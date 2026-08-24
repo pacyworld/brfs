@@ -29,7 +29,7 @@ the codec is the authority; keep this table in sync.
 HELLO        proto u16 | node_id | psk | nonce [16]
 ANNOUNCE     ver | flags u16 | mode u16 | size u64 | mtime_sec i64 |
              mtime_nsec u32 | path | sha256 [32]
-FETCH_REQ    ver | path
+FETCH_REQ    ver | offset u64 | len u32 | path
 FETCH_DATA   ver | offset u64 | path | data (u32 len + bytes)
 FETCH_ACK    ver | path | sha256 [32]
 TOMBSTONE    ver | flags u16 | path
@@ -72,8 +72,8 @@ incremented on every local mutation. Clock time plays no role in ordering
 |----|-------------|---------|-------|
 | 1  | HELLO       | node_id, protocol version, PSK, nonce | handshake; nonce prevents replay |
 | 2  | ANNOUNCE    | path, op-flags, size, mtime, sha256, ver | flags carry ISDIR |
-| 3  | FETCH_REQ   | path, ver | |
-| 4  | FETCH_DATA  | path, ver, offset, len, data | chunked; offset+len sequence the file |
+| 3  | FETCH_REQ   | path, ver, offset, len | receiver-driven pull: one chunk in flight per fetch (flow control) |
+| 4  | FETCH_DATA  | path, ver, offset, len, data | one requested chunk; empty data at offset==size completes a 0-byte file |
 | 5  | FETCH_ACK   | path, ver, sha256 | post-install hash re-verify |
 | 6  | TOMBSTONE   | path, ver, ISDIR | delete |
 | 7  | RESYNC_REQ  | content-set summary | joining node → peer |

@@ -50,6 +50,11 @@ pub const Peer = struct {
     state: State = .closed,
     outbound: bool = false,
     node_id: ?[]u8 = null, // learned from HELLO (owned)
+    /// Outbound only: the node_id this address belongs to, remembered
+    /// across disconnects.  The daemon suppresses re-dials while a ready
+    /// conn to that node exists (mesh dedup is per-PAIR, not per-conn:
+    /// without this the dropped redundant conn redials forever).
+    known_id: ?[]u8 = null,
     addr: ?std.net.Address = null, // dial target for outbound peers
     rbuf: std.ArrayList(u8) = .empty,
     wbuf: std.ArrayList(u8) = .empty,
@@ -70,6 +75,7 @@ pub const Peer = struct {
         while (mit.next()) |e| self.alloc.free(e.value_ptr.path);
         self.moves.deinit();
         if (self.node_id) |n| self.alloc.free(n);
+        if (self.known_id) |n| self.alloc.free(n);
     }
 
     pub fn noteRemoteMove(self: *Peer, cookie: u32, path: []const u8, ver: contentset.Version, is_dir: bool, now_ms: i64) !void {
@@ -140,10 +146,14 @@ pub const Peer = struct {
     pub fn dial(self: *Peer, addr: std.net.Address) !posix.fd_t {
         const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(fd);
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-            error.WouldBlock => {}, // EINPROGRESS: completion via kqueue
-            else => return err,
-        };
+        // std.c.connect directly: std.posix.connect's error mapping prints
+        // "unexpected errno" noise for immediate failures (ECONNREFUSED on
+        // a peer that isn't up yet is NORMAL during mesh startup).
+        if (std.c.connect(fd, &addr.any, addr.getOsSockLen()) != 0) {
+            const e = std.c._errno().*;
+            if (e != @intFromEnum(std.c.E.INPROGRESS) and e != @intFromEnum(std.c.E.AGAIN))
+                return error.ConnectFailed; // retried via backoff
+        }
         self.fd = fd;
         self.addr = addr;
         self.outbound = true;
@@ -238,6 +248,10 @@ pub const Peer = struct {
         if (!timingSafeEql(h.psk, our_psk)) return error.BadPsk;
         if (self.node_id) |n| self.alloc.free(n);
         self.node_id = try self.alloc.dupe(u8, h.node_id);
+        if (self.outbound) {
+            if (self.known_id) |n| self.alloc.free(n);
+            self.known_id = try self.alloc.dupe(u8, h.node_id);
+        }
         self.state = .ready;
         self.violations = 0;
     }
@@ -288,7 +302,7 @@ test "loopback frame exchange via peer buffers" {
     pa.adopt(fds[0]);
     pb.adopt(fds[1]);
 
-    try pa.send(.{ .fetch_req = .{ .ver = .{ .origin = 1, .seq = 2 }, .path = "a/b.txt" } });
+    try pa.send(.{ .fetch_req = .{ .ver = .{ .origin = 1, .seq = 2 }, .offset = 0, .len = 64, .path = "a/b.txt" } });
     try pa.send(.{ .nack = .{ .ver = .{ .origin = 1, .seq = 3 }, .code = 9, .path = "c" } });
     try pump(&pa, &pb);
 

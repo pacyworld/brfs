@@ -21,6 +21,43 @@ const contentset = @import("contentset.zig");
 extern "c" fn utimensat(dirfd: c_int, path: [*:0]const u8, times: *const [2]posix.timespec, flags: c_int) c_int;
 extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
 
+// struct statfs header through f_fsid (sys/mount.h, FreeBSD 15).  The
+// trailing blob keeps the buffer big enough for the kernel to fill.
+const fsid_t = extern struct { val: [2]i32 };
+const StatfsHeader = extern struct {
+    f_version: u32,
+    f_type: u32,
+    f_flags: u64,
+    f_bsize: u64,
+    f_iosize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: i64,
+    f_files: u64,
+    f_ffree: i64,
+    f_syncwrites: u64,
+    f_asyncwrites: u64,
+    f_syncreads: u64,
+    f_asyncreads: u64,
+    f_spare: [10]u64,
+    f_namemax: u32,
+    f_owner: u32,
+    f_fsid: fsid_t,
+    _rest: [2048]u8,
+};
+extern "c" fn statfs(path: [*:0]const u8, buf: *StatfsHeader) c_int;
+
+/// The filesystem id in the SAME encoding brfs.ko uses for be_fsid
+/// (f_fsid.val[0]<<32 | val[1]).  st_dev is a DIFFERENT namespace — do not
+/// mix them (empirical: /data on the rig: st_dev=60, f_fsid pair hashes).
+pub fn fsidOf(path: []const u8) !u64 {
+    var st: StatfsHeader = undefined;
+    const path_z = try std.posix.toPosixPath(path);
+    if (statfs(&path_z, &st) != 0) return error.StatfsFailed;
+    return (@as(u64, @as(u32, @bitCast(st.f_fsid.val[0]))) << 32) |
+        @as(u64, @as(u32, @bitCast(st.f_fsid.val[1])));
+}
+
 pub const chunk_size: usize = 1024 * 1024;
 
 const Fetch = struct {
@@ -28,11 +65,16 @@ const Fetch = struct {
     path: []u8, // owned
     ver: contentset.Version,
     size: u64,
-    sha256: [32]u8,
+    sha256: [32]u8, // expected (from the announce)
     mode: u16,
     mtime_sec: i64,
     mtime_nsec: u32,
     received: u64 = 0,
+    // Chunks arrive in strict offset order, so the hash is computed
+    // incrementally as they land — complete() would otherwise re-read and
+    // re-hash the whole file on the core thread (200 MiB blocked the event
+    // loop for tens of seconds on the bhyve rig, stalling all conns).
+    hasher: std.crypto.hash.sha2.Sha256,
 };
 
 pub const Installer = struct {
@@ -110,6 +152,7 @@ pub const Installer = struct {
             .mode = ann.mode,
             .mtime_sec = ann.mtime_sec,
             .mtime_nsec = ann.mtime_nsec,
+            .hasher = std.crypto.hash.sha2.Sha256.init(.{}),
         };
         try self.fetches.put(owned, f);
     }
@@ -126,6 +169,7 @@ pub const Installer = struct {
             const n = try posix.pwrite(f.fd, data[off..], @intCast(f.received + off));
             off += n;
         }
+        f.hasher.update(data);
         f.received += data.len;
     }
 
@@ -148,6 +192,12 @@ pub const Installer = struct {
 
     pub fn fetchInProgress(self: *Installer, path: []const u8) bool {
         return self.fetches.contains(path);
+    }
+
+    /// Bytes staged so far (the next FETCH_REQ's offset).
+    pub fn fetchOffset(self: *Installer, path: []const u8) u64 {
+        const f = self.fetches.get(path) orelse return 0;
+        return f.received;
     }
 
     pub fn abortFetch(self: *Installer, path: []const u8) void {
@@ -186,7 +236,8 @@ pub const Installer = struct {
         const spath = try self.stagingPath(&scratch, f.path, f.ver);
         errdefer std.fs.cwd().deleteFile(spath) catch {};
 
-        const actual = try hashFile(spath);
+        var actual: [32]u8 = undefined;
+        f.hasher.final(&actual);
         if (!std.mem.eql(u8, &actual, &f.sha256)) return error.HashMismatch;
 
         const dest = try std.fs.path.join(self.alloc, &.{ self.root, path });
@@ -285,6 +336,12 @@ pub fn hashFile(path: []const u8) ![32]u8 {
     var out: [32]u8 = undefined;
     h.final(&out);
     return out;
+}
+
+/// Apply replicated metadata (mode bits + mtime; NOT uid/gid) to an
+/// existing path.  Public: the daemon uses it for dir ANNOUNCEs.
+pub fn setMeta(path: []const u8, mode: u16, mtime_sec: i64, mtime_nsec: u32) void {
+    applyMeta(path, mode, mtime_sec, mtime_nsec);
 }
 
 fn applyMeta(path: []const u8, mode: u16, mtime_sec: i64, mtime_nsec: u32) void {

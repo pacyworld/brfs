@@ -33,10 +33,10 @@ pub const ScanStats = struct {
     unchanged: u64 = 0,
 };
 
-fn recordFromStat(st: posix.Stat, is_dir: bool, ver: contentset.Version, sha: [32]u8) contentset.Record {
+fn recordFromStat(fsid: u64, st: posix.Stat, is_dir: bool, ver: contentset.Version, sha: [32]u8) contentset.Record {
     return .{
         .id = .{
-            .fsid = @intCast(st.dev),
+            .fsid = fsid,
             .fileid = @intCast(st.ino),
             .gen = @intCast(st.gen),
         },
@@ -53,7 +53,14 @@ fn recordFromStat(st: posix.Stat, is_dir: bool, ver: contentset.Version, sha: [3
 
 /// Walk the tree, reconcile against the content set, synthesize journal
 /// entries (debounced/coalesced with any live ring events) for deltas.
-/// Local mutations found by the scan get fresh local versions.
+///
+/// The scan NEVER upserts delta records itself: version assignment,
+/// hashing, and announcing live in the journal's processing path
+/// (daemon.processUpsert/processDelete) — a single code path for local
+/// mutations.  (The first iteration did upsert + enqueue, and processing
+/// then saw "already in set, unchanged" and announced NOTHING.)  Unchanged
+/// entries get their identity refreshed silently; that also rebuilds the
+/// dir index used to resolve kernel events.
 pub fn scan(
     alloc: Allocator,
     root: []const u8,
@@ -62,6 +69,7 @@ pub fn scan(
     now_ms: i64,
 ) !ScanStats {
     var stats = ScanStats{};
+    const root_fsid = installer.fsidOf(root) catch 0;
     var seen = std.StringHashMap(void).init(alloc);
     defer {
         var it = seen.iterator();
@@ -87,79 +95,43 @@ pub fn scan(
         const is_dir = installer.isDir(st);
 
         if (cs.lookup(rel)) |rec| {
-            if (rec.state == .live) {
-                if (is_dir) {
-                    // Refresh identity (inode reuse across restarts); no
-                    // announce for dirs that still exist.
-                    var r = rec.*;
-                    r.id = recordFromStat(st, true, rec.ver, rec.sha256).id;
-                    try cs.upsert(rel, r);
-                    stats.unchanged += 1;
-                    continue;
-                }
-                if (rec.size == st.size and rec.mtime_sec == st.mtim.sec and
-                    rec.mtime_nsec == @as(u32, @intCast(@max(st.mtim.nsec, 0))))
-                {
-                    var r = rec.*;
-                    r.id = recordFromStat(st, false, rec.ver, rec.sha256).id;
-                    try cs.upsert(rel, r);
-                    stats.unchanged += 1;
-                    continue;
-                }
-                // Suspicious: hash to decide.
-                const sha = installer.hashFile(abs) catch continue;
-                if (std.mem.eql(u8, &sha, &rec.sha256)) {
-                    var r = rec.*;
-                    r.size = @intCast(@max(st.size, 0));
-                    r.mtime_sec = @intCast(st.mtim.sec);
-                    r.mtime_nsec = @intCast(@max(st.mtim.nsec, 0));
-                    r.id = recordFromStat(st, false, rec.ver, sha).id;
-                    try cs.upsert(rel, r);
-                    stats.unchanged += 1;
-                    continue;
-                }
-                // Modified while we were down.
-                const ver = cs.nextVersion();
-                try cs.upsert(rel, recordFromStat(st, false, ver, sha));
-                try j.add(.{ .path = rel, .op = .modify, .is_dir = false, .seq = cs.ring_seq }, now_ms);
-                stats.announced_modified += 1;
-            } else {
-                // Tombstone but the file exists: it was recreated while we
-                // were down.  Resurrect with a fresh local version (gap #9
-                // direction; the rule locks with LMDB in Phase 2).
-                const sha = if (is_dir) [_]u8{0} ** 32 else installer.hashFile(abs) catch continue;
-                const ver = cs.nextVersion();
-                try cs.upsert(rel, recordFromStat(st, is_dir, ver, sha));
-                try j.add(.{ .path = rel, .op = .create, .is_dir = is_dir, .seq = cs.ring_seq }, now_ms);
-                stats.announced_new += 1;
+            if (rec.state == .live and is_dir == rec.is_dir and
+                (is_dir or
+                    (rec.size == @as(u64, @intCast(@max(st.size, 0))) and
+                        rec.mtime_sec == st.mtim.sec and
+                        rec.mtime_nsec == @as(u32, @intCast(@max(st.mtim.nsec, 0))))))
+            {
+                // Unchanged: refresh identity silently (inode reuse across
+                // restarts) — no journal entry, no announce.
+                var r = rec.*;
+                r.id = recordFromStat(root_fsid, st, is_dir, rec.ver, rec.sha256).id;
+                try cs.upsert(rel, r);
+                stats.unchanged += 1;
+                continue;
             }
+            // New-over-tombstone (resurrection, gap #9 direction), or
+            // changed while down: the journal path assigns a fresh local
+            // version and announces after hashing.
+            try j.add(.{ .path = rel, .op = if (rec.state == .live) .modify else .create, .is_dir = is_dir, .seq = cs.ring_seq }, now_ms);
+            if (rec.state == .live)
+                stats.announced_modified += 1
+            else
+                stats.announced_new += 1;
         } else {
             // Never seen: local creation while we were down (or first-ever
             // scan of a primary's seeded tree).
-            const sha = if (is_dir) [_]u8{0} ** 32 else installer.hashFile(abs) catch continue;
-            const ver = cs.nextVersion();
-            try cs.upsert(rel, recordFromStat(st, is_dir, ver, sha));
             try j.add(.{ .path = rel, .op = .create, .is_dir = is_dir, .seq = cs.ring_seq }, now_ms);
             stats.announced_new += 1;
         }
     }
 
     // Anything live in the set but absent on disk was deleted while down.
-    var gone: std.ArrayList([]const u8) = .empty;
-    defer gone.deinit(alloc);
     var it = cs.map.iterator();
     while (it.next()) |e| {
-        if (e.value_ptr.state == .live and !seen.contains(e.key_ptr.*))
-            try gone.append(alloc, e.key_ptr.*);
-    }
-    for (gone.items) |path| {
-        const rec = cs.lookup(path).?;
-        var r = rec.*;
-        r.state = .deleted;
-        r.ver = cs.nextVersion();
-        try cs.upsert(path, r);
-        try j.add(.{ .path = path, .op = .delete, .is_dir = rec.is_dir, .seq = cs.ring_seq }, now_ms);
-        stats.announced_deleted += 1;
+        if (e.value_ptr.state == .live and !seen.contains(e.key_ptr.*)) {
+            try j.add(.{ .path = e.key_ptr.*, .op = .delete, .is_dir = e.value_ptr.is_dir, .seq = cs.ring_seq }, now_ms);
+            stats.announced_deleted += 1;
+        }
     }
 
     return stats;
@@ -283,7 +255,8 @@ test "first scan announces the seeded tree" {
     try t.expectEqual(@as(u64, 3), stats.seen); // a.txt, sub, sub/b.txt
     try t.expectEqual(@as(u64, 3), stats.announced_new);
     try t.expectEqual(@as(usize, 3), j.pendingCount());
-    try t.expect(cs.dirPath(cs.lookup("sub").?.id.fsid, cs.lookup("sub").?.id.fileid) != null);
+    // Scan enqueues only: no records until the journal processes them.
+    try t.expect(cs.lookup("sub") == null);
 
     const works = drainJournal(&j);
     defer {
@@ -291,6 +264,7 @@ test "first scan announces the seeded tree" {
         t.allocator.free(works);
     }
     try t.expectEqual(@as(usize, 3), works.len);
+    for (works) |w| try t.expect(w == .upsert);
 }
 
 test "clean restart scan announces nothing" {
@@ -304,6 +278,19 @@ test "clean restart scan announces nothing" {
         var j = journal.Journal.init(alloc, 10);
         defer j.deinit();
         _ = try scan(alloc, rig.root, &cs, &j, 0);
+        // Simulate the journal processing pass: record the file live.
+        const abs = try std.fs.path.join(alloc, &.{ rig.root, "a.txt" });
+        defer alloc.free(abs);
+        const st = try installer.statPath(abs);
+        const sha = try installer.hashFile(abs);
+        try cs.upsert("a.txt", .{
+            .id = .{ .fsid = 0, .fileid = @intCast(st.ino), .gen = @intCast(st.gen) },
+            .ver = .{ .origin = contentset.nodeOrigin("test"), .seq = 1 },
+            .size = @intCast(@max(st.size, 0)),
+            .mtime_sec = @intCast(st.mtim.sec),
+            .mtime_nsec = @intCast(@max(st.mtim.nsec, 0)),
+            .sha256 = sha,
+        });
         var works: std.ArrayList(journal.Work) = .empty;
         j.collectReady(std.math.maxInt(i64) - 1, &works) catch unreachable;
         const w2 = works.toOwnedSlice(alloc) catch unreachable;
@@ -335,16 +322,30 @@ test "offline modify, create, and delete are caught" {
 
     {
         var cs = try contentset.ContentSet.open(alloc, rig.state, "test");
+        defer cs.close();
         var j = journal.Journal.init(alloc, 10);
         defer j.deinit();
         _ = try scan(alloc, rig.root, &cs, &j, 0);
+        // Simulate processing: both files recorded live with local vers.
+        for ([_][]const u8{ "mod.txt", "del.txt" }, 1..) |rel, seq| {
+            const abs = try std.fs.path.join(alloc, &.{ rig.root, rel });
+            defer alloc.free(abs);
+            const st = try installer.statPath(abs);
+            const sha = try installer.hashFile(abs);
+            try cs.upsert(rel, .{
+                .ver = .{ .origin = contentset.nodeOrigin("test"), .seq = seq },
+                .size = @intCast(@max(st.size, 0)),
+                .mtime_sec = @intCast(st.mtim.sec),
+                .mtime_nsec = @intCast(@max(st.mtim.nsec, 0)),
+                .sha256 = sha,
+            });
+        }
         var works: std.ArrayList(journal.Work) = .empty;
         j.collectReady(std.math.maxInt(i64) - 1, &works) catch unreachable;
         const w2 = works.toOwnedSlice(alloc) catch unreachable;
         for (w2) |*w| j.freeWork(w);
         alloc.free(w2);
         try cs.snapshot();
-        cs.close();
     }
 
     // Daemon down: modify one, delete one, create one.
@@ -361,7 +362,27 @@ test "offline modify, create, and delete are caught" {
     try t.expectEqual(@as(u64, 1), stats.announced_new);
     try t.expectEqual(@as(u64, 1), stats.announced_modified);
     try t.expectEqual(@as(u64, 1), stats.announced_deleted);
-    try t.expectEqual(contentset.State.deleted, cs.lookup("del.txt").?.state);
+
+    // Scan enqueues only; the tombstone lands when the journal processes.
+    try t.expectEqual(contentset.State.live, cs.lookup("del.txt").?.state);
+    const works = drainJournal(&j);
+    defer {
+        for (works) |*w| j.freeWork(w);
+        t.allocator.free(works);
+    }
+    try t.expectEqual(@as(usize, 3), works.len);
+    var kinds = [3]bool{ false, false, false };
+    for (works) |w| switch (w) {
+        .upsert => |e| {
+            if (std.mem.eql(u8, e.path, "new.txt")) kinds[0] = true;
+            if (std.mem.eql(u8, e.path, "mod.txt")) kinds[1] = true;
+        },
+        .delete => |e| {
+            if (std.mem.eql(u8, e.path, "del.txt")) kinds[2] = true;
+        },
+        .rename => return error.UnexpectedRename,
+    };
+    for (kinds) |k| try t.expect(k);
 }
 
 test "file resurrecting over a tombstone gets a fresh local version" {
@@ -381,9 +402,18 @@ test "file resurrecting over a tombstone gets a fresh local version" {
     defer j.deinit();
     const stats = try scan(alloc, rig.root, &cs, &j, 0);
     try t.expectEqual(@as(u64, 1), stats.announced_new);
-    const after = cs.lookup("ghost.txt").?;
-    try t.expectEqual(contentset.State.live, after.state);
-    try t.expectEqual(cs.local_origin, after.ver.origin);
+    // Still a tombstone in the set until the journal entry processes; the
+    // work item is an upsert (resurrection announced with a fresh local
+    // version by the processing path).
+    try t.expectEqual(contentset.State.deleted, cs.lookup("ghost.txt").?.state);
+    const works = drainJournal(&j);
+    defer {
+        for (works) |*w| j.freeWork(w);
+        t.allocator.free(works);
+    }
+    try t.expectEqual(@as(usize, 1), works.len);
+    try t.expect(works[0] == .upsert);
+    try t.expectEqualStrings("ghost.txt", works[0].upsert.path);
 }
 
 test "version vector covers and filters" {

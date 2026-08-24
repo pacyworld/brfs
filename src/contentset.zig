@@ -81,6 +81,11 @@ pub const Record = struct {
 
 const DirKey = struct { fsid: u64, fileid: u64 };
 
+const IdEnt = struct {
+    path: []u8, // owned
+    gen: u64,
+};
+
 const snap_name = "contentset.snap";
 const snap_tmp_name = "contentset.snap.tmp";
 const log_name = "contentset.log";
@@ -110,7 +115,12 @@ pub const ContentSet = struct {
     alloc: Allocator,
     state_dir: []const u8,
     map: std.StringHashMap(Record),
-    dir_index: std.AutoHashMap(DirKey, []const u8),
+    /// (fsid, fileid) -> path for EVERY known vnode, dirs and files.
+    /// Named events resolve parent/name; NAMELESS self events (MODIFY/
+    /// ATTRIB carry no cnp — the kmod resolves no paths by design) resolve
+    /// the subject directly through this index.  Entries come from records
+    /// (upsert) and from the events themselves (learnId).
+    id_index: std.AutoHashMap(DirKey, IdEnt),
     log_fd: posix.fd_t,
     local_origin: u64,
     local_next_seq: u64 = 1,
@@ -128,7 +138,7 @@ pub const ContentSet = struct {
             .alloc = alloc,
             .state_dir = try alloc.dupe(u8, state_dir),
             .map = std.StringHashMap(Record).init(alloc),
-            .dir_index = std.AutoHashMap(DirKey, []const u8).init(alloc),
+            .id_index = std.AutoHashMap(DirKey, IdEnt).init(alloc),
             .log_fd = -1,
             .local_origin = nodeOrigin(node_id),
         };
@@ -168,25 +178,60 @@ pub const ContentSet = struct {
         while (it.next()) |e|
             self.alloc.free(e.key_ptr.*);
         self.map.deinit();
-        self.dir_index.deinit();
+        var iit = self.id_index.iterator();
+        while (iit.next()) |e|
+            self.alloc.free(e.value_ptr.path);
+        self.id_index.deinit();
     }
 
     pub fn lookup(self: *const ContentSet, path: []const u8) ?*const Record {
         return self.map.getPtr(path);
     }
 
+    /// Resolve (fsid, fileid) -> path.  gen 0 on either side means "no
+    /// opinion"; a nonzero mismatch means inode reuse — treat as unknown
+    /// (scan floor).  Unknown -> null; the caller triggers a rescan.
+    pub fn idPath(self: *const ContentSet, fsid: u64, fileid: u64, gen: u64) ?[]const u8 {
+        const e = self.id_index.get(.{ .fsid = fsid, .fileid = fileid }) orelse return null;
+        if (gen != 0 and e.gen != 0 and gen != e.gen) return null;
+        return e.path;
+    }
+
+    /// Learn a (fsid, fileid) -> path mapping from a kernel event (the
+    /// subject of a named event carries its fileid+gen).
+    pub fn learnId(self: *ContentSet, fsid: u64, fileid: u64, gen: u64, path: []const u8) !void {
+        if (fileid == 0) return;
+        const key = DirKey{ .fsid = fsid, .fileid = fileid };
+        const gop = try self.id_index.getOrPut(key);
+        if (gop.found_existing) {
+            if (std.mem.eql(u8, gop.value_ptr.path, path)) {
+                if (gen != 0) gop.value_ptr.gen = gen;
+                return;
+            }
+            self.alloc.free(gop.value_ptr.path);
+        }
+        gop.value_ptr.* = .{ .path = try self.alloc.dupe(u8, path), .gen = gen };
+    }
+
+    /// Forget a mapping (subject deleted).
+    pub fn dropId(self: *ContentSet, fsid: u64, fileid: u64) void {
+        if (fileid == 0) return;
+        if (self.id_index.fetchRemove(.{ .fsid = fsid, .fileid = fileid })) |kv|
+            self.alloc.free(kv.value.path);
+    }
+
     /// Resolve a kernel event's (fsid, dir_fileid) to a directory path.
     /// Unknown (dir created while we were down and never scanned) -> null;
     /// the caller treats that as a scan trigger.
     pub fn dirPath(self: *const ContentSet, fsid: u64, fileid: u64) ?[]const u8 {
-        return self.dir_index.get(.{ .fsid = fsid, .fileid = fileid });
+        return self.idPath(fsid, fileid, 0);
     }
 
-    /// Register the replicated root itself in the dir index (it has no
+    /// Register the replicated root itself in the id index (it has no
     /// record — relative paths never include it).  Its index path is "":
     /// events land directly under the root.
     pub fn indexRoot(self: *ContentSet, fsid: u64, fileid: u64) !void {
-        try self.dir_index.put(.{ .fsid = fsid, .fileid = fileid }, "");
+        try self.learnId(fsid, fileid, 0, "");
     }
 
     /// Allocate the next local version.  The counter persists via upsert
@@ -221,14 +266,14 @@ pub const ContentSet = struct {
     }
 
     fn indexDir(self: *ContentSet, path: []const u8, rec: Record) void {
-        if (!rec.is_dir or rec.state != .live or rec.id.fileid == 0) return;
-        self.dir_index.put(.{ .fsid = rec.id.fsid, .fileid = rec.id.fileid }, path) catch {};
+        if (rec.state != .live or rec.id.fileid == 0) return;
+        self.learnId(rec.id.fsid, rec.id.fileid, rec.id.gen, path) catch {};
     }
 
     fn unindexDir(self: *ContentSet, path: []const u8, rec: Record) void {
         _ = path;
-        if (!rec.is_dir or rec.id.fileid == 0) return;
-        _ = self.dir_index.remove(.{ .fsid = rec.id.fsid, .fileid = rec.id.fileid });
+        if (rec.id.fileid == 0) return;
+        self.dropId(rec.id.fsid, rec.id.fileid);
     }
 
     /// Persist the current ring consumption point (USN analog).  Cheap;
@@ -803,6 +848,30 @@ test "empty first start requests a scan" {
     var cs = try ContentSet.open(alloc, dir, "test-node");
     defer cs.close();
     try std.testing.expect(cs.needs_scan);
+}
+
+test "id index: learn, gen guard, drop" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var cs = try ContentSet.open(alloc, dir, "test-node");
+    defer cs.close();
+
+    try cs.learnId(55, 100, 7, "sub/file.txt");
+    try std.testing.expectEqualStrings("sub/file.txt", cs.idPath(55, 100, 7).?);
+    try std.testing.expectEqualStrings("sub/file.txt", cs.idPath(55, 100, 0).?); // no opinion
+    try std.testing.expect(cs.idPath(55, 100, 8) == null); // gen mismatch: inode reuse
+    try std.testing.expect(cs.idPath(55, 999, 0) == null);
+
+    // Rename remap: same fileid, new path.
+    try cs.learnId(55, 100, 7, "sub/renamed.txt");
+    try std.testing.expectEqualStrings("sub/renamed.txt", cs.idPath(55, 100, 7).?);
+
+    cs.dropId(55, 100);
+    try std.testing.expect(cs.idPath(55, 100, 0) == null);
 }
 
 test "validRelPath" {

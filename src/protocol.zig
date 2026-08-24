@@ -7,7 +7,7 @@
 //!   HELLO        proto u16 | node_id (u16 len + bytes) | psk (u16 len + bytes) | nonce [16]
 //!   ANNOUNCE     origin u64 | seq u64 | flags u16 | mode u16 | size u64 |
 //!                mtime_sec i64 | mtime_nsec u32 | path (u16 len + bytes) | sha256 [32]
-//!   FETCH_REQ    origin u64 | seq u64 | path
+//!   FETCH_REQ    origin u64 | seq u64 | offset u64 | len u32 | path
 //!   FETCH_DATA   origin u64 | seq u64 | offset u64 | path | data (u32 len + bytes)
 //!   FETCH_ACK    origin u64 | seq u64 | path | sha256 [32]
 //!   TOMBSTONE    origin u64 | seq u64 | flags u16 | path
@@ -74,6 +74,16 @@ pub const Announce = struct {
 
 pub const PathVer = struct { ver: Version, path: []const u8 };
 
+/// Receiver-driven chunk pull: one outstanding chunk per fetch, which is
+/// the flow control (a 200 MiB serve must NOT be blasted into a bounded
+/// write buffer — saturation would drop the conn and wedge the receiver).
+pub const FetchReq = struct {
+    ver: Version,
+    offset: u64,
+    len: u32,
+    path: []const u8,
+};
+
 pub const FetchData = struct {
     ver: Version,
     offset: u64,
@@ -128,7 +138,7 @@ pub const Nack = struct {
 pub const Message = union(enum) {
     hello: Hello,
     announce: Announce,
-    fetch_req: PathVer,
+    fetch_req: FetchReq,
     fetch_data: FetchData,
     fetch_ack: FetchAck,
     tombstone: Tombstone,
@@ -184,6 +194,8 @@ pub fn encode(alloc: Allocator, msg: Message) ![]u8 {
         .fetch_req => |m| {
             try appendInt(w, alloc, u16, @intFromEnum(Op.fetch_req));
             try appendVer(w, alloc, m.ver);
+            try appendInt(w, alloc, u64, m.offset);
+            try appendInt(w, alloc, u32, m.len);
             try appendStr(w, alloc, m.path);
         },
         .fetch_data => |m| {
@@ -290,7 +302,13 @@ pub fn decode(payload: []const u8) DecodeError!Message {
                 .sha256 = sha,
             } };
         },
-        .fetch_req => .{ .fetch_req = .{ .ver = try r.ver(), .path = try r.path() } },
+        .fetch_req => blk: {
+            const v = try r.ver();
+            const offset = try r.u64v();
+            const len = try r.u32v();
+            if (len == 0 or len > max_frame) return error.FrameTooLarge;
+            break :blk .{ .fetch_req = .{ .ver = v, .offset = offset, .len = len, .path = try r.path() } };
+        },
         .fetch_data => blk: {
             const ver = try r.ver();
             const offset = try r.u64v();
@@ -492,9 +510,11 @@ test "roundtrip every opcode" {
         try t.expectEqualStrings("dir/file.txt", rt.msg.announce.path);
     }
     {
-        const rt = try roundtrip(.{ .fetch_req = .{ .ver = .{ .origin = 1, .seq = 2 }, .path = "a" } });
+        const rt = try roundtrip(.{ .fetch_req = .{ .ver = .{ .origin = 1, .seq = 2 }, .offset = 4096, .len = 1024, .path = "a" } });
         defer t.allocator.free(rt.frame);
         try t.expectEqualStrings("a", rt.msg.fetch_req.path);
+        try t.expectEqual(@as(u64, 4096), rt.msg.fetch_req.offset);
+        try t.expectEqual(@as(u32, 1024), rt.msg.fetch_req.len);
     }
     {
         const rt = try roundtrip(.{ .fetch_data = .{
@@ -559,7 +579,7 @@ test "roundtrip every opcode" {
 }
 
 test "frameReady needs full frame, rejects oversize" {
-    const frame = try encode(t.allocator, .{ .fetch_req = .{ .ver = .{ .origin = 1, .seq = 1 }, .path = "x" } });
+    const frame = try encode(t.allocator, .{ .fetch_req = .{ .ver = .{ .origin = 1, .seq = 1 }, .offset = 0, .len = 64, .path = "x" } });
     defer t.allocator.free(frame);
     try t.expectEqual(@as(usize, 0), try frameReady(frame[0..2])); // partial header
     try t.expectEqual(@as(usize, 0), try frameReady(frame[0 .. frame.len - 1])); // partial body
@@ -623,6 +643,8 @@ test "hostile paths are rejected" {
         defer body.deinit(t.allocator);
         try appendInt(&body, t.allocator, u16, @intFromEnum(Op.fetch_req));
         try appendVer(&body, t.allocator, .{ .origin = 1, .seq = 1 });
+        try appendInt(&body, t.allocator, u64, 0);
+        try appendInt(&body, t.allocator, u32, 64);
         // Bypass appendStr's own checks is unnecessary; build the raw field.
         try appendInt(&body, t.allocator, u16, @intCast(p.len));
         try body.appendSlice(t.allocator, p);
@@ -634,7 +656,7 @@ test "unknown op and trailing garbage rejected" {
     var junk = [_]u8{ 0xde, 0xad, 0x00 }; // op 0xdead
     try t.expectError(error.BadOp, decode(&junk));
 
-    const frame = try encode(t.allocator, .{ .fetch_req = .{ .ver = .{ .origin = 1, .seq = 1 }, .path = "x" } });
+    const frame = try encode(t.allocator, .{ .fetch_req = .{ .ver = .{ .origin = 1, .seq = 1 }, .offset = 0, .len = 64, .path = "x" } });
     defer t.allocator.free(frame);
     const padded = try t.allocator.alloc(u8, frame.len + 1);
     defer t.allocator.free(padded);

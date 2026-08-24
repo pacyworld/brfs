@@ -82,9 +82,11 @@ const BRFSIOC_FLUSH = ioc(IOC_VOID, u0, 4);
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 
 pub fn openDevice() !posix.fd_t {
-    // O_NONBLOCK: the drain loop reads until empty; a blocking read would
-    // park the whole event loop inside drain() and starve signal handling.
-    return posix.open(dev_path, .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0);
+    // BLOCKING on purpose: the drainer thread parks in read() and owns the
+    // ring pop side; the core loop never reads the device (ioctls don't
+    // block).  Do NOT open O_NONBLOCK and try to clear it later — F_SETFL
+    // on a cdev fails with ENOTTY on FreeBSD.
+    return posix.open(dev_path, .{ .ACCMODE = .RDWR }, 0);
 }
 
 pub fn addRoot(fd: posix.fd_t, path: []const u8, mask: u32) !void {

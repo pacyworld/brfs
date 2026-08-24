@@ -53,8 +53,10 @@ pub const Level = enum { info, warn, err };
 
 pub fn log(comptime level: Level, comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "brfsd[" ++ @tagName(level) ++ "]: " ++ fmt ++ "\n", args) catch return;
-    _ = posix.write(2, msg) catch {};
+    const ts = std.time.milliTimestamp();
+    const prefix = std.fmt.bufPrint(&buf, "brfsd[{s}] {d}: ", .{ @tagName(level), ts }) catch return;
+    const msg = std.fmt.bufPrint(buf[prefix.len..], fmt ++ "\n", args) catch return;
+    _ = posix.write(2, buf[0 .. prefix.len + msg.len]) catch {};
 }
 
 fn makeKevent(ident: usize, filter: c_short, flags: c_ushort, udata: ?*anyopaque) KEvent {
@@ -98,9 +100,10 @@ pub fn drainerEntry(dev_fd: posix.fd_t, evq: *EventQueue) void {
 }
 
 fn drainerMain(dev_fd: posix.fd_t, evq: *EventQueue) void {
-    // Blocking read: this thread exists to own the ring pop side.
-    const flags = fcntl(dev_fd, F_GETFL, 0);
-    _ = fcntl(dev_fd, F_SETFL, flags & ~O_NONBLOCK);
+    // Blocking read: this thread exists to own the ring pop side.  The
+    // device was opened WITHOUT O_NONBLOCK (F_SETFL cannot toggle it on a
+    // cdev).  The thread exits only on device errors (kmod unload wakes
+    // readers with ENXIO); process exit reaps it.
     var buf: [65536]u8 align(@alignOf(events.Event)) = undefined;
     while (true) {
         const n = posix.read(dev_fd, &buf) catch |err| {
@@ -146,6 +149,10 @@ pub const Daemon = struct {
     incoming: std.StringHashMap(Incoming),
     dead: std.ArrayList(*Peer) = .empty,
     move_cookie: u32 = 0,
+    /// The replicated tree's fsid in kmod encoding (f_fsid pair — NOT
+    /// st_dev).  One fs per watched tree (no sub-mounts, documented POC
+    /// limitation).
+    tree_fsid: u64 = 0,
     resynced: bool = false,
     need_rescan: bool = false,
     last_rescan_ms: i64 = 0,
@@ -175,14 +182,21 @@ pub const Daemon = struct {
     }
 
     fn registerPeerFd(self: *Daemon, p: *Peer) void {
-        self.stageChange(@intCast(p.fd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, p);
+        // READ is armed only once the socket is actually connected: reading
+        // a connecting socket whose dial was refused yields the pending
+        // connect error (ECONNREFUSED), poisoning the conn for no reason.
+        if (p.state != .connecting)
+            self.stageChange(@intCast(p.fd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, p);
         if (p.state == .connecting or p.wantsWrite())
             self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
     }
 
     fn dropPeer(self: *Daemon, p: *Peer, now_ms: i64, why: []const u8) void {
         if (p.state == .closed) return;
-        log(.warn, "peer {s} dropped: {s}", .{ p.node_id orelse "?", why });
+        log(.warn, "peer {s} dropped: {s} ({s} fd={d})", .{
+            p.node_id orelse "?",                      why,
+            if (p.outbound) "outbound" else "inbound", p.fd,
+        });
         if (p.fd >= 0) {
             self.stageChange(@intCast(p.fd), c_event.EVFILT_READ, c_event.EV_DELETE, null);
             self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_DELETE, null);
@@ -227,7 +241,8 @@ pub const Daemon = struct {
 
         // Root dir index entry so events under the root resolve.
         const root_st = try installer.statPath(self.cfg.replicated_path);
-        try self.cs.indexRoot(@intCast(root_st.dev), @intCast(root_st.ino));
+        self.tree_fsid = try installer.fsidOf(self.cfg.replicated_path);
+        try self.cs.indexRoot(self.tree_fsid, @intCast(root_st.ino));
 
         // Orphaned staging files from a kill -9 (T8) are garbage.
         self.cleanStaging();
@@ -350,18 +365,51 @@ pub const Daemon = struct {
             return;
         }
         const name = bev.nameSlice();
-        if (name.len == 0) return;
-        const dir = self.cs.dirPath(bev.fsid, bev.dir_fileid) orelse {
-            // Directory unknown to us (created while down, or index gap):
-            // the scan floor recovers it.
-            self.need_rescan = true;
-            return;
-        };
         var pathbuf: [4096]u8 = undefined;
-        const rel = if (dir.len == 0)
-            std.fmt.bufPrint(&pathbuf, "{s}", .{name}) catch return
-        else
-            std.fmt.bufPrint(&pathbuf, "{s}/{s}", .{ dir, name }) catch return;
+        var rel: []const u8 = undefined;
+        if (name.len > 0) {
+            // Named event: resolve parent dir + last component.
+            const dir = self.cs.dirPath(bev.fsid, bev.dir_fileid) orelse {
+                // Directory unknown to us (created while down, or index
+                // gap): the scan floor recovers it.
+                self.need_rescan = true;
+                return;
+            };
+            rel = if (dir.len == 0)
+                std.fmt.bufPrint(&pathbuf, "{s}", .{name}) catch return
+            else
+                std.fmt.bufPrint(&pathbuf, "{s}/{s}", .{ dir, name }) catch return;
+            // Learn the subject's identity: later self events (MODIFY/
+            // ATTRIB) arrive NAMELESS and resolve through the id index.
+            switch (op) {
+                .create, .attrib, .move_to, .modify => self.cs.learnId(bev.fsid, bev.fileid, bev.gen, rel) catch {},
+                else => {},
+            }
+        } else {
+            // Nameless self event: resolve the subject by identity.  A
+            // nonzero gen mismatch = inode reuse = we don't know this
+            // file — scan floor.
+            rel = self.cs.idPath(bev.fsid, bev.fileid, bev.gen) orelse {
+                self.need_rescan = true;
+                return;
+            };
+            if (rel.len == 0) return; // the root itself: nothing to do
+            if (rel.len > pathbuf.len) return;
+            @memcpy(pathbuf[0..rel.len], rel);
+            rel = pathbuf[0..rel.len];
+        }
+        // Feed visibility (the tap regression suite greps this line).
+        log(.info, "seq={d} op={s} fsid={x} dir={d} file={d} gen={d} cookie={x} {s}{s}", .{
+            bev.seq,
+            events.opName(bev.op),
+            bev.fsid,
+            bev.dir_fileid,
+            bev.fileid,
+            bev.gen,
+            bev.cookie,
+            if (name.len > 0) name else rel,
+            if (bev.isDir()) " (dir)" else "",
+        });
 
         // Self-echo suppression (rule 6): swallow our own install/rename
         // events, but ONLY if the file still matches what we installed.
@@ -390,6 +438,10 @@ pub const Daemon = struct {
             .is_dir = bev.isDir(),
             .seq = bev.seq,
         }, now) catch {};
+        // Deletes forget the subject mapping.  Renames keep it: the
+        // MOVE_TO half's learnId remaps fileid -> new path.
+        if (op == .delete)
+            self.cs.dropId(bev.fsid, bev.fileid);
     }
 
     fn verifyInstallEcho(self: *Daemon, rel: []const u8, echo: journal.Echo) bool {
@@ -424,14 +476,22 @@ pub const Daemon = struct {
         const sha = if (is_dir) [_]u8{0} ** 32 else installer.hashFile(abs) catch return;
 
         if (self.cs.lookup(e.path)) |rec| {
-            if (rec.state == .live and rec.is_dir == is_dir and
-                std.mem.eql(u8, &rec.sha256, &sha) and
-                rec.size == @as(u64, @intCast(@max(st.size, 0))))
-            {
+            // Dirs: size/mtime change constantly as children come and go —
+            // content identity for a dir is "exists + mode".  Files: full
+            // (sha, size, mode) compare — ATTRIB events drive metadata-only
+            // announces (mode is replicated, uid/gid are not).
+            const unchanged = rec.state == .live and rec.is_dir == is_dir and
+                if (is_dir)
+                    rec.mode == @as(u16, @intCast(@as(u32, @intCast(st.mode)) & 0o7777))
+                else
+                    std.mem.eql(u8, &rec.sha256, &sha) and
+                        rec.size == @as(u64, @intCast(@max(st.size, 0))) and
+                        rec.mode == @as(u16, @intCast(@as(u32, @intCast(st.mode)) & 0o7777));
+            if (unchanged) {
                 // Spurious event (attrib-only or echo we didn't mark):
                 // refresh identity silently, announce nothing.
                 var r = rec.*;
-                r.id = .{ .fsid = @intCast(st.dev), .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
+                r.id = .{ .fsid = self.tree_fsid, .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
                 r.mtime_sec = @intCast(st.mtim.sec);
                 r.mtime_nsec = @intCast(@max(st.mtim.nsec, 0));
                 r.mode = @intCast(@as(u32, @intCast(st.mode)) & 0o7777);
@@ -442,7 +502,7 @@ pub const Daemon = struct {
 
         const ver = self.cs.nextVersion();
         const rec = contentset.Record{
-            .id = .{ .fsid = @intCast(st.dev), .fileid = @intCast(st.ino), .gen = @intCast(st.gen) },
+            .id = .{ .fsid = self.tree_fsid, .fileid = @intCast(st.ino), .gen = @intCast(st.gen) },
             .ver = ver,
             .size = @intCast(@max(st.size, 0)),
             .mtime_sec = @intCast(st.mtim.sec),
@@ -493,7 +553,7 @@ pub const Daemon = struct {
         if (self.inst.absPath(r.to)) |abs| {
             defer self.alloc.free(abs);
             if (installer.statPath(abs)) |st| {
-                dst.id = .{ .fsid = @intCast(st.dev), .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
+                dst.id = .{ .fsid = self.tree_fsid, .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
                 dst.size = @intCast(@max(st.size, 0));
                 dst.mtime_sec = @intCast(st.mtim.sec);
                 dst.mtime_nsec = @intCast(@max(st.mtim.nsec, 0));
@@ -549,6 +609,7 @@ pub const Daemon = struct {
                 return;
             };
             log(.info, "connected to peer {s}", .{peerName(p)});
+            self.stageChange(@intCast(p.fd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, p);
             self.sendHello(p);
             return;
         }
@@ -558,6 +619,7 @@ pub const Daemon = struct {
     }
 
     fn onPeerReadable(self: *Daemon, p: *Peer) void {
+        if (p.state == .connecting) return; // completion is the WRITE event
         p.readReady() catch {
             self.dropPeer(p, peer_mod.nowMs(), "read failed");
             return;
@@ -577,16 +639,39 @@ pub const Daemon = struct {
         }
     }
 
+    /// Queue + optimistically flush.  CRITICAL kqueue semantics: on an
+    /// idle, fully-writable socket, re-adding an already-armed EVFILT_WRITE
+    /// filter does NOT re-fire (no space-available transition happens), so
+    /// frames would sit in wbuf indefinitely.  Always attempt the write
+    /// synchronously; the armed WRITE filter is only the backpressure
+    /// continuation for when the socket buffer is genuinely full.
+    fn pushTo(self: *Daemon, p: *Peer, msg: protocol.Message) void {
+        p.send(msg) catch {
+            self.dropPeer(p, peer_mod.nowMs(), "send queue saturated");
+            return;
+        };
+        self.flushPeer(p);
+    }
+
+    fn flushPeer(self: *Daemon, p: *Peer) void {
+        if (p.state == .connecting or p.state == .closed) return;
+        p.writeReady() catch {
+            self.dropPeer(p, peer_mod.nowMs(), "write failed");
+            return;
+        };
+        if (p.wantsWrite())
+            self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+    }
+
     fn sendHello(self: *Daemon, p: *Peer) void {
         var nonce: [protocol.nonce_len]u8 = undefined;
         std.crypto.random.bytes(&nonce);
-        p.send(.{ .hello = .{
+        self.pushTo(p, .{ .hello = .{
             .proto = protocol.protocol_version,
             .node_id = self.cfg.node_id,
             .psk = self.psk,
             .nonce = nonce,
-        } }) catch {};
-        self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+        } });
     }
 
     fn onMessage(self: *Daemon, p: *Peer, msg: protocol.Message) void {
@@ -616,7 +701,10 @@ pub const Daemon = struct {
             .move_to => |m| self.onMoveTo(p, m),
             .nack => |m| {
                 log(.warn, "NACK from {s}: {s} v=({x},{d}) code={d}", .{ peerName(p), m.path, m.ver.origin, m.ver.seq, m.code });
-                if (m.code == nack_missing) self.inst.abortFetch(m.path);
+                if (m.code == nack_missing or m.code == nack_stale) {
+                    self.inst.abortFetch(m.path);
+                    if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
+                }
             },
         }
     }
@@ -642,22 +730,15 @@ pub const Daemon = struct {
     }
 
     fn broadcast(self: *Daemon, msg: protocol.Message) void {
-        const now = peer_mod.nowMs();
         var i: usize = 0;
         while (i < self.peers.items.len) : (i += 1) {
             const p = self.peers.items[i];
             if (p.state != .ready) continue;
-            var failed = false;
-            p.send(msg) catch {
-                failed = true;
-            };
-            if (failed) {
-                self.dropPeer(p, now, "saturated"); // may swapRemove: re-examine i
-                if (i < self.peers.items.len and self.peers.items[i] != p) i -%= 1;
-                continue;
-            }
-            if (p.wantsWrite())
-                self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+            const before = p;
+            self.pushTo(p, msg);
+            // pushTo may dropPeer (swapRemove): re-examine slot i.
+            if (before.state == .closed and i < self.peers.items.len and self.peers.items[i] != before)
+                i -%= 1;
         }
     }
 
@@ -665,6 +746,9 @@ pub const Daemon = struct {
 
     fn onAnnounce(self: *Daemon, p: *Peer, m: protocol.Announce) void {
         if (p.state != .ready) return;
+        log(.info, "recv announce {s} v=({x},{d}) size={d} from {s}", .{
+            m.path, m.ver.origin, m.ver.seq, m.size, peerName(p),
+        });
         // A fetch already in flight for this path+ver (the unpaired-MOVE_TO
         // fallback): the sender's pre-chunk ANNOUNCE carries the real meta.
         if (self.inst.fetchInProgress(m.path)) {
@@ -688,8 +772,13 @@ pub const Daemon = struct {
                 .conflict_stored_wins => return, // we win; peer converges via our ANNOUNCE
                 .newer => {},
                 .conflict_incoming_wins => {
-                    log(.info, "conflict {s}: peer {s} wins, quarantining local", .{ m.path, peerName(p) });
-                    self.inst.quarantine(m.path) catch {};
+                    // Don't quarantine eagerly: a divergent local file is
+                    // moved aside atomically at install time (installer.
+                    // complete), which keeps the kernel from seeing a
+                    // spurious delete/rename of the loser.
+                    log(.info, "conflict {s}: peer {s} v=({x},{d}) wins over local", .{
+                        m.path, peerName(p), m.ver.origin, m.ver.seq,
+                    });
                 },
             }
         }
@@ -697,8 +786,22 @@ pub const Daemon = struct {
             const abs = self.inst.absPath(m.path) catch return;
             defer self.alloc.free(abs);
             std.fs.cwd().makePath(abs) catch {};
+            installer.setMeta(abs, m.mode, m.mtime_sec, m.mtime_nsec);
             self.upsertFromWire(m.path, m.ver, true, m.mode, 0, m.mtime_sec, m.mtime_nsec, m.sha256);
             return;
+        }
+        // Metadata-only announce (ATTRIB path): identical content needs no
+        // transfer — just apply mode/mtime and adopt the version.
+        if (stored) |rec| {
+            if (rec.state == .live and !rec.is_dir and
+                std.mem.eql(u8, &rec.sha256, &m.sha256) and rec.size == m.size)
+            {
+                const abs = self.inst.absPath(m.path) catch return;
+                defer self.alloc.free(abs);
+                installer.setMeta(abs, m.mode, m.mtime_sec, m.mtime_nsec);
+                self.upsertFromWire(m.path, m.ver, false, m.mode, m.size, m.mtime_sec, m.mtime_nsec, m.sha256);
+                return;
+            }
         }
         self.startFetch(p, m.path, m.ver, m.size, m.sha256, m.mode, m.mtime_sec, m.mtime_nsec);
     }
@@ -710,24 +813,38 @@ pub const Daemon = struct {
             gop.key_ptr.* = self.alloc.dupe(u8, path) catch return;
         gop.value_ptr.* = meta;
 
+        // A fetch already in flight for this path is stale by definition
+        // (this announce carries the version we actually want now).
+        if (self.inst.fetchInProgress(path))
+            self.inst.abortFetch(path);
         self.inst.beginFetch(path, meta) catch |err| {
             log(.warn, "beginFetch {s}: {s}", .{ path, @errorName(err) });
             return;
         };
-        p.send(.{ .fetch_req = .{ .ver = ver, .path = path } }) catch {};
-        self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+        self.requestChunk(p, path, ver, 0);
+    }
+
+    /// Receiver-driven pull: exactly one chunk in flight per fetch.
+    fn requestChunk(self: *Daemon, p: *Peer, path: []const u8, ver: Version, offset: u64) void {
+        self.pushTo(p, .{ .fetch_req = .{ .ver = ver, .offset = offset, .len = installer.chunk_size, .path = path } });
     }
 
     const nack_stale: u16 = 1;
     const nack_missing: u16 = 2;
 
-    fn onFetchReq(self: *Daemon, p: *Peer, m: protocol.PathVer) void {
+    fn onFetchReq(self: *Daemon, p: *Peer, m: protocol.FetchReq) void {
         if (p.state != .ready) return;
         const rec = self.cs.lookup(m.path) orelse {
+            log(.info, "fetch_req {s} v=({x},{d}) off={d} from {s}: NACK missing (no record)", .{
+                m.path, m.ver.origin, m.ver.seq, m.offset, peerName(p),
+            });
             self.sendNack(p, m.path, m.ver, nack_missing);
             return;
         };
         if (rec.state != .live or rec.is_dir) {
+            log(.info, "fetch_req {s} v=({x},{d}) off={d} from {s}: NACK missing (state)", .{
+                m.path, m.ver.origin, m.ver.seq, m.offset, peerName(p),
+            });
             self.sendNack(p, m.path, m.ver, nack_missing);
             return;
         }
@@ -735,31 +852,19 @@ pub const Daemon = struct {
             // Stale request: the requester will re-fetch from the fresh
             // ANNOUNCE we proactively emit.
             self.sendNack(p, m.path, m.ver, nack_stale);
-            p.send(.{ .announce = .{
-                .ver = rec.ver,
-                .is_dir = false,
-                .mode = rec.mode,
-                .size = rec.size,
-                .mtime_sec = rec.mtime_sec,
-                .mtime_nsec = rec.mtime_nsec,
-                .path = m.path,
-                .sha256 = rec.sha256,
-            } }) catch {};
-            self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+            self.announceRecord(p, m.path, rec);
+            return;
+        }
+        if (m.offset > rec.size) {
+            self.sendNack(p, m.path, m.ver, nack_stale);
             return;
         }
         // Meta first: the unpaired-MOVE_TO fetch path on the receiver has
         // no ANNOUNCE yet; in the normal flow this is an idempotent no-op.
-        p.send(.{ .announce = .{
-            .ver = rec.ver,
-            .is_dir = false,
-            .mode = rec.mode,
-            .size = rec.size,
-            .mtime_sec = rec.mtime_sec,
-            .mtime_nsec = rec.mtime_nsec,
-            .path = m.path,
-            .sha256 = rec.sha256,
-        } }) catch return;
+        // (Only before the FIRST chunk — per-chunk prefaces waste frames.)
+        if (m.offset == 0) self.announceRecord(p, m.path, rec);
+
+        // Serve exactly one requested chunk (receiver-driven pacing).
         const abs = self.inst.absPath(m.path) catch return;
         defer self.alloc.free(abs);
         const fd = posix.open(abs, .{ .ACCMODE = .RDONLY }, 0) catch {
@@ -767,17 +872,30 @@ pub const Daemon = struct {
             return;
         };
         defer posix.close(fd);
-        var offset: u64 = 0;
+        const want: usize = @intCast(@min(@as(u64, m.len), rec.size - m.offset));
         var buf: [installer.chunk_size]u8 = undefined;
-        while (offset < rec.size) {
-            const want: usize = @intCast(@min(@as(u64, installer.chunk_size), rec.size - offset));
-            const n = posix.read(fd, buf[0..want]) catch return;
-            if (n == 0) return; // truncated mid-serve: receiver's hash check catches it
-            p.send(.{ .fetch_data = .{ .ver = m.ver, .offset = offset, .path = m.path, .data = buf[0..n] } }) catch return;
-            offset += n;
+        var data: []const u8 = &.{};
+        if (want > 0) {
+            const n = posix.pread(fd, buf[0..want], @intCast(m.offset)) catch return;
+            data = buf[0..n];
         }
-        if (p.wantsWrite())
-            self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+        log(.info, "fetch_req {s} v=({x},{d}) off={d} from {s}: serving {d} bytes", .{
+            m.path, m.ver.origin, m.ver.seq, m.offset, peerName(p), data.len,
+        });
+        self.pushTo(p, .{ .fetch_data = .{ .ver = m.ver, .offset = m.offset, .path = m.path, .data = data } });
+    }
+
+    fn announceRecord(self: *Daemon, p: *Peer, path: []const u8, rec: *const contentset.Record) void {
+        self.pushTo(p, .{ .announce = .{
+            .ver = rec.ver,
+            .is_dir = false,
+            .mode = rec.mode,
+            .size = rec.size,
+            .mtime_sec = rec.mtime_sec,
+            .mtime_nsec = rec.mtime_nsec,
+            .path = path,
+            .sha256 = rec.sha256,
+        } });
     }
 
     fn onFetchData(self: *Daemon, p: *Peer, m: protocol.FetchData) void {
@@ -785,9 +903,25 @@ pub const Daemon = struct {
         self.inst.writeChunk(m.path, m.ver, m.offset, m.data) catch |err| {
             log(.warn, "writeChunk {s}: {s}", .{ m.path, @errorName(err) });
             self.inst.abortFetch(m.path);
+            if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
             return;
         };
-        if (!self.inst.fetchComplete(m.path)) return;
+        if (!self.inst.fetchComplete(m.path)) {
+            // Progress: push the stall deadline out (the timeout is a
+            // STALL detector, not a transfer deadline).
+            if (self.incoming.getPtr(m.path)) |meta|
+                meta.deadline_ms = peer_mod.nowMs() + fetch_timeout_ms;
+            if (m.data.len == 0) {
+                // Zero progress: the sender's copy shrank under us (stale
+                // size).  Abort; the sender's next ANNOUNCE re-drives.
+                log(.warn, "fetch {s}: short file at offset {d}, aborting", .{ m.path, m.offset });
+                self.inst.abortFetch(m.path);
+                if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
+                return;
+            }
+            self.requestChunk(p, m.path, m.ver, self.inst.fetchOffset(m.path));
+            return;
+        }
 
         const meta = self.incoming.get(m.path) orelse {
             self.inst.abortFetch(m.path);
@@ -799,13 +933,19 @@ pub const Daemon = struct {
         const installed = self.inst.complete(m.path) catch |err| {
             log(.warn, "install {s} failed: {s}", .{ m.path, @errorName(err) });
             if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
+            // protocol.md: a hash mismatch REQUEUES (bounded — the file
+            // may be actively changing on the sender; each retry re-reads).
+            if (err == error.HashMismatch and meta.retries < 3) {
+                log(.info, "requeue fetch {s} (retry {d})", .{ m.path, meta.retries + 1 });
+                self.startFetch(p, m.path, meta.ver, meta.size, meta.sha256, meta.mode, meta.mtime_sec, meta.mtime_nsec);
+                if (self.incoming.getPtr(m.path)) |e| e.retries = meta.retries + 1;
+            }
             return;
         };
         if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
 
         self.upsertFromWire(m.path, m.ver, false, meta.mode, meta.size, meta.mtime_sec, meta.mtime_nsec, installed);
-        p.send(.{ .fetch_ack = .{ .ver = m.ver, .path = m.path, .sha256 = installed } }) catch {};
-        self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+        self.pushTo(p, .{ .fetch_ack = .{ .ver = m.ver, .path = m.path, .sha256 = installed } });
         log(.info, "installed {s} v=({x},{d}) size={d}", .{ m.path, m.ver.origin, m.ver.seq, meta.size });
     }
 
@@ -820,23 +960,63 @@ pub const Daemon = struct {
 
     fn onTombstone(self: *Daemon, p: *Peer, m: protocol.Tombstone) void {
         if (p.state != .ready) return;
+        var quarantine_loser = false;
         if (self.cs.lookup(m.path)) |rec| {
             switch (contentset.relate(m.ver, rec.ver)) {
                 .same, .older, .conflict_stored_wins => return,
                 .newer => {},
                 .conflict_incoming_wins => {
                     // Loser content is preserved (DFSR ConflictAndDeleted).
-                    self.inst.quarantine(m.path) catch {};
+                    quarantine_loser = true;
                 },
             }
         }
+        // Echo suppression BEFORE the fs mutations: the deletes we perform
+        // (and a quarantine move) must not re-enter the journal as local
+        // changes.  A dir tombstone removes the subtree: mark every live
+        // descendant we know about.
+        self.markEchoSubtree(m.path, m.is_dir);
+        if (quarantine_loser)
+            self.inst.quarantine(m.path) catch {};
         self.inst.tombstone(m.path, m.is_dir) catch |err| {
             log(.warn, "tombstone {s}: {s}", .{ m.path, @errorName(err) });
         };
         var rec = contentset.Record{ .ver = m.ver, .is_dir = m.is_dir, .state = .deleted };
         if (self.cs.lookup(m.path)) |old| rec.id = old.id;
         self.cs.upsert(m.path, rec) catch {};
+        // Tombstone the subtree records too (same version — the sender's
+        // per-file tombstones relate as same/older and no-op).
+        if (m.is_dir) self.tombstoneSubtree(m.path, m.ver);
         log(.info, "applied tombstone {s} v=({x},{d})", .{ m.path, m.ver.origin, m.ver.seq });
+    }
+
+    /// Echo-mark a path and (for dirs) every live descendant in the set.
+    fn markEchoSubtree(self: *Daemon, path: []const u8, is_dir: bool) void {
+        self.jr.noteEcho(path, .move_from, [_]u8{0} ** 32, 0) catch {};
+        if (!is_dir) return;
+        var it = self.cs.map.iterator();
+        while (it.next()) |e| {
+            const p2 = e.key_ptr.*;
+            if (e.value_ptr.state != .live) continue;
+            if (p2.len > path.len and std.mem.startsWith(u8, p2, path) and p2[path.len] == '/')
+                self.jr.noteEcho(p2, .move_from, [_]u8{0} ** 32, 0) catch {};
+        }
+    }
+
+    /// Tombstone all live descendants of a dir (applied dir delete).
+    fn tombstoneSubtree(self: *Daemon, path: []const u8, ver: Version) void {
+        var descendants: std.ArrayList(struct { p: []const u8, is_dir: bool, id: contentset.Id }) = .empty;
+        defer descendants.deinit(self.alloc);
+        var it = self.cs.map.iterator();
+        while (it.next()) |e| {
+            const p2 = e.key_ptr.*;
+            if (e.value_ptr.state != .live) continue;
+            if (p2.len > path.len and std.mem.startsWith(u8, p2, path) and p2[path.len] == '/')
+                descendants.append(self.alloc, .{ .p = p2, .is_dir = e.value_ptr.is_dir, .id = e.value_ptr.id }) catch return;
+        }
+        for (descendants.items) |d| {
+            self.cs.upsert(d.p, .{ .id = d.id, .ver = ver, .is_dir = d.is_dir, .state = .deleted }) catch {};
+        }
     }
 
     fn onMoveTo(self: *Daemon, p: *Peer, m: protocol.Move) void {
@@ -881,7 +1061,7 @@ pub const Daemon = struct {
         dst.ver = m.ver;
         dst.state = .live;
         if (installer.statPath(abs_to)) |st| {
-            dst.id = .{ .fsid = @intCast(st.dev), .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
+            dst.id = .{ .fsid = self.tree_fsid, .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
             dst.size = @intCast(@max(st.size, 0));
             dst.mtime_sec = @intCast(st.mtim.sec);
             dst.mtime_nsec = @intCast(@max(st.mtim.nsec, 0));
@@ -902,8 +1082,7 @@ pub const Daemon = struct {
     }
 
     fn sendNack(self: *Daemon, p: *Peer, path: []const u8, ver: Version, code: u16) void {
-        p.send(.{ .nack = .{ .ver = ver, .code = code, .path = path } }) catch {};
-        self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+        self.pushTo(p, .{ .nack = .{ .ver = ver, .code = code, .path = path } });
     }
 
     fn upsertFromWire(self: *Daemon, path: []const u8, ver: Version, is_dir: bool, mode: u16, size: u64, mtime_sec: i64, mtime_nsec: u32, sha: [32]u8) void {
@@ -921,7 +1100,7 @@ pub const Daemon = struct {
         if (self.inst.absPath(path)) |abs| {
             defer self.alloc.free(abs);
             if (installer.statPath(abs)) |st| {
-                rec.id = .{ .fsid = @intCast(st.dev), .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
+                rec.id = .{ .fsid = self.tree_fsid, .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
                 if (is_dir) {
                     rec.size = 0;
                 } else {
@@ -936,8 +1115,7 @@ pub const Daemon = struct {
 
     fn sendResyncReq(self: *Daemon, p: *Peer) void {
         const vec = resync.buildVector(&self.cs);
-        p.send(.{ .resync_req = vec }) catch {};
-        self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+        self.pushTo(p, .{ .resync_req = vec });
     }
 
     fn onResyncReq(self: *Daemon, p: *Peer, m: protocol.ResyncReq) void {
@@ -960,9 +1138,7 @@ pub const Daemon = struct {
             } }) catch return;
             count += 1;
         }
-        p.send(.{ .resync_done = count }) catch return;
-        if (p.wantsWrite())
-            self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+        self.pushTo(p, .{ .resync_done = count });
         log(.info, "served RESYNC to {s}: {d} entries", .{ peerName(p), count });
     }
 
@@ -1023,11 +1199,29 @@ pub const Daemon = struct {
         // Reconnect due outbound peers.
         for (self.peers.items) |p| {
             if (p.outbound and p.state == .closed and p.addr != null and now >= p.next_retry_ms) {
+                // Mesh dedup is per-PAIR: if we already hold a ready conn
+                // to this node (the pair's surviving direction), stay quiet.
+                if (p.known_id) |kid| {
+                    var have = false;
+                    for (self.peers.items) |q| {
+                        if (q.state == .ready and q.node_id != null and
+                            std.mem.eql(u8, q.node_id.?, kid))
+                        {
+                            have = true;
+                            break;
+                        }
+                    }
+                    if (have) {
+                        if (p.next_retry_ms <= now) // log only at the moment we first suppress
+                            log(.info, "dial to {s} suppressed: ready conn exists", .{kid});
+                        p.next_retry_ms = now + peer_mod.backoff_max_ms;
+                        continue;
+                    }
+                }
                 const fd = p.dial(p.addr.?) catch {
                     p.disconnected(now);
                     continue;
                 };
-                self.stageChange(@intCast(fd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, p);
                 self.stageChange(@intCast(fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
             }
             // Expired unpaired remote MOVE_FROMs = moved out of tree.
@@ -1062,10 +1256,19 @@ pub const Daemon = struct {
             if (e.value_ptr.deadline_ms <= now)
                 expired_f.append(self.alloc, e.key_ptr.*) catch break;
         }
+        var restalled = false;
         for (expired_f.items) |path| {
-            log(.warn, "fetch {s} timed out; aborting", .{path});
+            log(.warn, "fetch {s} stalled (no progress {d}ms); aborting", .{ path, fetch_timeout_ms });
             self.inst.abortFetch(path);
             if (self.incoming.fetchRemove(path)) |kv| self.alloc.free(kv.key);
+            restalled = true;
+        }
+        // Re-drive: a fresh vector pull re-fetches whatever we still lack
+        // (idempotent; peers stream only what our vector doesn't cover).
+        if (restalled) {
+            for (self.peers.items) |p| {
+                if (p.state == .ready) self.sendResyncReq(p);
+            }
         }
 
         // Ring-seq checkpoint (USN analog resume point).
