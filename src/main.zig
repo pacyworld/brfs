@@ -173,4 +173,5 @@ test {
     std.testing.refAllDecls(@import("events.zig"));
     std.testing.refAllDecls(@import("contentset.zig"));
     std.testing.refAllDecls(@import("journal.zig"));
+    std.testing.refAllDecls(@import("protocol.zig"));
 }

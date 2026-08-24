@@ -16,6 +16,39 @@ are trivially safe.
 `len` covers op + payload and MUST NOT exceed BRFS_MAX_FRAME (16 MiB); a
 peer sending a larger frame is dropped. `op` is one of the opcodes below.
 
+## Byte layouts
+
+All integers are big-endian. Strings (paths, node_id, psk) are
+length-prefixed with a u16 unless noted. `path` is always relative to the
+replicated root and validated on receipt (see below). `ver` is the pair
+`(origin u64, seq u64)`; `origin` is fnv1a64(node_id) of the node where the
+change was made. `flags` bit0 = ISDIR. Implemented by src/protocol.zig —
+the codec is the authority; keep this table in sync.
+
+```
+HELLO        proto u16 | node_id | psk | nonce [16]
+ANNOUNCE     ver | flags u16 | mode u16 | size u64 | mtime_sec i64 |
+             mtime_nsec u32 | path | sha256 [32]
+FETCH_REQ    ver | path
+FETCH_DATA   ver | offset u64 | path | data (u32 len + bytes)
+FETCH_ACK    ver | path | sha256 [32]
+TOMBSTONE    ver | flags u16 | path
+RESYNC_REQ   count u32 | count * (origin u64 | max_seq u64)   (version vector)
+RESYNC_ENTRY ver | flags u16 | state u8 | mode u16 | size u64 |
+             mtime_sec i64 | mtime_nsec u32 | path | sha256 [32]
+MOVE_FROM    ver | flags u16 | cookie u32 | path
+MOVE_TO      ver | flags u16 | cookie u32 | path
+NACK         ver | code u16 | path
+```
+
+RESYNC_ENTRY carries `state` (1=live, 2=deleted) so tombstones propagate
+during catch-up. Rename cookie 0 is a valid cookie (first rename after
+boot); pair by cookie value, not by "nonzero".
+
+Decoding is strict: every byte of the payload must be consumed
+(TrailingGarbage), every length field must fit the frame (Truncated), and
+paths must pass the validation below before ANY filesystem use.
+
 ## Versions
 
 A file's version is the pair `ver = (origin_node, origin_seq)`:
