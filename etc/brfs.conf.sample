@@ -1,0 +1,32 @@
+# brfsd configuration (UCL)
+#
+# One source of truth for this node. The kernel module never reads this
+# file; brfsd pushes what brfs.ko needs via ioctl at startup.
+
+# Unique identifier for this node in the replication group. Used as the
+# LWW tiebreak: conflicts resolve by (version, node_id).
+node_id = "node-a"
+
+# The replicated folder: an ordinary local tree (UFS2 or ZFS). No new
+# mount point; every member holds a full local copy.
+replicated_path = "/data/replicated"
+
+# Daemon state: content set, staging area, conflict quarantine.
+# staging/ must be on the SAME filesystem as replicated_path (atomic
+# rename requirement); conflicts/ holds LWW losers.
+state_dir = "/var/db/brfs"
+
+# Peer listener for the replication protocol (framed binary, PSK in HELLO).
+listen = "0.0.0.0:4590"
+
+# Full mesh: every other member of the group.
+peers = [
+    "10.66.0.12:4590",
+    "10.66.0.13:4590",
+]
+
+# Pre-shared key for the POC HELLO handshake. TLS replaces this later.
+psk_file = "/usr/local/etc/brfs.psk"
+
+# Outbound transfer cap in bytes/sec; 0 = unlimited.
+rate_limit = 0

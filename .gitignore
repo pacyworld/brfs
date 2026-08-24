@@ -1,0 +1,18 @@
+# Zig
+zig-out/
+.zig-cache/
+
+# kmod build artifacts
+kmod/*.ko
+kmod/*.o
+kmod/*.debug
+kmod/.depend.*
+kmod/machine
+kmod/x86
+kmod/i386
+kmod/opt_*.h
+kmod/vnode_if.h
+kmod/vnode_if_newproto.h
+kmod/vnode_if_typedef.h
+kmod/export_syms
+kmod/*.full

@@ -1,0 +1,55 @@
+#!/bin/sh
+
+# PROVIDE: brfsd
+# REQUIRE: DAEMON
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf to enable brfsd:
+#
+# brfsd_enable (bool):	Set to YES to enable brfsd.
+#			Default: NO
+# brfsd_config (str):	Path to config file.
+#			Default: /usr/local/etc/brfs.conf
+# brfsd_output (str):	Path to the daemon's own log output.
+#			Default: /var/log/brfs/brfsd.log
+#
+
+. /etc/rc.subr
+
+name="brfsd"
+rcvar="${name}_enable"
+desc="BrFS replication daemon"
+
+load_rc_config $name
+
+: ${brfsd_enable:="NO"}
+: ${brfsd_config:="/usr/local/etc/brfs.conf"}
+: ${brfsd_output:="/var/log/brfs/brfsd.log"}
+
+procname="/usr/local/bin/brfsd"
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-f -p ${pidfile} -t ${name} -o ${brfsd_output} ${procname} --config=${brfsd_config}"
+
+start_precmd="${name}_prestart"
+
+brfsd_prestart()
+{
+	local dir
+
+	for dir in $(dirname "${brfsd_output}") /var/db/brfs \
+	    /var/db/brfs/staging /var/db/brfs/conflicts; do
+		[ -d "${dir}" ] || install -d -m 750 "${dir}"
+	done
+	if ! kldstat -q -m brfs; then
+		warn "brfs kernel module is not loaded (kldload brfs or brfs_load=YES in loader.conf)"
+		return 1
+	fi
+	if [ ! -c /dev/brfs ]; then
+		warn "/dev/brfs does not exist"
+		return 1
+	fi
+}
+
+run_rc_command "$1"
