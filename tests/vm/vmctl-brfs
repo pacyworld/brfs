@@ -1,0 +1,121 @@
+#!/bin/sh
+#
+# vmctl-brfs - manage the BrFS test bhyve VMs (freebsd-dev1)
+#
+# Three nodes: brfs-a (10.66.0.11, tap1, nmdm11), brfs-b (10.66.0.12,
+# tap2, nmdm12), brfs-c (10.66.0.13, tap3, nmdm13).
+# Disks: zvols vault/VMs/brfs-{a,b,c} (8G sparse)
+# Net:   NAT via host bridge0 + pf <cni-nat> table (10.66.0.0/24)
+# Boot:  UEFI (BHYVE_UEFI.fd) — bhyveload/userboot hangs with this image
+# Console: serial on nmdm pair, logged to /var/log/<vm>-console.log
+#
+# Usage: vmctl-brfs {a|b|c|all} start | stop | console | status
+#
+
+BOOTROM=/usr/local/share/uefi-firmware/BHYVE_UEFI.fd
+MEM=2G
+CPUS=2
+
+die() { echo "vmctl-brfs: $*" >&2; exit 1; }
+
+node_setup() {
+	case "$1" in
+	a) VM=brfs-a; DISK=/dev/zvol/vault/VMs/brfs-a; TAP=tap1; NMDM=11; IP=10.66.0.11 ;;
+	b) VM=brfs-b; DISK=/dev/zvol/vault/VMs/brfs-b; TAP=tap2; NMDM=12; IP=10.66.0.12 ;;
+	c) VM=brfs-c; DISK=/dev/zvol/vault/VMs/brfs-c; TAP=tap3; NMDM=13; IP=10.66.0.13 ;;
+	*) die "unknown node: $1 (use a, b, c, or all)" ;;
+	esac
+	GUEST_CON=/dev/nmdm${NMDM}A
+	HOST_CON=/dev/nmdm${NMDM}B
+	PIDFILE=/var/run/${VM}.pid
+	LOGPIDFILE=/var/run/${VM}-console.pid
+	SERIAL_LOG=/var/log/${VM}-console.log
+}
+
+vm_running() {
+	[ -c "/dev/vmm/${VM}" ]
+}
+
+do_start() {
+	vm_running && die "${VM} already running"
+	[ -c "$DISK" ] || die "disk not found: $DISK"
+	[ -f "$BOOTROM" ] || die "boot ROM not found: $BOOTROM (pkg install bhyve-firmware)"
+	[ -c "/dev/${TAP}" ] || die "tap device not found: $TAP"
+	kldstat -q -m vmm || kldload vmm || die "cannot load vmm"
+	kldstat -q -m nmdm || kldload nmdm || die "cannot load nmdm"
+
+	bhyvectl --destroy --vm="$VM" 2>/dev/null
+
+	# Keep a reader on the console at all times so guest serial writes
+	# never block; log everything for post-mortem/boot debugging.
+	daemon -f -p "$LOGPIDFILE" -t "${VM}-console" \
+		sh -c "cat $HOST_CON >> $SERIAL_LOG" || die "console logger failed"
+
+	daemon -f -p "$PIDFILE" -t "$VM" bhyve \
+		-c "$CPUS" -m "$MEM" -H -A -P \
+		-s 0:0,hostbridge \
+		-s 1:0,lpc \
+		-s 2:0,virtio-blk,"$DISK" \
+		-s 3:0,virtio-net,"$TAP" \
+		-l com1,"$GUEST_CON" \
+		-l bootrom,"$BOOTROM" \
+		"$VM" || die "bhyve failed to start"
+	echo "vmctl-brfs: ${VM} started (ssh admin@${IP}, console: vmctl-brfs ${VM#brfs-} console)"
+}
+
+do_stop() {
+	if ! vm_running; then
+		echo "vmctl-brfs: ${VM} not running"
+	else
+		echo "vmctl-brfs: requesting ${VM} shutdown (30s grace)"
+		ssh -n -o BatchMode=yes -o ConnectTimeout=5 admin@${IP} \
+			'doas shutdown -p now' 2>/dev/null || true
+		i=0
+		while vm_running && [ $i -lt 30 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		if vm_running; then
+			echo "vmctl-brfs: forcing destroy of ${VM}"
+			bhyvectl --destroy --vm="$VM"
+		fi
+	fi
+	if [ -f "$LOGPIDFILE" ]; then
+		kill "$(cat "$LOGPIDFILE")" 2>/dev/null
+	fi
+	rm -f "$PIDFILE" "$LOGPIDFILE"
+	echo "vmctl-brfs: ${VM} stopped"
+}
+
+do_node() {
+	node_setup "$1"
+	case "$2" in
+	start)	do_start ;;
+	stop)	do_stop ;;
+	console)
+		vm_running || die "${VM} not running"
+		echo "Connected to ${VM} console. Escape: ~." >&2
+		cu -l "$HOST_CON" -s 9600
+		;;
+	status)
+		if vm_running; then
+			echo "${VM}: running"
+		else
+			echo "${VM}: stopped"
+		fi
+		;;
+	*)
+		die "usage: vmctl-brfs {a|b|c|all} start | stop | console | status"
+		;;
+	esac
+}
+
+[ $# -ge 2 ] || die "usage: vmctl-brfs {a|b|c|all} start | stop | console | status"
+
+if [ "$1" = "all" ]; then
+	for n in a b c; do
+		do_node "$n" "$2"
+	done
+else
+	do_node "$1" "$2"
+fi
