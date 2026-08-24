@@ -1,6 +1,6 @@
 # BrFS (BSD Replicated File System) — DFSR-style Replicated Folder Engine for FreeBSD
 
-Status: PLANNING → IMPLEMENTATION (v0.4, 2026-08-23)
+Status: IMPLEMENTATION (v0.5, 2026-08-24) — Phase 0 complete, P0.2 GO
 Name: FINAL — **BrFS** ("Brrr... it's cold"). Daemon: `brfsd`, kmod: `brfs.ko`, utility: `brfsctl`.
 Owner: Daniel
 Target: FreeBSD 15.0+ (VFS event notification points / inotify landed 15.0-RELEASE)
@@ -139,14 +139,10 @@ pairs. All ops idempotent. See docs/protocol.md.
 
 ## Phases
 
-- Phase 0 spikes: P0.0 DONE; P0.1 characterize notification points (source +
-  dtrace + inotify-tools oracle: event taxonomy, rename cookies,
-  VIRF_INOTIFY_PARENT propagation, NFS/nullfs coverage, flag lifecycle on
-  vnode recycle); P0.2 GATING kmod spike (tap + flags + ring + /dev/brfs,
-  GO/NO-GO, NO-GO→kernel-patch strategy); P0.3 bhyve 3×VM rig on vault pool
-  (vmctl pattern: UEFI BHYVE_UEFI.fd, nmdm serial, ttyu0 getty OFF,
-  bridge+tap+NAT via pf cni-nat; zig NOT in guest — host builds, scp; kmod
-  builds in-guest; NEVER test kmod on host); P0.4 repo scaffolding.
+- Phase 0 spikes: ALL DONE. P0.0 (autodo UAF fix); P0.1 notification-point
+  characterization (findings below, GO); P0.2 GATING kmod spike (tap +
+  flags + ring + /dev/brfs — GO, findings below); P0.3 bhyve 3×VM rig on
+  vault pool (RUNNING: brfs-a/b/c, vmctl-brfs); P0.4 repo scaffolding.
 - Phase 1: POC end-to-end ON brfs.ko from day one. T1–T8 green on 3 VMs with
   mid-test daemon restarts.
 - Phase 2: kernel hardening — fidelity vs dtrace oracle, ring sizing/drop
@@ -227,6 +223,133 @@ Refined tap design for P0.2 (supersedes the earlier option list):
   behavior if the tree root is rmdir'd mid-watch).
 - GO decision: mechanism is fully mapped with exported symbols; proceed to
   P0.2 implementation in the bhyve rig.
+
+## P0.2 findings (2026-08-24, brfs-a/b/c bhyve rig, 15.1) — GO
+
+The tap is implemented and validated. brfs.ko interposes vop_inotify on
+the vop vectors serving registered trees and feeds /dev/brfs; brfsd
+drains real filesystem events end-to-end.
+
+Implementation decisions (settled by the spike):
+
+- **Vector patching, lazy and vnode-driven** (supersedes "enumerate the
+  vectors"): vfs_vector_op_register() BAKES defaults into each vector at
+  registration, so patching default_vnodeops would be useless. Instead
+  ADDROOT patches the vop_inotify slot of every vector encountered in
+  the tree walk, discovered via vnode->v_op — no symbol references, so
+  base-kernel UFS/FFS and module ZFS work identically with no
+  MODULE_DEPEND. Only slots holding vop_stdinotify are replaced (bypass
+  vectors like nullfs are skipped — their writes reach us via bypass
+  re-dispatch on the lower vnode). Restore at DELROOT refcount-zero and
+  MOD_UNLOAD. (#14 KBI: single-interposer enforced by the
+  == vop_stdinotify precondition; we never stomp a foreign override.)
+- **Emit-all** (#13, decided): NO lineage filtering in kernel. The VIRF
+  gate flags scope the stream; the daemon discards events outside its
+  roots by (fsid, dir_fileid). No namecache walk on the event path, no
+  UAF surface. Validated: genuine inotify consumers' events simply pass
+  through the same ring.
+- **fileid/gen via guarded VOP_GETATTR in the tap**: all vfs_subr.c
+  post-hook call sites hold the subject/parent locked EXCEPT the rename
+  post hook (args are WILLRELE, already unlocked) — for that one the tap
+  takes LK_SHARED|LK_NOWAIT and degrades to fileid=0 (daemon rescans) on
+  contention or doom. No vnode locks are ever acquired without NOWAIT.
+- **Recursion engine**: VIRF_INOTIFY on every directory (named child
+  events are gated on the parent dir's VIRF_INOTIFY), VIRF_INOTIFY_PARENT
+  on files (self events). Existing tree flagged by the ADDROOT walk
+  (vfs_inotify.c dirent-walk pattern, recursive, iterative queue — no
+  kernel stack recursion); new children propagate via cache_enter for
+  free; new dirs upgraded by the tap at CREATE; populated dirs renamed
+  INTO a tree get a deferred taskqueue subtree walk (preallocated pool —
+  no allocation on the event path). The walk trigger must NOT key on
+  "was already flagged": the MOVE_FROM half of a rename performs the
+  upgrade before MOVE_TO is seen — walk on every MOVE_TO of a dir
+  (in-tree moves degenerate to one readdir).
+- **Pollinfo invariant (the hard-won one)**: inotify_log() dereferences
+  vp->v_pollinfo with NO NULL check — genuine inotify only flags watched
+  vnodes, which always have pollinfo. We allocate pollinfo
+  (v_addpollinfo) BEFORE setting VIRF_INOTIFY on any directory. Without
+  this, the first P0.2 run panicked (page fault in inotify_log from
+  cache_vop_inotify, write to 0x18): stale tree flags survived a
+  kldunload, the restored vector routed an open(2) on a flagged dir
+  straight into vop_stdinotify, NULL pollinfo deref. DELROOT and
+  MOD_UNLOAD now also strip directory flags via an unflag walk BEFORE
+  vector restore; file PARENT flags self-heal via the genuine decay
+  path. Panic regression test (unload with flagged tree, then fts-based
+  rm -rf) now passes clean.
+- **Forwarding guard**: events reach vop_stdinotify only when genuine
+  inotify watches exist on vp/dvp (vpi_inotify non-empty) — otherwise
+  vn_inotify's cache_vop_inotify fallback would strip our PARENT flags
+  (decay hazard from P0.1, confirmed live: see below).
+- **Root-dir rmdir/revoke while vref'd (P0.1 open question, ANSWERED)**:
+  the vref pins the doomed vnode; a DELETE event for the root itself
+  still fires (named gate on the subject's own VIRF_INOTIFY) so the
+  daemon learns the tree died; ops via surviving open fds still fire and
+  are safe (pollinfo invariant + emit-all); DELROOT skips the unflag
+  walk for doomed roots (cannot readdir), residue is inert after vector
+  restore and fades with vnode recycling; re-ADDROOT of the same path
+  re-resolves to the new vnode and re-flags. No deadlock, no leak beyond
+  transient flags.
+- **Consecutive-dedup in the ring**: identical (op, dir_fileid, fileid,
+  name) events collapse; a 50-write storm yielded ~12 events (drain
+  boundaries). Rename pairs never dedup (op differs). The synthetic
+  test_event sysctl uses unique names so it can still fill the ring.
+- **Ring overflow**: validated — 5000-event burst into a 4096 ring =
+  4096 enqueued + 904 drops, and the next event is preceded by
+  BRFS_OP_OVERFLOW (daemon logs "tree rescan required"). Marker seq is
+  assigned before the triggering event so ring order stays monotonic.
+
+Validation matrix (all on the 3-VM rig unless noted):
+
+- T11-lite event fidelity: scripted op battery (create/modify/mkdir/
+  nested/chmod/rename/delete/import/storm) matches ground truth on
+  brfs-a, brfs-b, brfs-c; dir fileids verified against stat(1); va_gen
+  disambiguates inode reuse (deleted file vs recreated same-inode file
+  carry different gen).
+- Oracle coexistence: genuine inotify watcher on the tree received the
+  same CREATE/MOVED_FROM/MOVED_TO/DELETE with the SAME rename cookies as
+  the brfs feed while brfsd drained concurrently.
+- brfsd restart mid-stream: ops performed while the daemon was down
+  (including a create inside a directory created during the outage)
+  drained intact on restart; seq continuity preserved.
+- ZFS: full battery on a file-backed pool passes, including
+  same-dataset populated-dir rename-in + deferred walk. (Cross-dataset/
+  pool rename is EXDEV — not a case.) NOTE: early ZFS run showed
+  spurious pool-wide coverage — root cause was a leftover brfsd from a
+  failed attempt still registered on the pool root; single-open guard
+  makes overlapping generations confusing in logs. Clean step-by-step
+  re-run shows no walk escape and silent gates outside the root.
+- Lifecycle: load/unload/reload across repeated rounds, SIGTERM clean
+  exit, unload veto while the daemon holds the device (EBUSY), DELROOT
+  silence (events stop), reload + re-ADDROOT green.
+- Repeatable: tests/vm/tap-smoke.sh runs the battery + lifecycle checks
+  and passes on all three VMs.
+
+Known limitations (documented, POC-accepted):
+
+- inotify watch REMOVAL inside our tree strips VIRF_INOTIFY off that dir
+  (vfs_inotify.c:377 unsets unconditionally when the last watch goes) —
+  coverage for that dir's direct children goes silent until the next
+  ADDROOT re-register. inotify is oracle-only for BrFS; the daemon's
+  scan layer is the durability floor. Phase 2 decision: periodic
+  idempotent root re-push or a kernel-side flag refcount.
+- Namespace scoping: ADDROOT flags the vnodes resolved in the caller's
+  namespace. Writes via a different alias (e.g. host path into a jailed
+  nullfs tree) are not covered by the alias registration. Deployment
+  rule: the daemon registers the path its writers use.
+- Sub-mounts inside a watched tree are not covered (walk does not
+  descend; their vectors are not patched).
+- First rename after boot carries cookie 0 (inotify_rename_cookie starts
+  at 0) — pair by (cookie, op adjacency), 0 is not "no cookie" for
+  MOVE_* ops.
+- Ring emits no IN_CLOSE_WRITE/IN_ACCESS/IN_OPEN (read-side noise);
+  daemon coalescing is the quiescence signal for POC tests.
+- The unload grace for in-flight tap calls is pause(hz); a hard
+  epoch-style drain is Phase 2 hardening.
+- Guest pkg/DNS through the rig NAT is broken (resolver failures) —
+  build oracle/test tools on the host or in-guest from source.
+
+GO: proceed to Phase 1 (brfsd replication logic). The kernel change
+feed is proven sufficient; no fallback (kernel patch) was needed.
 
 ## Risks
 

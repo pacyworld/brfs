@@ -148,11 +148,13 @@ pub fn main() !void {
                             log(.warn, "RING OVERFLOW seq={d} — tree rescan required", .{bev.seq});
                             continue;
                         }
-                        log(.info, "seq={d} op={s} dir={d} file={d} cookie={x} {s}{s}", .{
+                        log(.info, "seq={d} op={s} fsid={x} dir={d} file={d} gen={d} cookie={x} {s}{s}", .{
                             bev.seq,
                             events.opName(bev.op),
+                            bev.fsid,
                             bev.dir_fileid,
                             bev.fileid,
+                            bev.gen,
                             bev.cookie,
                             bev.nameSlice(),
                             if (bev.isDir()) " (dir)" else "",
