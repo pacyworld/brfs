@@ -28,9 +28,18 @@ pub const Config = struct {
             return error.NoPeers;
         if (self.state_dir.len == 0 or self.state_dir[0] != '/')
             return error.BadStateDir;
-        // Staging must live on the same filesystem as the replicated tree
-        // for rename(2) installs to be atomic; with state_dir inside or
-        // beside the tree this holds — enforce by construction in P1.
+        // state_dir inside the watched tree = staging events feed the
+        // journal = self-echo storm.  Reject by prefix at component
+        // granularity ("/data/x" must not match "/data/xyz").
+        if (std.mem.eql(u8, self.state_dir, self.replicated_path))
+            return error.StateDirInsideTree;
+        if (std.mem.startsWith(u8, self.state_dir, self.replicated_path)) {
+            const rest = self.state_dir[self.replicated_path.len..];
+            if (rest.len > 0 and rest[0] == '/')
+                return error.StateDirInsideTree;
+        }
+        // Same-filesystem rule (staging rename(2) must not EXDEV) is
+        // checked at startup via statfs — it cannot be evaluated here.
     }
 };
 
@@ -124,5 +133,24 @@ test "config validate accepts minimal good config" {
         .num_peers = 1,
     };
     cfg.peers[0] = "10.0.0.2:4590";
+    try cfg.validate();
+}
+
+test "config validate rejects state_dir inside the watched tree" {
+    var cfg = Config{
+        .node_id = "a",
+        .replicated_path = "/data/replicated",
+        .state_dir = "/data/replicated/.brfs",
+        .num_peers = 1,
+    };
+    cfg.peers[0] = "10.0.0.2:4590";
+    try std.testing.expectError(error.StateDirInsideTree, cfg.validate());
+
+    // Same name, exact match:
+    cfg.state_dir = "/data/replicated";
+    try std.testing.expectError(error.StateDirInsideTree, cfg.validate());
+
+    // Component-granularity: "/data/replicated2" is NOT inside the tree:
+    cfg.state_dir = "/data/replicated2/.brfs";
     try cfg.validate();
 }

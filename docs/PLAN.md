@@ -129,6 +129,13 @@ pairs. All ops idempotent. See docs/protocol.md.
 4. Per-path coalescing.
 5. Per-path monotonic ordering (older dropped, newer queued).
 6. Self-echo suppression (installer's rename never re-announces — T7).
+7. Wire path validation: every path in an incoming message is validated
+   (relative to root, no empty/./.. components, no leading /) before ANY
+   filesystem use (T16 hostile-peer test).
+8. Version derivation: ver = (origin_node, origin_seq), persistent per-node
+   monotonic counter — no wall-clock in ordering (T18 clock-skew test).
+9. Metadata policy: mode+mtime replicated; uid/gid NOT (service user owns
+   content per node); no ACL/xattr/symlink/device in POC.
 
 ## Phases
 

@@ -1,0 +1,12 @@
+.{
+    .name = .brfs,
+    .version = "0.0.0",
+    .fingerprint = 0x1db5b00d01a9a56d,
+    .minimum_zig_version = "0.15.0",
+    .paths = .{
+        "build.zig",
+        "src",
+        "ctl",
+        "lib",
+    },
+}

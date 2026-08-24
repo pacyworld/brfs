@@ -13,33 +13,66 @@ are trivially safe.
 +--------+--------+-----------------------------------+
 ```
 
-`len` covers op + payload. `op` is one of the opcodes below.
+`len` covers op + payload and MUST NOT exceed BRFS_MAX_FRAME (16 MiB); a
+peer sending a larger frame is dropped. `op` is one of the opcodes below.
+
+## Versions
+
+A file's version is the pair `ver = (origin_node, origin_seq)`:
+`origin_node` is the node_id of the member where the change was made;
+`origin_seq` is a persistent, per-node, strictly monotonic counter
+incremented on every local mutation. Clock time plays no role in ordering
+— NTP skew cannot break convergence (T18 verifies).
+
+- Same origin, higher seq → newer (normal update).
+- Different origins where neither version subsumes the other → **conflict**.
+  Deterministic LWW on all members: higher `(origin_seq, origin_node)` wins;
+  the losing content moves to `/var/db/brfs/conflicts/` (quarantine), never
+  silently dropped.
+- Receiving an already-known or older version is a no-op (idempotency).
 
 ## Opcodes
 
-| op | name        | payload | direction |
-|----|-------------|---------|-----------|
-| 1  | HELLO       | node_id, protocol version, PSK | handshake |
-| 2  | ANNOUNCE    | path, op, size, mtime, sha256, ver | originator → peers |
-| 3  | FETCH_REQ   | path, ver | receiver → originator |
-| 4  | FETCH_DATA  | path, ver, chunk data | originator → receiver |
-| 5  | FETCH_ACK   | path, ver | receiver → originator |
-| 6  | TOMBSTONE   | path, ver | originator → peers |
-| 7  | RESYNC_REQ  | node content-set summary | joining node → peer |
-| 8  | RESYNC_ENTRY| path, size, mtime, sha256, ver | peer → joining node |
-| 9  | MOVE_FROM   | path, ver, cookie | originator → peers |
-| 10 | MOVE_TO     | path, ver, cookie | originator → peers |
+| op | name        | payload | notes |
+|----|-------------|---------|-------|
+| 1  | HELLO       | node_id, protocol version, PSK, nonce | handshake; nonce prevents replay |
+| 2  | ANNOUNCE    | path, op-flags, size, mtime, sha256, ver | flags carry ISDIR |
+| 3  | FETCH_REQ   | path, ver | |
+| 4  | FETCH_DATA  | path, ver, offset, len, data | chunked; offset+len sequence the file |
+| 5  | FETCH_ACK   | path, ver, sha256 | post-install hash re-verify |
+| 6  | TOMBSTONE   | path, ver, ISDIR | delete |
+| 7  | RESYNC_REQ  | content-set summary | joining node → peer |
+| 8  | RESYNC_ENTRY| path, ISDIR, size, mtime, sha256, ver | peer → joining node |
+| 9  | MOVE_FROM   | path, ver, cookie, ISDIR | rename source |
+| 10 | MOVE_TO     | path, ver, cookie, ISDIR | rename destination |
+| 11 | NACK        | path, ver, error code | explicit failure; never silently drop |
 
-MOVE_FROM/MOVE_TO share a cookie (the kernel rename cookie) and are applied
-as a rename pair, never as delete+create.
+## Directories
 
-## Versioning and conflicts
+Empty directories replicate via ANNOUNCE with ISDIR (created on receipt).
+Directory delete = TOMBSTONE with ISDIR. A directory rename is a MOVE pair
+with ISDIR; the receiver rewrites the subtree paths in its content set
+descendant-by-descendant (T12 covers a populated-subtree rename).
 
-Per-file monotonic version, originator-assigned. Conflict = same path
-announced from two members with versions not ordered by history.
-Resolution is deterministic on all members: higher `(ver, node_id)` wins
-(LWW). The losing version is moved to `/var/db/brfs/conflicts/` — never
-silently dropped.
+## Metadata policy (POC)
+
+Replicated: mode bits and mtime. NOT replicated: uid/gid (content is owned
+by the service user on each node), ACLs, flags, xattrs, symlinks, devices.
+ATTRIB kernel events drive metadata-only ANNOUNCEs (mode/mtime).
+
+## Write stability
+
+The journal debounces: a file is hashed and announced only after a
+quiet period (no MODIFY for N ms) or CLOSE_WRITE. After transfer, the
+receiver's FETCH_ACK includes the sha256 of what it installed; a mismatch
+requeues.
+
+## Wire path validation (non-negotiable)
+
+All paths in incoming messages are validated before ANY filesystem use:
+relative to the replicated root, no empty components, no `.`/`..`
+components, no leading `/`. Violations are dropped and the peer is
+demoted (logged; repeated violations = disconnect).
 
 ## Ordering
 
@@ -55,5 +88,5 @@ loop hazard; it is covered by test T7.
 
 ## Security (POC)
 
-Bind to a trusted interface; HELLO carries a pre-shared key. TLS/mTLS is
-post-POC (Phase 3).
+Bind to a trusted interface; HELLO carries a pre-shared key + nonce.
+TLS/mTLS is post-POC (Phase 3).

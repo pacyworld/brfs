@@ -63,16 +63,28 @@ enum brfs_op {
 /* be_flags */
 #define	BRFS_EVF_ISDIR		0x0001	/* event subject is a directory */
 
+/*
+ * Event record.  512 bytes exactly: power-of-two slot size so a future
+ * mmap'd shared ring indexes slots with a shift, not a division.
+ * be_fsid + be_dir_fileid/be_fileid disambiguate across filesystems
+ * (fileids are per-filesystem); be_gen (va_gen) guards inode reuse.
+ */
 struct brfs_event {
 	uint64_t	be_seq;		/* monotonic sequence (USN analog) */
+	uint64_t	be_fsid;	/* filesystem id (va_fsid) */
 	uint64_t	be_dir_fileid;	/* containing directory fileid */
 	uint64_t	be_fileid;	/* subject fileid, 0 if unknown */
+	uint64_t	be_gen;		/* subject generation (va_gen), 0 if n/a */
 	uint32_t	be_op;		/* enum brfs_op */
 	uint32_t	be_cookie;	/* rename pairing cookie, 0 if none */
 	uint32_t	be_flags;	/* BRFS_EVF_* */
 	uint32_t	be_abi;		/* BRFS_ABI_VERSION */
 	char		be_name[NAME_MAX + 1]; /* last component; may be "" */
+	uint64_t	be_reserved[25]; /* zero; future use, keeps 512 layout */
 };
+#ifdef _KERNEL
+_Static_assert(sizeof(struct brfs_event) == 512, "brfs_event must stay 512");
+#endif
 
 /* ioctl payloads */
 struct brfs_root {

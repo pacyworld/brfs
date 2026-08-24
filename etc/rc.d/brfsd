@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # PROVIDE: brfsd
-# REQUIRE: DAEMON
+# REQUIRE: NETWORKING mountcritremote
 # BEFORE: LOGIN
 # KEYWORD: shutdown
 #

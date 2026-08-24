@@ -64,9 +64,10 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/poll.h>
+#include <sys/priv.h>
 #include <sys/proc.h>
+#include <sys/rmlock.h>
 #include <sys/selinfo.h>
-#include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
@@ -76,35 +77,7 @@
 MALLOC_DEFINE(M_BRFS, "brfs", "brfs event ring");
 
 /* ----------------------------------------------------------------
- * Tunables / sysctls
- * ---------------------------------------------------------------- */
-
-SYSCTL_NODE(_security, OID_AUTO, brfs, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
-    "brfs event tap parameters");
-
-static u_int	brfs_ring_size_cfg = BRFS_DEFAULT_RING_SIZE;
-SYSCTL_UINT(_security_brfs, OID_AUTO, ring_size, CTLFLAG_RDTUN,
-    &brfs_ring_size_cfg, BRFS_DEFAULT_RING_SIZE,
-    "brfs event ring capacity in events (load-time only)");
-
-static int	brfs_enabled = 1;
-SYSCTL_INT(_security_brfs, OID_AUTO, enabled, CTLFLAG_RW,
-    &brfs_enabled, 1, "brfs event tap master switch");
-
-static int	brfs_log_events = 0;
-SYSCTL_INT(_security_brfs, OID_AUTO, log_events, CTLFLAG_RW,
-    &brfs_log_events, 0, "log each emitted event to the kernel console");
-
-static uint64_t	brfs_event_count;
-SYSCTL_U64(_security_brfs, OID_AUTO, event_count, CTLFLAG_RD,
-    &brfs_event_count, 0, "total events pushed to the ring");
-
-static uint64_t	brfs_ring_drops;
-SYSCTL_U64(_security_brfs, OID_AUTO, ring_drops, CTLFLAG_RD,
-    &brfs_ring_drops, 0, "events dropped due to ring overflow");
-
-/* ----------------------------------------------------------------
- * Ring buffer
+ * Ring buffer state (declared early: sysctl handlers touch it)
  * ---------------------------------------------------------------- */
 
 static struct mtx	brfs_ring_mtx;
@@ -119,6 +92,54 @@ static struct selinfo	brfs_sel;
 static struct cdev	*brfs_cdev;
 static int		brfs_dev_open;		/* single-open flag */
 static int		brfs_dev_dying;		/* set when module is unloading */
+
+/* ----------------------------------------------------------------
+ * Tunables / sysctls
+ * ---------------------------------------------------------------- */
+
+SYSCTL_NODE(_security, OID_AUTO, brfs, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "brfs event tap parameters");
+
+static u_int	brfs_ring_size_cfg = BRFS_DEFAULT_RING_SIZE;
+SYSCTL_UINT(_security_brfs, OID_AUTO, ring_size, CTLFLAG_RDTUN,
+    &brfs_ring_size_cfg, BRFS_DEFAULT_RING_SIZE,
+    "brfs event ring capacity in events (load-time only)");
+
+static int	brfs_enabled = 1;
+static int
+sysctl_brfs_enabled(SYSCTL_HANDLER_ARGS)
+{
+	int error, was;
+
+	was = brfs_enabled;
+	error = sysctl_handle_int(oidp, &brfs_enabled, 0, req);
+	if (error == 0 && req->newptr != NULL && brfs_enabled && !was) {
+		/*
+		 * Re-enabling after a disabled window means events were
+		 * lost: flag an overflow so the next push emits
+		 * BRFS_OP_OVERFLOW and the daemon rescans.
+		 */
+		mtx_lock(&brfs_ring_mtx);
+		brfs_overflow_pending = 1;
+		mtx_unlock(&brfs_ring_mtx);
+	}
+	return (error);
+}
+SYSCTL_PROC(_security_brfs, OID_AUTO, enabled,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_brfs_enabled, "I", "brfs event tap master switch");
+
+static int	brfs_log_events = 0;
+SYSCTL_INT(_security_brfs, OID_AUTO, log_events, CTLFLAG_RW,
+    &brfs_log_events, 0, "log each emitted event to the kernel console");
+
+static uint64_t	brfs_event_count;
+SYSCTL_U64(_security_brfs, OID_AUTO, event_count, CTLFLAG_RD,
+    &brfs_event_count, 0, "total events pushed to the ring");
+
+static uint64_t	brfs_ring_drops;
+SYSCTL_U64(_security_brfs, OID_AUTO, ring_drops, CTLFLAG_RD,
+    &brfs_ring_drops, 0, "events dropped due to ring overflow");
 
 /* Caller holds brfs_ring_mtx. */
 static void
@@ -147,6 +168,7 @@ brfs_ring_push(struct brfs_event *ev)
 	}
 	if (brfs_ring_count >= brfs_ring_size) {
 		brfs_ring_drops++;
+		brfs_seq++;		/* leave a numeric gap for the daemon */
 		brfs_overflow_pending = 1;
 	} else {
 		ev->be_seq = ++brfs_seq;
@@ -224,7 +246,11 @@ SYSCTL_PROC(_security_brfs, OID_AUTO, test_event,
  * Watch roots (pushed by brfsd via ioctl; consumed by the P0.2 tap)
  * ---------------------------------------------------------------- */
 
-static struct sx	brfs_roots_sx;
+/*
+ * rmlock: the P0.2 tap reads this list from VOP post-hooks with vnode
+ * locks held; an sx lock could sleep in that context.
+ */
+static struct rmlock	brfs_roots_rm;
 static struct brfs_root brfs_roots[BRFS_MAX_ROOTS];
 static u_int		brfs_roots_count;
 
@@ -234,8 +260,14 @@ static u_int		brfs_roots_count;
 
 static int
 brfs_dev_open_f(struct cdev *dev __unused, int oflags __unused,
-    int devtype __unused, struct thread *td __unused)
+    int devtype __unused, struct thread *td)
 {
+	int error;
+
+	/* Single-open device: unauthorized opens also starve brfsd. */
+	error = priv_check(td, PRIV_DRIVER);
+	if (error != 0)
+		return (error);
 
 	/*
 	 * The dying check and the open flag are set under the same lock
@@ -291,6 +323,10 @@ brfs_dev_read(struct cdev *dev __unused, struct uio *uio, int ioflag)
 	struct brfs_event ev;
 	int error;
 
+	/* Partial-record reads are a consumer bug; fail loudly. */
+	if (uio->uio_resid < (ssize_t)sizeof(ev))
+		return (EINVAL);
+
 	mtx_lock(&brfs_ring_mtx);
 	while (brfs_ring_count == 0) {
 		if (brfs_dev_dying) {
@@ -311,9 +347,14 @@ brfs_dev_read(struct cdev *dev __unused, struct uio *uio, int ioflag)
 
 	while (uio->uio_resid >= (ssize_t)sizeof(ev) &&
 	    brfs_ring_count > 0) {
+		/*
+		 * Copy the tail event out under the lock but only advance
+		 * the tail after a successful uiomove: a failed copy must
+		 * not silently lose the event.  The tail slot is stable
+		 * meanwhile — overflow drops discard incoming events, never
+		 * the queued tail.
+		 */
 		ev = brfs_ring[brfs_ring_tail];
-		brfs_ring_tail = (brfs_ring_tail + 1) % brfs_ring_size;
-		brfs_ring_count--;
 		mtx_unlock(&brfs_ring_mtx);
 
 		error = uiomove(&ev, sizeof(ev), uio);
@@ -321,6 +362,8 @@ brfs_dev_read(struct cdev *dev __unused, struct uio *uio, int ioflag)
 			return (error);
 
 		mtx_lock(&brfs_ring_mtx);
+		brfs_ring_tail = (brfs_ring_tail + 1) % brfs_ring_size;
+		brfs_ring_count--;
 	}
 	mtx_unlock(&brfs_ring_mtx);
 	return (0);
@@ -346,11 +389,17 @@ brfs_dev_poll(struct cdev *dev __unused, int events, struct thread *td)
 
 static int
 brfs_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
-    int fflag __unused, struct thread *td __unused)
+    int fflag __unused, struct thread *td)
 {
 	struct brfs_root *root;
 	struct brfs_stats *stats;
 	u_int i;
+	int error;
+
+	/* Watch-root management can move data structures the tap reads. */
+	error = priv_check(td, PRIV_DRIVER);
+	if (error != 0)
+		return (error);
 
 	switch (cmd) {
 	case BRFSIOC_ADDROOT: {
@@ -363,40 +412,49 @@ brfs_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		    root->br_path[strlen(root->br_path) - 1] == '/')
 			root->br_path[strlen(root->br_path) - 1] = '\0';
 
-		sx_xlock(&brfs_roots_sx);
-		if (brfs_roots_count >= BRFS_MAX_ROOTS) {
-			sx_xunlock(&brfs_roots_sx);
-			return (ENOSPC);
-		}
+		rm_wlock(&brfs_roots_rm);
 		for (i = 0; i < brfs_roots_count; i++) {
 			if (strcmp(brfs_roots[i].br_path, root->br_path) == 0) {
-				sx_xunlock(&brfs_roots_sx);
-				return (EEXIST);
+				/*
+				 * Idempotent re-register: brfsd restarts
+				 * (including kill -9, which gets no cleanup
+				 * chance) must not fail on the surviving
+				 * registration.  Refresh the mask.
+				 */
+				brfs_roots[i].br_mask = root->br_mask;
+				rm_wunlock(&brfs_roots_rm);
+				return (0);
 			}
 		}
+		if (brfs_roots_count >= BRFS_MAX_ROOTS) {
+			rm_wunlock(&brfs_roots_rm);
+			return (ENOSPC);
+		}
 		brfs_roots[brfs_roots_count++] = *root;
-		sx_xunlock(&brfs_roots_sx);
+		rm_wunlock(&brfs_roots_rm);
 		return (0);
 	}
 
 	case BRFSIOC_DELROOT:
 		root = (struct brfs_root *)data;
 		root->br_path[MAXPATHLEN - 1] = '\0';
-		sx_xlock(&brfs_roots_sx);
+		rm_wlock(&brfs_roots_rm);
 		for (i = 0; i < brfs_roots_count; i++) {
 			if (strcmp(brfs_roots[i].br_path, root->br_path) == 0) {
 				brfs_roots[i] =
 				    brfs_roots[--brfs_roots_count];
 				memset(&brfs_roots[brfs_roots_count], 0,
 				    sizeof(struct brfs_root));
-				sx_xunlock(&brfs_roots_sx);
+				rm_wunlock(&brfs_roots_rm);
 				return (0);
 			}
 		}
-		sx_xunlock(&brfs_roots_sx);
+		rm_wunlock(&brfs_roots_rm);
 		return (ENOENT);
 
-	case BRFSIOC_GETSTATS:
+	case BRFSIOC_GETSTATS: {
+		struct rm_priotracker track;
+
 		stats = (struct brfs_stats *)data;
 		memset(stats, 0, sizeof(*stats));
 		mtx_lock(&brfs_ring_mtx);
@@ -405,16 +463,23 @@ brfs_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		stats->bs_ring_count = brfs_ring_count;
 		stats->bs_ring_size = brfs_ring_size;
 		mtx_unlock(&brfs_ring_mtx);
-		sx_slock(&brfs_roots_sx);
+		rm_rlock(&brfs_roots_rm, &track);
 		stats->bs_roots = brfs_roots_count;
-		sx_sunlock(&brfs_roots_sx);
+		rm_runlock(&brfs_roots_rm, &track);
 		return (0);
+	}
 
 	case BRFSIOC_FLUSH:
+		/*
+		 * Discarding buffered events must not be silent: flag an
+		 * overflow so the next push emits BRFS_OP_OVERFLOW and the
+		 * daemon rescans rather than trusting a truncated stream.
+		 */
 		mtx_lock(&brfs_ring_mtx);
 		brfs_ring_head = 0;
 		brfs_ring_tail = 0;
 		brfs_ring_count = 0;
+		brfs_overflow_pending = 1;
 		mtx_unlock(&brfs_ring_mtx);
 		return (0);
 
@@ -451,9 +516,14 @@ static int
 brfs_kqread(struct knote *kn, long hint __unused)
 {
 
-	mtx_lock(&brfs_ring_mtx);
+	/*
+	 * knlist_init_mtx() makes brfs_ring_mtx the knlist lock; knote()
+	 * invokes f_event holding it (KNOTE_UNLOCKED acquires it first).
+	 * Taking it again here would be a recursive lock of a
+	 * non-recursive MTX_DEF mutex.
+	 */
+	mtx_assert(&brfs_ring_mtx, MA_OWNED);
 	kn->kn_data = brfs_ring_count * sizeof(struct brfs_event);
-	mtx_unlock(&brfs_ring_mtx);
 	return (kn->kn_data > 0);
 }
 
@@ -477,18 +547,17 @@ static struct cdevsw brfs_cdevsw = {
 };
 
 /*
- * Create /dev/brfs once devfs is initialized.  Deferred via SYSINIT so a
- * loader-preloaded module does not make_dev() before devfs exists (the
- * boot panic class documented in mac_do_auto).
+ * /dev/brfs is created at the END of MOD_LOAD: this module registers at
+ * SI_SUB_DRIVERS, which initializes after SI_SUB_DEVFS at boot, so devfs
+ * is ready even for a loader-preloaded module — and the ring/mutex/dying
+ * state is guaranteed initialized before the node is openable.  (A
+ * separate SI_SUB_DEVFS SYSINIT would run BEFORE this module's MOD_LOAD,
+ * leaving the device openable against uninitialized state.)
+ *
+ * Mode 0600: the device is single-open; any local user able to open it
+ * can starve brfsd.  Jail exposure is via devfs ruleset at the host
+ * administrator's discretion.
  */
-static void
-brfs_cdev_init(void *arg __unused)
-{
-
-	brfs_cdev = make_dev(&brfs_cdevsw, 0, UID_ROOT, GID_WHEEL,
-	    0640, BRFS_DEV_NAME);
-}
-SYSINIT(brfs_cdev, SI_SUB_DEVFS, SI_ORDER_MIDDLE, brfs_cdev_init, NULL);
 
 /* ----------------------------------------------------------------
  * Module lifecycle
@@ -502,7 +571,7 @@ brfs_modevent(module_t mod __unused, int type, void *data __unused)
 	switch (type) {
 	case MOD_LOAD:
 		mtx_init(&brfs_ring_mtx, "brfs ring", NULL, MTX_DEF);
-		sx_init(&brfs_roots_sx, "brfs roots");
+		rm_init(&brfs_roots_rm, "brfs roots");
 		brfs_ring_size = brfs_ring_size_cfg;
 		if (brfs_ring_size == 0)
 			brfs_ring_size = BRFS_DEFAULT_RING_SIZE;
@@ -517,7 +586,9 @@ brfs_modevent(module_t mod __unused, int type, void *data __unused)
 		brfs_dev_open = 0;
 		brfs_dev_dying = 0;
 		knlist_init_mtx(&brfs_sel.si_note, &brfs_ring_mtx);
-		return (0);
+		brfs_cdev = make_dev(&brfs_cdevsw, 0, UID_ROOT, GID_WHEEL,
+		    0600, BRFS_DEV_NAME);
+		return (brfs_cdev == NULL ? ENXIO : 0);
 
 	case MOD_QUIESCE:
 		/*
@@ -526,6 +597,13 @@ brfs_modevent(module_t mod __unused, int type, void *data __unused)
 		 * quiesce time so an open(2) racing the unload fails instead
 		 * of establishing a new fd against a device about to be
 		 * destroyed.
+		 *
+		 * Note: this linker file contains exactly one module, so the
+		 * only QUIESCE veto that can abort an unload after ours
+		 * succeeds is ours — dying can never be left stale by
+		 * another module's veto.  If this file ever grows a second
+		 * module, dying must be cleared when MOD_UNLOAD reports
+		 * failure.
 		 */
 		mtx_lock(&brfs_ring_mtx);
 		error = brfs_dev_open ? EBUSY : 0;
@@ -562,7 +640,7 @@ brfs_modevent(module_t mod __unused, int type, void *data __unused)
 		brfs_ring_count = 0;
 		mtx_unlock(&brfs_ring_mtx);
 		mtx_destroy(&brfs_ring_mtx);
-		sx_destroy(&brfs_roots_sx);
+		rm_destroy(&brfs_roots_rm);
 		return (0);
 
 	default:

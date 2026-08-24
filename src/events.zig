@@ -22,15 +22,21 @@ pub const Op = enum(u32) {
     _,
 };
 
+/// Mirrors struct brfs_event in kmod/brfs.h. Exactly 512 bytes:
+/// power-of-two slots for the future mmap'd shared ring. fsid+fileid
+/// disambiguate across filesystems; gen guards inode reuse.
 pub const Event = extern struct {
     seq: u64,
+    fsid: u64,
     dir_fileid: u64,
     fileid: u64,
+    gen: u64,
     op: u32,
     cookie: u32,
     flags: u32,
     abi: u32,
     name: [name_max + 1]u8,
+    reserved: [25]u64,
 
     pub fn isDir(self: *const Event) bool {
         return (self.flags & 0x1) != 0;
@@ -76,7 +82,9 @@ const BRFSIOC_FLUSH = ioc(IOC_VOID, u0, 4);
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 
 pub fn openDevice() !posix.fd_t {
-    return posix.open(dev_path, .{ .ACCMODE = .RDWR }, 0);
+    // O_NONBLOCK: the drain loop reads until empty; a blocking read would
+    // park the whole event loop inside drain() and starve signal handling.
+    return posix.open(dev_path, .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0);
 }
 
 pub fn addRoot(fd: posix.fd_t, path: []const u8, mask: u32) !void {
@@ -121,8 +129,12 @@ fn ioctlChecked(fd: posix.fd_t, request: c_ulong, arg: usize) !void {
 
 /// Drain available events into caller buffer; returns events decoded.
 /// Buffer must be Event-aligned and a whole multiple of @sizeOf(Event).
+/// Device is O_NONBLOCK: an empty ring returns an empty slice.
 pub fn drain(fd: posix.fd_t, buf: []align(@alignOf(Event)) u8) ![]const Event {
-    const n = try posix.read(fd, buf);
+    const n = posix.read(fd, buf) catch |err| switch (err) {
+        error.WouldBlock => return &.{},
+        else => return err,
+    };
     const count = n / @sizeOf(Event);
     const ptr: [*]const Event = @ptrCast(@alignCast(buf.ptr));
     return ptr[0..count];
@@ -153,8 +165,9 @@ test "ioctl encodings match C _IOW/_IOR for brfs.h structs" {
 }
 
 test "event struct size and alignment" {
-    // 3*u64 + 4*u32 + 256 = 296; keep layout mmap-ring compatible.
-    try std.testing.expectEqual(@as(usize, 296), @sizeOf(Event));
+    // 5*u64 + 4*u32 + 256 + 25*u64 reserved = 512 exactly: power-of-two
+    // slots so the future mmap ring indexes with a shift.
+    try std.testing.expectEqual(@as(usize, 512), @sizeOf(Event));
     try std.testing.expectEqual(@as(usize, 8), @alignOf(Event));
 }
 

@@ -12,9 +12,11 @@ node_id = "node-a"
 replicated_path = "/data/replicated"
 
 # Daemon state: content set, staging area, conflict quarantine.
-# staging/ must be on the SAME filesystem as replicated_path (atomic
-# rename requirement); conflicts/ holds LWW losers.
-state_dir = "/var/db/brfs"
+# staging/ MUST be on the same filesystem as replicated_path (atomic
+# rename requirement) and MUST NOT be inside replicated_path (a watched
+# staging dir is a self-echo storm). A sibling directory on the same
+# filesystem is the canonical layout:
+state_dir = "/data/.brfs"
 
 # Peer listener for the replication protocol (framed binary, PSK in HELLO).
 listen = "0.0.0.0:4590"
