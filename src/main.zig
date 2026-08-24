@@ -171,4 +171,6 @@ pub fn main() !void {
 test {
     std.testing.refAllDecls(@import("config.zig"));
     std.testing.refAllDecls(@import("events.zig"));
+    std.testing.refAllDecls(@import("contentset.zig"));
+    std.testing.refAllDecls(@import("journal.zig"));
 }
