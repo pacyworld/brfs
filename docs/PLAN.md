@@ -1,6 +1,7 @@
 # BrFS (BSD Replicated File System) — DFSR-style Replicated Folder Engine for FreeBSD
 
-Status: IMPLEMENTATION (v0.5, 2026-08-24) — Phase 0 complete, P0.2 GO
+Status: IMPLEMENTATION (v0.6, 2026-08-24) — Phase 0 + Phase 1 complete
+(POC end-to-end: T1-T8 + T10 green on the 3-VM rig, commit fb4b1b5)
 Name: FINAL — **BrFS** ("Brrr... it's cold"). Daemon: `brfsd`, kmod: `brfs.ko`, utility: `brfsctl`.
 Owner: Daniel
 Target: FreeBSD 15.0+ (VFS event notification points / inotify landed 15.0-RELEASE)
@@ -144,7 +145,11 @@ pairs. All ops idempotent. See docs/protocol.md.
   flags + ring + /dev/brfs — GO, findings below); P0.3 bhyve 3×VM rig on
   vault pool (RUNNING: brfs-a/b/c, vmctl-brfs); P0.4 repo scaffolding.
 - Phase 1: POC end-to-end ON brfs.ko from day one. T1–T8 green on 3 VMs with
-  mid-test daemon restarts.
+  mid-test daemon restarts. **DONE 2026-08-24 (fb4b1b5)**: T1–T8 + T10 PASS
+  (tests/vm/repl-tests.sh), tap-smoke green on all 3 VMs after. Known POC
+  limitation logged for Phase 2: big-file install blocks the core loop
+  (fsync) — conns stall but converge; incremental hashing landed, the rest
+  is a worker-thread or chunked-fsync question.
 - Phase 2: kernel hardening — fidelity vs dtrace oracle, ring sizing/drop
   behavior, overhead measurement, T9 matrix, unload veto while fd held.
 - Phase 3 (deferred): durable per-volume journal (biggest DFSR-parity item),
