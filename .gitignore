@@ -16,3 +16,4 @@ kmod/vnode_if_newproto.h
 kmod/vnode_if_typedef.h
 kmod/export_syms
 kmod/*.full
+*.core
