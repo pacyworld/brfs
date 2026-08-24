@@ -169,6 +169,58 @@ poudriere jails (open item). Local battery before europa:
 makesum/stage-qa/check-orphans/package, DEVELOPER=yes; Jenkins
 overlay-update→bulk after local green.
 
+## P0.1 findings (2026-08-23, source walk on 15.x /usr/src + host empirical run) — GO
+
+Event taxonomy (all from VOP dispatch-layer post-hooks in vfs_subr.c /
+vfs_vnops.c — filesystem-agnostic by construction):
+- open → IN_OPEN; read/sendfile → IN_ACCESS; write/extend → IN_MODIFY;
+  close → IN_CLOSE_WRITE / IN_CLOSE_NOWRITE
+- create/mknod/mkdir/symlink/link → IN_CREATE (INOTIFY_NAME with dvp+cnp)
+- unlink/rmdir → IN_DELETE + _IN_ATTRIB_LINKCOUNT (surfaces as IN_ATTRIB)
+- rename → IN_MOVED_FROM/IN_MOVED_TO sharing a cookie from the global
+  atomic inotify_rename_cookie (confirmed live on 15.0 host:
+  `mv` emits the pair; `touch` = CREATE+OPEN+CLOSE_WRITE; `chmod` = ATTRIB;
+  `rm` = DELETE; `mkdir` = CREATE)
+- chmod/chown/utimes/truncate → IN_ATTRIB; revoke → INOTIFY_REVOKE path
+- No recursion, as documented: `touch watched/subdir/nested` after watching
+  only `watched` emits nothing — per-directory watches. The kmod's whole-tree
+  flagging is what fixes this.
+
+Flag machinery (the load-bearing details for the tap):
+- vn_inotify_add_watch sets VIRF_INOTIFY on the watched vnode and walks
+  existing dirents setting VIRF_INOTIFY_PARENT on each child
+  (vfs_inotify.c:780-818); NEW children are flagged lazily at cache_enter
+  (vfs_cache.c:2638) — that path only checks dvp's VIRF_INOTIFY and does not
+  care who set it, so our own flagging propagates to new files for free.
+- DECAY HAZARD: cache_vop_inotify (vfs_cache.c:4097-4102) UNSETS
+  VIRF_INOTIFY_PARENT when no genuinely-watched parent is found. Avoided by
+  the tap never forwarding to vop_stdinotify unless the vnode has real
+  inotify watches (vp->v_pollinfo->vpi_inotify non-empty — both fields are
+  in public struct vnode / vnode.h).
+- Exported symbols a kmod can use: vn_irflag_set_cond, cache_vop_inotify,
+  vop_stdinotify, inotify_log (all in vnode.h). struct inotify_softc is
+  opaque (vfs_inotify.c-private) → no kernel-side inotify watch; not needed.
+- nullfs: vn_inotify_add_watch notes the vnode may differ when nullfs is in
+  the picture (vfs_inotify.c:821); our ADDROOT namei resolves in the
+  caller's namespace to the operative vnode — jail/nullfs model holds.
+
+Refined tap design for P0.2 (supersedes the earlier option list):
+- Interpose vop_inotify on the UFS/ZFS vop vectors (enumerate all relevant
+  vectors in the spike: file/dir/fifo). Fast path: zero registered roots →
+  call original immediately.
+- Handler: lineage-check (vp/dvp) against registered roots via namecache
+  parent walk (same pattern as cache_vop_inotify) → brfs_emit() to ring.
+  Forward to vop_stdinotify ONLY when real inotify watches exist on the
+  vnode (preserves inotify compat; sidesteps the decay path).
+- BRFSIOC_ADDROOT: namei in caller context (jail-correct), vref the root,
+  vn_irflag_set_cond(root, VIRF_INOTIFY), dirent walk setting
+  VIRF_INOTIFY_PARENT on existing children (mirror of vfs_inotify.c:780).
+  New children propagate via cache_enter. Open spike question: root-dir
+  removal/revoke handling while vref'd (vrele on DELROOT/unload; document
+  behavior if the tree root is rmdir'd mid-watch).
+- GO decision: mechanism is fully mapped with exported symbols; proceed to
+  P0.2 implementation in the bhyve rig.
+
 ## Risks
 
 Self-echo loops (rule 6 + T7); kmod UAF (safety bar + T9 + witness/dtrace,
