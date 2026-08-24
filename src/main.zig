@@ -174,4 +174,6 @@ test {
     std.testing.refAllDecls(@import("contentset.zig"));
     std.testing.refAllDecls(@import("journal.zig"));
     std.testing.refAllDecls(@import("protocol.zig"));
+    std.testing.refAllDecls(@import("peer.zig"));
+    std.testing.refAllDecls(@import("installer.zig"));
 }
