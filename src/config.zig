@@ -17,6 +17,10 @@ pub const Config = struct {
     peers: [max_peers][]const u8 = undefined,
     num_peers: usize = 0,
     rate_limit: u64 = 0, // bytes/sec, 0 = unlimited
+    /// Initial-seed role (gap #8): a primary with an empty content set
+    /// treats its local tree as authoritative; a non-primary with an empty
+    /// set pulls via RESYNC before announcing anything local.
+    primary: bool = false,
 
     /// Validate cross-field rules that parsing alone cannot catch.
     pub fn validate(self: *const Config) !void {
@@ -67,6 +71,7 @@ pub fn load(path: [*:0]const u8) ?Config {
     if (getString(root, "state_dir")) |v| cfg.state_dir = v;
     if (getString(root, "listen")) |v| cfg.listen = v;
     if (getString(root, "psk_file")) |v| cfg.psk_file = v;
+    if (root.lookup("primary")) |obj| cfg.primary = obj.toBool();
 
     if (root.lookup("rate_limit")) |obj| {
         cfg.rate_limit = switch (obj.objectType()) {

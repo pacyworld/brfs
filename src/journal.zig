@@ -54,9 +54,15 @@ pub const Rename = struct {
 };
 
 /// What the installer expects its own activity to look like.
+/// install: next content event for the path must match (sha256, size) to
+/// be swallowed.  move_from: the path must be ABSENT (our own rename's
+/// FROM half) to be swallowed.  Mismatch on either = genuine local change.
 pub const Echo = struct {
+    kind: EchoKind,
     sha256: [32]u8,
     size: u64,
+
+    pub const EchoKind = enum { install, move_from };
 };
 
 const Pending = struct {
@@ -295,11 +301,11 @@ pub const Journal = struct {
 
     /// Register an install echo: the next content event for path that still
     /// matches (sha256, size) is our own rename-into-place, not a change.
-    pub fn noteEcho(self: *Journal, path: []const u8, sha256: [32]u8, size: u64) !void {
+    pub fn noteEcho(self: *Journal, path: []const u8, kind: Echo.EchoKind, sha256: [32]u8, size: u64) !void {
         const gop = try self.echoes.getOrPut(path);
         if (!gop.found_existing)
             gop.key_ptr.* = try self.alloc.dupe(u8, path);
-        gop.value_ptr.* = .{ .sha256 = sha256, .size = size };
+        gop.value_ptr.* = .{ .kind = kind, .sha256 = sha256, .size = size };
     }
 
     /// Inspect (without consuming) a pending echo marker.
@@ -478,7 +484,7 @@ test "echo marker lifecycle" {
     defer j.deinit();
     var sha: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("x", &sha, .{});
-    try j.noteEcho("f.txt", sha, 1);
+    try j.noteEcho("f.txt", .install, sha, 1);
     try t.expect(j.peekEcho("f.txt") != null);
     j.clearEcho("f.txt");
     try t.expect(j.peekEcho("f.txt") == null);

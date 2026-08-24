@@ -30,5 +30,10 @@ peers = [
 # Pre-shared key for the POC HELLO handshake. TLS replaces this later.
 psk_file = "/usr/local/etc/brfs.psk"
 
+# Initial seed (gap #8): exactly one node starts with primary = true; it
+# treats its local tree as authoritative. Every other member starts with
+# an empty content set and pulls via RESYNC before announcing anything.
+primary = false
+
 # Outbound transfer cap in bytes/sec; 0 = unlimited.
 rate_limit = 0

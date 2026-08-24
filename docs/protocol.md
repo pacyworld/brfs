@@ -39,6 +39,8 @@ RESYNC_ENTRY ver | flags u16 | state u8 | mode u16 | size u64 |
 MOVE_FROM    ver | flags u16 | cookie u32 | path
 MOVE_TO      ver | flags u16 | cookie u32 | path
 NACK         ver | code u16 | path
+RESYNC_DONE  count u64   (terminates a RESYNC stream; receiver then runs
+                          its post-join local scan)
 ```
 
 RESYNC_ENTRY carries `state` (1=live, 2=deleted) so tombstones propagate
@@ -79,6 +81,7 @@ incremented on every local mutation. Clock time plays no role in ordering
 | 9  | MOVE_FROM   | path, ver, cookie, ISDIR | rename source |
 | 10 | MOVE_TO     | path, ver, cookie, ISDIR | rename destination |
 | 11 | NACK        | path, ver, error code | explicit failure; never silently drop |
+| 12 | RESYNC_DONE | count | stream terminator; receiver runs post-join scan |
 
 ## Directories
 

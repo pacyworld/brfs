@@ -1,54 +1,20 @@
 //! brfsd — BrFS replication daemon.
 //!
-//! Phase 0/1 scope: real config parsing (UCL), real /dev/brfs consumption
-//! (ioctl root push + kqueue-driven batched drain), real signal handling.
-//! The peer protocol, content set, installer, and resync land in Phase 1;
-//! this event-drain loop doubles as the P0.2 kmod spike verification tool.
+//! Thin entry point: config, PSK, device setup, then the daemon core
+//! (daemon.zig): one kqueue loop + one drainer thread owning the ring pop.
 
 const std = @import("std");
 const posix = std.posix;
 const config = @import("config.zig");
 const events = @import("events.zig");
+const daemon = @import("daemon.zig");
 
 const default_config_path = "/usr/local/etc/brfs.conf";
 
-const c_event = @cImport({
-    @cInclude("sys/event.h");
-});
-
-const KEvent = c_event.struct_kevent;
-
-extern "c" fn kqueue() c_int;
-extern "c" fn kevent(
-    kq: c_int,
-    changelist: ?[*]const KEvent,
-    nchanges: c_int,
-    eventlist: ?[*]KEvent,
-    nevents: c_int,
-    timeout: ?*const std.c.timespec,
-) c_int;
-
-fn makeKevent(ident: usize, filter: c_short, flags: c_ushort, fflags: c_uint) KEvent {
-    return KEvent{
-        .ident = ident,
-        .filter = filter,
-        .flags = flags,
-        .fflags = fflags,
-        .data = 0,
-        .udata = null,
-        .ext = [_]u64{ 0, 0, 0, 0 },
-    };
-}
-
-const Level = enum { info, warn, err };
-
-fn log(comptime level: Level, comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "brfsd[" ++ @tagName(level) ++ "]: " ++ fmt ++ "\n", args) catch return;
-    _ = posix.write(2, msg) catch {};
-}
-
 pub fn main() !void {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa_state.allocator();
+
     var config_path: [*:0]const u8 = default_config_path;
 
     var args = std.process.args();
@@ -69,103 +35,56 @@ pub fn main() !void {
     }
 
     const cfg = config.load(config_path) orelse {
-        log(.err, "cannot load config {s}", .{config_path});
+        daemon.log(.err, "cannot load config {s}", .{config_path});
         return error.ConfigFailed;
     };
-    log(.info, "node_id={s} path={s} peers={d}", .{
-        cfg.node_id, cfg.replicated_path, cfg.num_peers,
+    daemon.log(.info, "node_id={s} path={s} peers={d} primary={}", .{
+        cfg.node_id, cfg.replicated_path, cfg.num_peers, cfg.primary,
     });
 
+    var psk: []const u8 = "";
+    var psk_buf: []u8 = &.{};
+    defer if (psk_buf.len > 0) alloc.free(psk_buf);
+    if (cfg.psk_file.len > 0) {
+        psk_buf = std.fs.cwd().readFileAlloc(alloc, cfg.psk_file, 4096) catch |err| {
+            daemon.log(.err, "cannot read psk_file {s}: {s}", .{ cfg.psk_file, @errorName(err) });
+            return error.PskFailed;
+        };
+        psk = std.mem.trim(u8, psk_buf, " \t\r\n");
+        if (psk.len == 0) {
+            daemon.log(.err, "psk_file {s} is empty", .{cfg.psk_file});
+            return error.PskFailed;
+        }
+    }
+
     const dev_fd = events.openDevice() catch |err| {
-        log(.err, "cannot open {s}: {s} (is brfs.ko loaded?)", .{
+        daemon.log(.err, "cannot open {s}: {s} (is brfs.ko loaded? stale brfsd?)", .{
             events.dev_path, @errorName(err),
         });
         return err;
     };
-    defer posix.close(dev_fd);
+    // Not closed on the error paths below on purpose: process exit does it.
 
     events.addRoot(dev_fd, cfg.replicated_path, 0) catch |err| {
-        log(.err, "ADDROOT {s}: {s}", .{ cfg.replicated_path, @errorName(err) });
+        daemon.log(.err, "ADDROOT {s}: {s}", .{ cfg.replicated_path, @errorName(err) });
         return err;
     };
-    log(.info, "watch root registered: {s}", .{cfg.replicated_path});
+    daemon.log(.info, "watch root registered: {s}", .{cfg.replicated_path});
 
-    const kq = kqueue();
-    if (kq < 0) {
-        log(.err, "kqueue() failed", .{});
-        return error.KqueueFailed;
-    }
+    // Drainer wakeup pipe (both ends non-blocking; the core loop drains
+    // with EV_CLEAR, the drainer drops wakeups on a full pipe).
+    const pfds = try posix.pipe();
+    var fl = std.c.fcntl(pfds[0], 3, @as(c_int, 0)); // F_GETFL
+    _ = std.c.fcntl(pfds[0], 4, fl | @as(c_int, 0x0004)); // F_SETFL | O_NONBLOCK
+    fl = std.c.fcntl(pfds[1], 3, @as(c_int, 0));
+    _ = std.c.fcntl(pfds[1], 4, fl | @as(c_int, 0x0004));
 
-    const changes = [_]KEvent{
-        // EV_CLEAR: drain the device fully on each wakeup.
-        makeKevent(@intCast(dev_fd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, 0),
-        makeKevent(15, c_event.EVFILT_SIGNAL, c_event.EV_ADD, 0), // SIGTERM
-        makeKevent(2, c_event.EVFILT_SIGNAL, c_event.EV_ADD, 0), // SIGINT
-    };
-    var changelist: ?[*]const KEvent = &changes;
-    var nchanges: c_int = changes.len;
+    var d = try daemon.Daemon.init(alloc, &cfg, psk, dev_fd, pfds[0], pfds[1]);
 
-    var mask = posix.sigemptyset();
-    _ = std.c.sigaddset(&mask, 15);
-    _ = std.c.sigaddset(&mask, 2);
-    _ = std.c.sigprocmask(std.c.SIG.BLOCK, &mask, null);
+    const drainer = try std.Thread.spawn(.{}, daemon.drainerEntry, .{ dev_fd, &d.evq });
+    drainer.detach();
 
-    log(.info, "event loop started, draining {s}", .{events.dev_path});
-
-    var running = true;
-    var evlist: [8]KEvent = undefined;
-    var buf: [65536]u8 align(@alignOf(events.Event)) = undefined;
-
-    while (running) {
-        const nevents = kevent(kq, changelist, nchanges, &evlist, evlist.len, null);
-        changelist = null;
-        nchanges = 0;
-        if (nevents < 0) {
-            if (std.c._errno().* != 4) // EINTR
-                log(.err, "kevent wait failed, errno={d}", .{std.c._errno().*});
-            continue;
-        }
-
-        for (evlist[0..@intCast(nevents)]) |*ev| {
-            if (ev.filter == c_event.EVFILT_SIGNAL) {
-                log(.info, "signal {d}, shutting down", .{ev.ident});
-                running = false;
-            } else if (ev.filter == c_event.EVFILT_READ) {
-                while (true) {
-                    const batch = events.drain(dev_fd, &buf) catch |err| {
-                        log(.err, "read {s}: {s}", .{ events.dev_path, @errorName(err) });
-                        break;
-                    };
-                    if (batch.len == 0) break;
-                    for (batch) |*bev| {
-                        if (bev.abi != events.abi_version) {
-                            log(.warn, "ABI mismatch: event v{d}, daemon v{d}", .{
-                                bev.abi, events.abi_version,
-                            });
-                            continue;
-                        }
-                        if (bev.op == @intFromEnum(events.Op.overflow)) {
-                            log(.warn, "RING OVERFLOW seq={d} — tree rescan required", .{bev.seq});
-                            continue;
-                        }
-                        log(.info, "seq={d} op={s} fsid={x} dir={d} file={d} gen={d} cookie={x} {s}{s}", .{
-                            bev.seq,
-                            events.opName(bev.op),
-                            bev.fsid,
-                            bev.dir_fileid,
-                            bev.fileid,
-                            bev.gen,
-                            bev.cookie,
-                            bev.nameSlice(),
-                            if (bev.isDir()) " (dir)" else "",
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    log(.info, "shutdown complete", .{});
+    try d.run();
 }
 
 test {
@@ -177,4 +96,6 @@ test {
     std.testing.refAllDecls(@import("peer.zig"));
     std.testing.refAllDecls(@import("installer.zig"));
     std.testing.refAllDecls(@import("resync.zig"));
+    std.testing.refAllDecls(@import("server.zig"));
+    std.testing.refAllDecls(@import("daemon.zig"));
 }

@@ -182,6 +182,13 @@ pub const ContentSet = struct {
         return self.dir_index.get(.{ .fsid = fsid, .fileid = fileid });
     }
 
+    /// Register the replicated root itself in the dir index (it has no
+    /// record — relative paths never include it).  Its index path is "":
+    /// events land directly under the root.
+    pub fn indexRoot(self: *ContentSet, fsid: u64, fileid: u64) !void {
+        try self.dir_index.put(.{ .fsid = fsid, .fileid = fileid }, "");
+    }
+
     /// Allocate the next local version.  The counter persists via upsert
     /// records and snapshot headers; a state loss that resets it is healed
     /// by the scan fallback re-announcing with fresh (higher-origin-seq

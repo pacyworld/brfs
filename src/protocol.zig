@@ -17,6 +17,8 @@
 //!   MOVE_FROM    origin u64 | seq u64 | flags u16 | cookie u32 | path
 //!   MOVE_TO      same as MOVE_FROM
 //!   NACK         origin u64 | seq u64 | code u16 | path
+//!   RESYNC_DONE  count u64  (terminates a RESYNC stream; receiver runs its
+//!                            post-join local scan)
 //!
 //! flags bit0 = ISDIR.  All ops are idempotent; every incoming path is
 //! validated (contentset.validRelPath) before the caller may touch the
@@ -44,6 +46,7 @@ pub const Op = enum(u16) {
     move_from = 9,
     move_to = 10,
     nack = 11,
+    resync_done = 12,
     _,
 };
 
@@ -134,6 +137,9 @@ pub const Message = union(enum) {
     move_from: Move,
     move_to: Move,
     nack: Nack,
+    /// Terminates a RESYNC stream: count = entries sent.  The receiver
+    /// runs its post-join local scan when this arrives.
+    resync_done: u64,
 };
 
 pub const DecodeError = error{ Truncated, FrameTooLarge, BadOp, BadPath, TrailingGarbage, VectorTooLarge };
@@ -234,6 +240,10 @@ pub fn encode(alloc: Allocator, msg: Message) ![]u8 {
             try appendVer(w, alloc, m.ver);
             try appendInt(w, alloc, u16, m.code);
             try appendStr(w, alloc, m.path);
+        },
+        .resync_done => |count| {
+            try appendInt(w, alloc, u16, @intFromEnum(Op.resync_done));
+            try appendInt(w, alloc, u64, count);
         },
     }
 
@@ -348,6 +358,7 @@ pub fn decode(payload: []const u8) DecodeError!Message {
             const path = try r.path();
             break :blk .{ .nack = .{ .ver = ver, .code = code, .path = path } };
         },
+        .resync_done => .{ .resync_done = try r.u64v() },
         _ => return error.BadOp,
     };
     if (r.pos != payload.len) return error.TrailingGarbage;

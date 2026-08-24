@@ -32,6 +32,18 @@ pub const State = enum {
     closed,
 };
 
+/// A MOVE_FROM received from this peer, awaiting its MOVE_TO (they share
+/// the sender's rename cookie).  Unpaired past the deadline = the file
+/// moved out of the tree on the sender (delete).
+pub const RemoteMove = struct {
+    path: []u8, // owned
+    ver: contentset.Version,
+    is_dir: bool,
+    deadline_ms: i64,
+};
+
+pub const remote_move_timeout_ms: i64 = 2_000;
+
 pub const Peer = struct {
     alloc: Allocator,
     fd: posix.fd_t = -1,
@@ -44,16 +56,56 @@ pub const Peer = struct {
     violations: u32 = 0, // path-validation strikes; demote threshold
     next_retry_ms: i64 = 0,
     backoff_ms: i64 = backoff_initial_ms,
+    moves: std.AutoHashMap(u32, RemoteMove), // cookie -> pending MOVE_FROM
 
     pub fn init(alloc: Allocator) Peer {
-        return .{ .alloc = alloc };
+        return .{ .alloc = alloc, .moves = std.AutoHashMap(u32, RemoteMove).init(alloc) };
     }
 
     pub fn deinit(self: *Peer) void {
         self.closeFd();
         self.rbuf.deinit(self.alloc);
         self.wbuf.deinit(self.alloc);
+        var mit = self.moves.iterator();
+        while (mit.next()) |e| self.alloc.free(e.value_ptr.path);
+        self.moves.deinit();
         if (self.node_id) |n| self.alloc.free(n);
+    }
+
+    pub fn noteRemoteMove(self: *Peer, cookie: u32, path: []const u8, ver: contentset.Version, is_dir: bool, now_ms: i64) !void {
+        if (self.moves.fetchRemove(cookie)) |old| self.alloc.free(old.value.path);
+        const owned = try self.alloc.dupe(u8, path);
+        try self.moves.put(cookie, .{
+            .path = owned,
+            .ver = ver,
+            .is_dir = is_dir,
+            .deadline_ms = now_ms + remote_move_timeout_ms,
+        });
+    }
+
+    pub fn takeRemoteMove(self: *Peer, cookie: u32) ?RemoteMove {
+        const kv = self.moves.fetchRemove(cookie) orelse return null;
+        return kv.value; // caller owns path
+    }
+
+    /// Expired unpaired MOVE_FROMs (moved out of tree).  Caller frees
+    /// each returned path with freeMove.
+    pub fn sweepRemoteMoves(self: *Peer, now_ms: i64, out: *std.ArrayList(RemoteMove)) !void {
+        var expired: std.ArrayList(u32) = .empty;
+        defer expired.deinit(self.alloc);
+        var it = self.moves.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.deadline_ms <= now_ms)
+                try expired.append(self.alloc, e.key_ptr.*);
+        }
+        for (expired.items) |cookie| {
+            const kv = self.moves.fetchRemove(cookie).?;
+            try out.append(self.alloc, kv.value);
+        }
+    }
+
+    pub fn freeMove(self: *Peer, m: *RemoteMove) void {
+        self.alloc.free(m.path);
     }
 
     pub fn closeFd(self: *Peer) void {
@@ -70,6 +122,9 @@ pub const Peer = struct {
         self.closeFd();
         self.rbuf.clearRetainingCapacity();
         self.wbuf.clearRetainingCapacity();
+        var mit = self.moves.iterator();
+        while (mit.next()) |e| self.alloc.free(e.value_ptr.path);
+        self.moves.clearRetainingCapacity();
         if (self.node_id) |n| {
             self.alloc.free(n);
             self.node_id = null;

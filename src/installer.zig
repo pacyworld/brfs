@@ -134,6 +134,22 @@ pub const Installer = struct {
         return f.received == f.size;
     }
 
+    /// Fill in meta for a fetch started without it (the unpaired MOVE_TO
+    /// fallback): the sender emits a fresh ANNOUNCE before its chunks, and
+    /// the daemon updates the in-flight fetch with real size/hash.
+    pub fn updateFetchMeta(self: *Installer, path: []const u8, size: u64, sha256: [32]u8, mode: u16, mtime_sec: i64, mtime_nsec: u32) void {
+        const f = self.fetches.get(path) orelse return;
+        f.size = size;
+        f.sha256 = sha256;
+        f.mode = mode;
+        f.mtime_sec = mtime_sec;
+        f.mtime_nsec = mtime_nsec;
+    }
+
+    pub fn fetchInProgress(self: *Installer, path: []const u8) bool {
+        return self.fetches.contains(path);
+    }
+
     pub fn abortFetch(self: *Installer, path: []const u8) void {
         if (self.fetches.fetchRemove(path)) |kv| {
             const f = kv.value;
