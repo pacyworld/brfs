@@ -110,7 +110,7 @@ Driver use case: replace cdn-sync.sh (rsync+lockf cron hack) for Pacy World CDN 
   snapshot, checksummed, corrupt→rebuild-via-scan; LMDB/SQLite later),
   journal.zig (per-path coalescing), protocol.zig (mutation-tested codec,
   securemilter-lib pattern), peer.zig/server.zig (full mesh,
-  retries/backoff, PSK-in-HELLO POC, TLS later), installer.zig (staging +
+  retries/backoff, PSK-in-HELLO POC, TLS/mTLS Phase 2), installer.zig (staging +
   atomic rename + echo suppression + quarantine), resync.zig, config.zig
   (UCL via base-system privateucl, sole consumer), ctl.zig (brfsd.sock
   server).
@@ -152,9 +152,20 @@ pairs. All ops idempotent. See docs/protocol.md.
   is a worker-thread or chunked-fsync question.
 - Phase 2: kernel hardening — fidelity vs dtrace oracle, ring sizing/drop
   behavior, overhead measurement, T9 matrix, unload veto while fd held.
+  PLUS (promoted 2026-08-24, user): **TLS/mTLS between nodes** — rationale:
+  (a) users will run BrFS across the public internet regardless of the
+  LAN-only intent; (b) compliance regimes require encryption of all data in
+  motion, including LANs/VPNs.  Design constraints: house DANE-first rule
+  (TLSA validation primary, local CA trust store fallback, DNSSEC ignored);
+  certs from the Pacy World CA (OpenBao-issued); nonblocking-socket TLS via
+  OpenSSL/LibreSSL memory-BIO pairs into the existing kqueue core (no
+  blocking I/O threads); PSK mode kept as a config fallback for air-gapped
+  rigs.  Also: WAN/chaos test track (see test matrix).
 - Phase 3 (deferred): durable per-volume journal (biggest DFSR-parity item),
-  RDC deltas (>64KB, cross-file seeds), rate limiting/credits, TLS/mTLS
-  (vault-issued), node add/remove, >3 nodes, resync skip-on-(size,sha),
+  RDC deltas (>64KB, cross-file seeds), rate limiting/credits + fetch
+  pipelining windows (receiver-driven pull is RTT-serialized: ~1 MiB per
+  RTT per file — ~20 MB/s ceiling at a 50 ms cross-region RTT, fine for
+  POC), node add/remove, >3 nodes, resync skip-on-(size,sha),
   upstreamable registration API if patch fallback used.
 
 ## Test matrix (T1–T11)
@@ -166,6 +177,25 @@ converge (no delete+create artifacts), T11 event fidelity vs dtrace oracle +
 ring overflow→rescan. All repeated with mid-test daemon restarts.
 Out of POC scope: deltas, durable journal, sync mode, auth beyond PSK,
 ACL/symlink/device propagation, >3 nodes, WAN.
+
+### WAN / chaos track (added 2026-08-24, user)
+
+The deployment target is cross-region WAN: three regions (FL/NY/SD,
+10.7.7/8/6.0/24) interconnected by IPsec tunnels through OPNsense — tens of
+ms of RTT, occasional loss, tunnel MTU quirks.  Once the engine matures
+(post-Phase 2), add a degradation matrix on the rig using FreeBSD's
+netgraph — `ng_netem(4)` inserted on the guest vtnet path (or dummynet
+pipes scoped to peer-pair traffic as the firewall-touching alternative;
+console access via vmctl-brfs is the lockout fallback):
+
+- T21 latency: 25/50/100 ms added per link — convergence must hold,
+  fetch timeouts must not false-fire (stall detector, not deadline).
+- T22 loss: 0.5%/2% packet drop — TCP hides it, watch for pathological
+  re-fetch loops (hash-mismatch requeue is bounded; verify).
+- T23 bandwidth cap: 10/1 Mbps — wbuf saturation drops the conn and
+  resync heals; no livelock (backoff + dial suppression).
+- T24 partition: ngctl shutdown a link for N minutes of writes, heal —
+  full convergence via RESYNC (already the T6 mechanism, at WAN scale).
 
 ## Packaging (after POC)
 

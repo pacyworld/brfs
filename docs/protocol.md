@@ -125,4 +125,10 @@ loop hazard; it is covered by test T7.
 ## Security (POC)
 
 Bind to a trusted interface; HELLO carries a pre-shared key + nonce.
-TLS/mTLS is post-POC (Phase 3).
+TLS/mTLS is Phase 2 (promoted from Phase 3 on 2026-08-24: users WILL run
+this across the public internet, and compliance regimes require encrypting
+all data in motion, LAN/VPN included).  House TLS rules apply: DANE TLSA
+validation primary, local CA trust store as fallback, DNSSEC ignored;
+Pacy World CA (OpenBao-issued) node certificates.  The framed codec above
+is transport-agnostic — TLS wraps the byte stream without touching
+framing.
