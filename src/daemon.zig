@@ -47,6 +47,7 @@ const O_NONBLOCK: c_int = 0x0004;
 
 const checkpoint_interval_ms: i64 = 5_000;
 const rescan_cooldown_ms: i64 = 1_000;
+const gc_interval_ms: i64 = 3_600_000; // tombstone GC cadence (gap #7)
 const max_violations: u32 = 8;
 
 pub const Level = enum { info, warn, err };
@@ -157,6 +158,7 @@ pub const Daemon = struct {
     need_rescan: bool = false,
     last_rescan_ms: i64 = 0,
     last_checkpoint_ms: i64 = 0,
+    last_gc_ms: i64 = 0,
     running: bool = true,
 
     pub fn init(alloc: Allocator, cfg: *const config.Config, psk: []const u8, dev_fd: posix.fd_t, wake_rd: posix.fd_t, wake_wr: posix.fd_t) !Daemon {
@@ -776,9 +778,19 @@ pub const Daemon = struct {
                     // moved aside atomically at install time (installer.
                     // complete), which keeps the kernel from seeing a
                     // spurious delete/rename of the loser.
-                    log(.info, "conflict {s}: peer {s} v=({x},{d}) wins over local", .{
-                        m.path, peerName(p), m.ver.origin, m.ver.seq,
-                    });
+                    //
+                    // Gap #9 (LOCKED): a stored TOMBSTONE that loses here
+                    // resurrects the path — the offline modify M > tombstone
+                    // N case falls through to the fetch/install below, and
+                    // the deleting side has no local copy to quarantine.
+                    if (rec.state == .deleted)
+                        log(.info, "resurrect {s}: peer {s} v=({x},{d}) wins over tombstone", .{
+                            m.path, peerName(p), m.ver.origin, m.ver.seq,
+                        })
+                    else
+                        log(.info, "conflict {s}: peer {s} v=({x},{d}) wins over local", .{
+                            m.path, peerName(p), m.ver.origin, m.ver.seq,
+                        });
                 },
             }
         }
@@ -1276,6 +1288,16 @@ pub const Daemon = struct {
             self.last_checkpoint_ms = now;
             self.cs.checkpoint(self.jr.high_seq) catch {};
             self.cs.flush() catch {};
+        }
+
+        // Tombstone GC (gap #7): TTL-bound range pass.  The all-member-ack
+        // horizon half of the retention rule lands with per-member ack
+        // tracking; TTL alone is the DFSR ConflictAndDeleted window.
+        if (now - self.last_gc_ms >= gc_interval_ms) {
+            self.last_gc_ms = now;
+            const collected = self.cs.gcTombstones(@intCast(@divFloor(now, 1000))) catch 0;
+            if (collected > 0)
+                log(.info, "tombstone GC: {d} collected", .{collected});
         }
     }
 

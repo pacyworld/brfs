@@ -485,3 +485,51 @@ test "entryAction matrix" {
     tomb.path = "same";
     try t.expectEqual(EntryAction.ignore, entryAction(&cs, tomb));
 }
+
+test "gap #9 (LOCKED): delete-vs-modify — winning modify resurrects, winning delete stands" {
+    const alloc = t.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+
+    var cs = try contentset.ContentSet.open(alloc, dir, "test");
+    defer cs.close();
+    const sha = [_]u8{9} ** 32;
+
+    const live_entry = protocol.ResyncEntry{
+        .ver = .{ .origin = 2, .seq = 9 }, // offline modify M
+        .is_dir = false,
+        .state = .live,
+        .mode = 0o644,
+        .size = 1,
+        .mtime_sec = 0,
+        .mtime_nsec = 0,
+        .path = "f",
+        .sha256 = sha,
+    };
+
+    // Stored tombstone N; M > N (divergent origins, higher seq) -> the
+    // modify wins: fetch = resurrect.  The deleting side has no local
+    // copy; there is nothing to quarantine on this node.
+    try cs.upsert("f", .{ .ver = .{ .origin = 1, .seq = 5 }, .state = .deleted });
+    try t.expectEqual(EntryAction.fetch, entryAction(&cs, live_entry));
+
+    // Same outcome when the modify is merely same-origin newer.
+    var m_same = live_entry;
+    m_same.ver = .{ .origin = 1, .seq = 6 };
+    try t.expectEqual(EntryAction.fetch, entryAction(&cs, m_same));
+
+    // Stored live M; incoming tombstone N > M -> delete wins (the daemon
+    // quarantines the divergent local copy via installer.quarantine).
+    try cs.upsert("f", .{ .ver = .{ .origin = 1, .seq = 5 }, .state = .live, .sha256 = sha });
+    var tomb = live_entry;
+    tomb.state = .deleted;
+    try t.expectEqual(EntryAction.tombstone, entryAction(&cs, tomb));
+
+    // Stored tombstone N; incoming modify M < N -> delete stands.
+    try cs.upsert("f", .{ .ver = .{ .origin = 2, .seq = 9 }, .state = .deleted });
+    var stale = live_entry;
+    stale.ver = .{ .origin = 1, .seq = 5 };
+    try t.expectEqual(EntryAction.ignore, entryAction(&cs, stale));
+}

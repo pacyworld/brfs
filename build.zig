@@ -1,5 +1,15 @@
 const std = @import("std");
 
+const lmdb_files: []const []const u8 = &.{ "mdb.c", "midl.c" };
+
+/// Vendored LMDB 1.0.0 (lib/lmdb, hash-verified against the databases/lmdb
+/// port distinfo).  Static: brfsd must carry no runtime deps the rig
+/// guests can't resolve (their pkg/DNS is broken by design).
+fn addLmdb(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addIncludePath(b.path("lib/lmdb"));
+    mod.addCSourceFiles(.{ .root = b.path("lib/lmdb"), .files = lmdb_files });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -20,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     brfsd_mod.addImport("ucl", ucl_mod);
+    addLmdb(b, brfsd_mod);
 
     const brfsd = b.addExecutable(.{
         .name = "brfsd",
@@ -47,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_mod.addImport("ucl", ucl_mod);
+    addLmdb(b, test_mod);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

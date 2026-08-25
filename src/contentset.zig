@@ -3,27 +3,45 @@
 //! One record per path (relative to the replicated root): identity
 //! (fsid/fileid/gen from the kernel feed), version (origin_node, origin_seq),
 //! size, mtime, mode, sha256, and a first-class state flag
-//! (live | deleted) — deletes are tombstones from day one; retention/GC
-//! arrives with the LMDB swap in Phase 2 (decision locked 2026-08-24).
+//! (live | deleted) — deletes are tombstones from day one.
 //!
-//! POC persistence (per plan; LMDB in Phase 2): append-only log + periodic
-//! snapshot under state_dir.  kill -9 mid-write safety (T8):
-//!   - log records are framed [len u32][crc32 u32][payload]; a torn tail
-//!     (short read or bad checksum) is detected on load and the file is
-//!     truncated back to the last good record;
-//!   - snapshots are written to a tmp file, fsynced, then rename(2)d into
-//!     place; the log is only truncated after the snapshot is durable.
-//! Corruption beyond a torn tail -> needs_scan: the caller falls back to a
-//! full tree scan (the layered-durability floor — the set is a cache of
-//! ground truth, never the only copy).
+//! Persistence is LMDB (Phase 2 swap; decision locked 2026-08-24 — replaces
+//! the POC append-only log + snapshot):
+//!   - gap #12 (crash consistency): every flush()/checkpoint() is ONE LMDB
+//!     write-txn commit — records, the ring-seq checkpoint, and the local
+//!     seq counter land atomically and fsync'd.  Torn tails cannot exist by
+//!     construction; an uncommitted batch simply never happened and
+//!     idempotent replay heals it.
+//!   - gap #7 (tombstone retention/GC): tombstones are durable keys with a
+//!     deleted_at wall-clock stamp (retention bookkeeping only — ordering
+//!     stays pure version vectors, T18).  gcTombstones() drops tombstones
+//!     older than tombstone_ttl_sec (7 days, the DFSR ConflictAndDeleted
+//!     window).  The all-member-ack horizon half of the locked retention
+//!     rule (keep until ALL members' last-ack ver exceeds the tombstone
+//!     ver OR the TTL, whichever is longer) lands with per-member ack
+//!     tracking; TTL alone is DFSR-equivalent until then.
+//!   - Corruption fallback: an env that fails to open or load is moved
+//!     aside (csdb.corrupt-<ts>) and rebuilt empty with needs_scan — the
+//!     set is a cache of ground truth, never the only copy.
 //!
-//! A secondary dir index maps (fsid, fileid) -> directory path so kernel
-//! events (which carry only dir_fileid + name, never paths) resolve to
-//! wire-protocol paths.
+//! The in-memory map stays the query layer (the daemon iterates it
+//! directly); LMDB is the durable store it is write-through mirrored into.
+//!
+//! Gotchas carried from the design decision: the map size is FIXED
+//! (map_size below; MDB_MAP_FULL recovery runbook: stop brfsd,
+//! `mdb_copy -c csdb csdb.compact`, swap, start); the env lives under
+//! state_dir/csdb and shares the free-space precondition with quarantine
+//! (gap #18); LMDB keys cap at 511 bytes (4K pages) so relative paths are
+//! limited to max_path_len — a digest-key scheme is Phase 3 material if
+//! real trees ever need deeper.
 
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+
+const c = @cImport({
+    @cInclude("lmdb.h");
+});
 
 pub const State = enum(u8) {
     live = 1,
@@ -77,6 +95,10 @@ pub const Record = struct {
     is_dir: bool = false,
     state: State = .live,
     sha256: [32]u8 = [_]u8{0} ** 32,
+    /// Wall-clock seconds when the tombstone was first applied (retention
+    /// bookkeeping for gap #7 GC; never consulted for ordering and never
+    /// sent on the wire).
+    deleted_at: i64 = 0,
 };
 
 const DirKey = struct { fsid: u64, fileid: u64 };
@@ -86,29 +108,57 @@ const IdEnt = struct {
     gen: u64,
 };
 
-const snap_name = "contentset.snap";
-const snap_tmp_name = "contentset.snap.tmp";
-const log_name = "contentset.log";
+/// LMDB keys cap at 511 bytes (4K pages); keep margin.  Longer relative
+/// paths are rejected (error.NameTooLong) and surface in the daemon log.
+pub const max_path_len = 480;
 
-const snap_magic = "BRFSCS01";
-const format_version: u32 = 1;
+/// Gap #7 retention window (DFSR ConflictAndDeleted analog).
+pub const tombstone_ttl_sec: i64 = 7 * 24 * 3600;
 
-const rec_upsert: u8 = 1;
-const rec_ring_seq: u8 = 2;
+/// Fixed map size (sparse file; VA reservation, not physical).  See the
+/// MDB_MAP_FULL runbook note in the module docs.
+const map_size: usize = 1 << 30;
 
-/// Fixed part of an upsert payload (everything before the path bytes).
-const upsert_fixed_len = 1 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 2 + 1 + 1 + 32 + 2;
+const db_dir = "csdb";
+const dbi_records_name = "records";
+const dbi_meta_name = "meta";
+const meta_local_next_seq = "local_next_seq";
+const meta_ring_seq = "ring_seq";
 
-/// Safety bound while loading; the POC set is small and LMDB takes over in
-/// Phase 2 before any real scale shows up.
-const max_load_bytes = 256 * 1024 * 1024;
-
-/// Snapshot cadence: whichever trips first.
-const snap_max_log_bytes = 4 * 1024 * 1024;
-const snap_max_ops = 4096;
+/// Record value layout: fixed 104 bytes, big-endian.  The path is the LMDB
+/// key and is not repeated in the value.
+const value_len = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 2 + 1 + 1 + 8 + 32;
 
 pub fn nodeOrigin(node_id: []const u8) u64 {
     return std.hash.Fnv1a_64.hash(node_id);
+}
+
+const LmdbError = error{
+    NotFound,
+    MapFull,
+    NameTooLong,
+    Corrupt,
+    LmdbFail,
+};
+
+fn mdbCheck(rc: c_int) LmdbError!void {
+    switch (rc) {
+        0 => return,
+        c.MDB_NOTFOUND => return error.NotFound,
+        c.MDB_MAP_FULL => return error.MapFull,
+        c.MDB_BAD_VALSIZE => return error.NameTooLong,
+        c.MDB_CORRUPTED, c.MDB_PANIC, c.MDB_VERSION_MISMATCH => return error.Corrupt,
+        else => return error.LmdbFail,
+    }
+}
+
+fn mval(bytes: []const u8) c.MDB_val {
+    return .{ .mv_size = bytes.len, .mv_data = @constCast(bytes.ptr) };
+}
+
+fn mvalSlice(v: *const c.MDB_val) []const u8 {
+    const p: [*]const u8 = @ptrCast(v.mv_data);
+    return p[0..v.mv_size];
 }
 
 pub const ContentSet = struct {
@@ -121,16 +171,21 @@ pub const ContentSet = struct {
     /// the subject directly through this index.  Entries come from records
     /// (upsert) and from the events themselves (learnId).
     id_index: std.AutoHashMap(DirKey, IdEnt),
-    log_fd: posix.fd_t,
+    env: ?*c.MDB_env,
+    dbi_records: c.MDB_dbi,
+    dbi_meta: c.MDB_dbi,
+    /// Pending write txn, begun lazily by the first mutation after the
+    /// last commit; flush()/checkpoint() commit it (one atomic batch).
+    wtxn: ?*c.MDB_txn = null,
     local_origin: u64,
     local_next_seq: u64 = 1,
     ring_seq: u64 = 0,
     needs_scan: bool = false,
-    log_bytes: u64 = 0,
-    ops_since_snap: u64 = 0,
 
-    /// Open (creating if needed) state_dir and load snapshot + log.
-    /// node_id derives the local origin for version stamping.
+    /// Open (creating if needed) state_dir/csdb and load every record.
+    /// node_id derives the local origin for version stamping.  A corrupt
+    /// env is moved aside and rebuilt empty with needs_scan set (the
+    /// startup scan / RESYNC pull is the universal floor).
     pub fn open(alloc: Allocator, state_dir: []const u8, node_id: []const u8) !ContentSet {
         try std.fs.cwd().makePath(state_dir);
 
@@ -139,38 +194,76 @@ pub const ContentSet = struct {
             .state_dir = try alloc.dupe(u8, state_dir),
             .map = std.StringHashMap(Record).init(alloc),
             .id_index = std.AutoHashMap(DirKey, IdEnt).init(alloc),
-            .log_fd = -1,
+            .env = null,
+            .dbi_records = 0,
+            .dbi_meta = 0,
             .local_origin = nodeOrigin(node_id),
         };
         errdefer {
+            self.closeEnv();
             self.deinitMaps();
             alloc.free(self.state_dir);
         }
 
-        self.loadSnapshot();
-        self.loadLog();
+        self.openEnv() catch {
+            self.resetEnvAside();
+            self.openEnv() catch return error.EnvOpen;
+            self.needs_scan = true;
+        };
+        self.loadAll() catch {
+            self.resetEnvAside();
+            self.deinitMaps();
+            self.map = std.StringHashMap(Record).init(alloc);
+            self.id_index = std.AutoHashMap(DirKey, IdEnt).init(alloc);
+            self.local_next_seq = 1;
+            self.ring_seq = 0;
+            self.openEnv() catch return error.EnvOpen;
+            self.needs_scan = true;
+        };
 
         // First-ever start (nothing persisted) has no ground truth at all:
         // the startup scan builds it.
         if (self.map.count() == 0 and self.local_next_seq == 1 and self.ring_seq == 0)
             self.needs_scan = true;
 
-        const log_path = try std.fs.path.join(alloc, &.{ state_dir, log_name });
-        defer alloc.free(log_path);
-        const log_z = try alloc.dupeZ(u8, log_path);
-        defer alloc.free(log_z);
-        self.log_fd = try posix.open(log_z, .{ .ACCMODE = .RDWR, .CREAT = true, .APPEND = true }, 0o600);
         return self;
     }
 
     pub fn close(self: *ContentSet) void {
-        if (self.log_fd >= 0) {
-            posix.fsync(self.log_fd) catch {};
-            posix.close(self.log_fd);
-            self.log_fd = -1;
-        }
+        self.flush() catch {}; // commit any pending batch
+        self.closeEnv();
         self.deinitMaps();
         self.alloc.free(self.state_dir);
+    }
+
+    /// Crash simulation (kill -9 semantics): discard the pending batch
+    /// exactly as a real crash would.  Tests only.
+    pub fn abortAndClose(self: *ContentSet) void {
+        self.abortTxn();
+        self.closeEnv();
+        self.deinitMaps();
+        self.alloc.free(self.state_dir);
+    }
+
+    fn closeEnv(self: *ContentSet) void {
+        if (self.env) |env| {
+            _ = c.mdb_env_sync(env, 1); // orderly close: force the deferred meta flush
+            c.mdb_dbi_close(env, self.dbi_records);
+            c.mdb_dbi_close(env, self.dbi_meta);
+            c.mdb_env_close(env);
+            self.env = null;
+        }
+    }
+
+    /// Move a suspect env aside so a fresh one can be built; the startup
+    /// scan / RESYNC pull then rebuilds state from ground truth.
+    fn resetEnvAside(self: *ContentSet) void {
+        self.closeEnv();
+        const dir = std.fs.path.join(self.alloc, &.{ self.state_dir, db_dir }) catch return;
+        defer self.alloc.free(dir);
+        const aside = std.fmt.allocPrint(self.alloc, "{s}.corrupt-{d}", .{ dir, std.time.timestamp() }) catch return;
+        defer self.alloc.free(aside);
+        std.fs.cwd().rename(dir, aside) catch {};
     }
 
     fn deinitMaps(self: *ContentSet) void {
@@ -182,6 +275,85 @@ pub const ContentSet = struct {
         while (iit.next()) |e|
             self.alloc.free(e.value_ptr.path);
         self.id_index.deinit();
+    }
+
+    fn openEnv(self: *ContentSet) !void {
+        const dir = try std.fs.path.join(self.alloc, &.{ self.state_dir, db_dir });
+        defer self.alloc.free(dir);
+        try std.fs.cwd().makePath(dir);
+        const dir_z = try self.alloc.dupeZ(u8, dir);
+        defer self.alloc.free(dir_z);
+
+        // MDB_NOTLS: the caller (daemon core thread, test runner) owns txn
+        // discipline explicitly instead of LMDB tying txns to threads.
+        // MDB_NOMETASYNC: one flush per commit instead of two — the second
+        // (meta) fdatasync doubles ZFS TXG waits on the daemon's core loop
+        // (rig-measured: doubled the post-big-file-install stall vs the POC
+        // log backend).  Integrity is preserved across an OS crash (data
+        // pages sync before the meta write); at most the LAST commit rolls
+        // back, which idempotent replay + the scan floor heal — the set is
+        // a cache of ground truth, never the only copy.
+        try mdbCheck(c.mdb_env_create(&self.env));
+        errdefer {
+            c.mdb_env_close(self.env);
+            self.env = null;
+        }
+        try mdbCheck(c.mdb_env_set_maxdbs(self.env, 4));
+        try mdbCheck(c.mdb_env_set_mapsize(self.env, map_size));
+        try mdbCheck(c.mdb_env_open(self.env, dir_z, c.MDB_NOTLS | c.MDB_NOMETASYNC, 0o600));
+
+        var txn: ?*c.MDB_txn = null;
+        try mdbCheck(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+        try mdbCheck(c.mdb_dbi_open(txn, dbi_records_name, c.MDB_CREATE, &self.dbi_records));
+        try mdbCheck(c.mdb_dbi_open(txn, dbi_meta_name, c.MDB_CREATE, &self.dbi_meta));
+        try mdbCheck(c.mdb_txn_commit(txn));
+    }
+
+    fn loadAll(self: *ContentSet) !void {
+        var txn: ?*c.MDB_txn = null;
+        try mdbCheck(c.mdb_txn_begin(self.env, null, c.MDB_RDONLY, &txn));
+        defer c.mdb_txn_abort(txn);
+
+        if (self.getMeta(txn, meta_local_next_seq)) |v| self.local_next_seq = v;
+        if (self.getMeta(txn, meta_ring_seq)) |v| self.ring_seq = v;
+
+        var cur: ?*c.MDB_cursor = null;
+        try mdbCheck(c.mdb_cursor_open(txn, self.dbi_records, &cur));
+        defer c.mdb_cursor_close(cur);
+
+        var k: c.MDB_val = undefined;
+        var v: c.MDB_val = undefined;
+        while (true) {
+            const rc = c.mdb_cursor_get(cur, &k, &v, c.MDB_NEXT);
+            if (rc == c.MDB_NOTFOUND) break;
+            try mdbCheck(rc);
+            const path = mvalSlice(&k);
+            if (!validRelPath(path) or path.len > max_path_len) return error.Corrupt;
+            const rec = try decodeRecord(mvalSlice(&v));
+            const gop = try self.map.getOrPut(path);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.alloc.dupe(u8, path);
+            } else {
+                self.unindexDir(gop.value_ptr.*);
+            }
+            gop.value_ptr.* = rec;
+            self.indexDir(gop.key_ptr.*, rec);
+            // The local seq counter survives even if the record carrying
+            // the max local seq is later GC'd (meta is the floor, the
+            // record scan covers anything newer than the last commit).
+            if (rec.ver.origin == self.local_origin and rec.ver.seq >= self.local_next_seq)
+                self.local_next_seq = rec.ver.seq + 1;
+        }
+    }
+
+    fn getMeta(self: *ContentSet, txn: ?*c.MDB_txn, key: []const u8) ?u64 {
+        var k = mval(key);
+        var v: c.MDB_val = undefined;
+        if (c.mdb_get(txn, self.dbi_meta, &k, &v) != 0) return null;
+        if (v.mv_size != 8) return null;
+        const p: [*]const u8 = @ptrCast(v.mv_data);
+        return std.mem.readInt(u64, p[0..8], .big);
     }
 
     pub fn lookup(self: *const ContentSet, path: []const u8) ?*const Record {
@@ -234,35 +406,53 @@ pub const ContentSet = struct {
         try self.learnId(fsid, fileid, 0, "");
     }
 
-    /// Allocate the next local version.  The counter persists via upsert
-    /// records and snapshot headers; a state loss that resets it is healed
-    /// by the scan fallback re-announcing with fresh (higher-origin-seq
-    /// streams restart at the recomputed max + 1).
+    /// Allocate the next local version.  The counter persists via the meta
+    /// DBI at every commit; a state loss that resets it is healed by the
+    /// scan fallback re-announcing (fresh higher-seq stream restarts at the
+    /// recomputed max + 1).
     pub fn nextVersion(self: *ContentSet) Version {
         const v = Version{ .origin = self.local_origin, .seq = self.local_next_seq };
         self.local_next_seq += 1;
         return v;
     }
 
-    /// Insert or replace the record for path, appending to the log.
-    /// Caller flushes at batch boundaries.
+    /// Insert or replace the record for path, write-through into the
+    /// pending LMDB txn.  Caller flushes at batch boundaries.
     pub fn upsert(self: *ContentSet, path: []const u8, rec: Record) !void {
         if (!validRelPath(path)) return error.BadPath;
-        if (path.len > 1024) return error.NameTooLong;
+        if (path.len > max_path_len) return error.NameTooLong;
 
-        var buf: [upsert_fixed_len + 1024]u8 = undefined;
-        const payload = try encodeUpsert(&buf, path, rec);
-        try self.appendFrame(payload);
+        var r = rec;
+        // First tombstone application starts the retention clock; restarts
+        // and re-upserts keep the original stamp.
+        if (r.state == .deleted and r.deleted_at == 0)
+            r.deleted_at = std.time.timestamp();
+        // Keep the local seq floor monotonic even for records applied from
+        // the wire with our own origin (restart replay corner).
+        if (r.ver.origin == self.local_origin and r.ver.seq >= self.local_next_seq)
+            self.local_next_seq = r.ver.seq + 1;
+
+        var buf: [value_len]u8 = undefined;
+        const body = encodeRecord(&buf, r);
+        self.ensureTxn() catch |e| {
+            self.abortTxn();
+            return e;
+        };
+        var k = mval(path);
+        var d = mval(body);
+        mdbCheck(c.mdb_put(self.wtxn, self.dbi_records, &k, &d, 0)) catch |e| {
+            self.abortTxn();
+            return e;
+        };
 
         const gop = try self.map.getOrPut(path);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.alloc.dupe(u8, path);
         } else {
-            self.unindexDir(gop.key_ptr.*, gop.value_ptr.*);
+            self.unindexDir(gop.value_ptr.*);
         }
-        gop.value_ptr.* = rec;
-        self.indexDir(gop.key_ptr.*, rec);
-        self.ops_since_snap += 1;
+        gop.value_ptr.* = r;
+        self.indexDir(gop.key_ptr.*, r);
     }
 
     fn indexDir(self: *ContentSet, path: []const u8, rec: Record) void {
@@ -270,8 +460,7 @@ pub const ContentSet = struct {
         self.learnId(rec.id.fsid, rec.id.fileid, rec.id.gen, path) catch {};
     }
 
-    fn unindexDir(self: *ContentSet, path: []const u8, rec: Record) void {
-        _ = path;
+    fn unindexDir(self: *ContentSet, rec: Record) void {
         if (rec.id.fileid == 0) return;
         self.dropId(rec.id.fsid, rec.id.fileid);
     }
@@ -281,179 +470,103 @@ pub const ContentSet = struct {
     /// crash are safe because every downstream op is idempotent.
     pub fn checkpoint(self: *ContentSet, ring_seq: u64) !void {
         if (ring_seq == self.ring_seq) return;
-        var payload: [9]u8 = undefined;
-        payload[0] = rec_ring_seq;
-        std.mem.writeInt(u64, payload[1..9], ring_seq, .big);
-        try self.appendFrame(&payload);
         self.ring_seq = ring_seq;
+        try self.ensureTxn();
         try self.flush();
     }
 
-    /// fsync the log; snapshot when the cadence trips.
+    /// Commit the pending write txn (records + ring-seq + local seq in ONE
+    /// atomic fsync'd commit — gap #12).
     pub fn flush(self: *ContentSet) !void {
-        try posix.fsync(self.log_fd);
-        if (self.log_bytes >= snap_max_log_bytes or self.ops_since_snap >= snap_max_ops)
-            try self.snapshot();
+        if (self.wtxn == null) return;
+        self.putMeta(meta_local_next_seq, self.local_next_seq) catch |e| {
+            self.abortTxn();
+            return e;
+        };
+        self.putMeta(meta_ring_seq, self.ring_seq) catch |e| {
+            self.abortTxn();
+            return e;
+        };
+        const txn = self.wtxn.?;
+        self.wtxn = null; // commit consumes the handle either way
+        mdbCheck(c.mdb_txn_commit(txn)) catch |e| {
+            // The batch is lost but the in-memory map carries it: without a
+            // rebuild the two diverge silently.  Force the scan floor.
+            self.needs_scan = true;
+            return e;
+        };
     }
 
-    /// Write a full snapshot (tmp + fsync + rename), then truncate the log.
+    /// LMDB's commit IS the snapshot — kept for API/behaviour parity with
+    /// the POC backend (callers, tests).  Freelist re-compaction is an
+    /// offline op (runbook: stop brfsd; `mdb_copy -c csdb csdb.compact`;
+    /// swap; start).
     pub fn snapshot(self: *ContentSet) !void {
-        const alloc = self.alloc;
-        const tmp_path = try std.fs.path.join(alloc, &.{ self.state_dir, snap_tmp_name });
-        defer alloc.free(tmp_path);
-        const final_path = try std.fs.path.join(alloc, &.{ self.state_dir, snap_name });
-        defer alloc.free(final_path);
+        try self.flush();
+    }
 
-        const tmp_z = try alloc.dupeZ(u8, tmp_path);
-        defer alloc.free(tmp_z);
-        const fd = try posix.open(tmp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
-        var ok = false;
-        defer if (!ok) posix.close(fd);
-
-        var body: std.ArrayList(u8) = .empty;
-        defer body.deinit(alloc);
-
-        try body.appendSlice(alloc, snap_magic);
-        try appendInt(&body, alloc, u32, format_version);
-        try appendInt(&body, alloc, u64, self.local_next_seq);
-        try appendInt(&body, alloc, u64, self.ring_seq);
-        try appendInt(&body, alloc, u64, self.map.count());
-
+    /// Gap #7: drop tombstones older than tombstone_ttl_sec.  Live records
+    /// are never collected.  Returns the number collected.  (The
+    /// all-member-ack horizon half of the retention rule lands with
+    /// per-member ack tracking; TTL alone matches DFSR's window.)
+    pub fn gcTombstones(self: *ContentSet, now_sec: i64) !u64 {
+        var doomed: std.ArrayList([]const u8) = .empty;
+        defer doomed.deinit(self.alloc);
         var it = self.map.iterator();
         while (it.next()) |e| {
-            var rbuf: [upsert_fixed_len + 4096]u8 = undefined;
-            const payload = encodeUpsert(&rbuf, e.key_ptr.*, e.value_ptr.*) catch return error.NameTooLong;
-            try appendInt(&body, alloc, u32, @intCast(payload.len));
-            try appendInt(&body, alloc, u32, std.hash.Crc32.hash(payload));
-            try body.appendSlice(alloc, payload);
+            const r = e.value_ptr;
+            if (r.state != .deleted or r.deleted_at == 0) continue;
+            if (now_sec - r.deleted_at < tombstone_ttl_sec) continue;
+            doomed.append(self.alloc, e.key_ptr.*) catch break;
         }
-        try appendInt(&body, alloc, u32, std.hash.Crc32.hash(body.items));
+        if (doomed.items.len == 0) return 0;
 
-        try writeAll(fd, body.items);
-        try posix.fsync(fd);
-        posix.close(fd);
-        ok = true;
-
-        const final_z = try alloc.dupeZ(u8, final_path);
-        defer alloc.free(final_z);
-        try posix.rename(tmp_z, final_z);
-        fsyncDir(self.state_dir);
-
-        // Snapshot is durable: start a fresh log.
-        posix.close(self.log_fd);
-        const log_path = try std.fs.path.join(alloc, &.{ self.state_dir, log_name });
-        defer alloc.free(log_path);
-        const log_z = try alloc.dupeZ(u8, log_path);
-        defer alloc.free(log_z);
-        self.log_fd = try posix.open(log_z, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .APPEND = true }, 0o600);
-        self.log_bytes = 0;
-        self.ops_since_snap = 0;
+        try self.ensureTxn();
+        var n: u64 = 0;
+        for (doomed.items) |p| {
+            var k = mval(p);
+            const rc = c.mdb_del(self.wtxn, self.dbi_records, &k, null);
+            if (rc == c.MDB_NOTFOUND) {
+                n += self.removeFromMap(p);
+                continue;
+            }
+            mdbCheck(rc) catch |e| {
+                self.abortTxn();
+                return e;
+            };
+            n += self.removeFromMap(p);
+        }
+        try self.flush();
+        return n;
     }
 
-    fn appendFrame(self: *ContentSet, payload: []const u8) !void {
-        var hdr: [8]u8 = undefined;
-        std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len), .big);
-        std.mem.writeInt(u32, hdr[4..8], std.hash.Crc32.hash(payload), .big);
-        try writeAll(self.log_fd, &hdr);
-        try writeAll(self.log_fd, payload);
-        self.log_bytes += 8 + payload.len;
+    fn removeFromMap(self: *ContentSet, path: []const u8) u64 {
+        // Tombstones carry no live id-index entry (unindexed at upsert).
+        if (self.map.fetchRemove(path)) |kv| {
+            self.alloc.free(kv.key);
+            return 1;
+        }
+        return 0;
     }
 
-    fn loadSnapshot(self: *ContentSet) void {
-        const alloc = self.alloc;
-        const path = std.fs.path.join(alloc, &.{ self.state_dir, snap_name }) catch return;
-        defer alloc.free(path);
-        const data = readWholeFile(alloc, path) orelse return;
-        defer alloc.free(data);
+    fn ensureTxn(self: *ContentSet) !void {
+        if (self.wtxn != null) return;
+        try mdbCheck(c.mdb_txn_begin(self.env, null, 0, &self.wtxn));
+    }
 
-        if (data.len < snap_magic.len + 4 + 8 + 8 + 8 + 4 + 4) {
-            self.needs_scan = true;
-            return;
-        }
-        const stored_crc = std.mem.readInt(u32, data[data.len - 4 ..][0..4], .big);
-        const body = data[0 .. data.len - 4];
-        if (std.hash.Crc32.hash(body) != stored_crc) {
-            self.needs_scan = true;
-            return;
-        }
-        if (!std.mem.eql(u8, body[0..8], snap_magic)) {
-            self.needs_scan = true;
-            return;
-        }
-        if (std.mem.readInt(u32, body[8..12], .big) != format_version) {
-            self.needs_scan = true;
-            return;
-        }
-        self.local_next_seq = std.mem.readInt(u64, body[12..20], .big);
-        self.ring_seq = std.mem.readInt(u64, body[20..28], .big);
-        // body[28..36] = record count (informational; the frames are truth)
-
-        // Records are framed exactly like the log.  A bad frame here means
-        // the file is corrupt despite the whole-file CRC (shouldn't happen);
-        // treat as corruption.
-        var pos: usize = 36;
-        while (pos < body.len) {
-            const parsed = parseFrame(body, &pos) orelse {
-                self.needs_scan = true;
-                return;
-            };
-            self.applyPayload(parsed) catch {
-                self.needs_scan = true;
-                return;
-            };
+    fn abortTxn(self: *ContentSet) void {
+        if (self.wtxn) |txn| {
+            c.mdb_txn_abort(txn);
+            self.wtxn = null;
         }
     }
 
-    fn loadLog(self: *ContentSet) void {
-        const alloc = self.alloc;
-        const path = std.fs.path.join(alloc, &.{ self.state_dir, log_name }) catch return;
-        defer alloc.free(path);
-        const data = readWholeFile(alloc, path) orelse return;
-        defer alloc.free(data);
-
-        var pos: usize = 0;
-        while (pos < data.len) {
-            const frame_start = pos;
-            const parsed = parseFrame(data, &pos) orelse {
-                // Torn tail (kill -9 mid-write): truncate to the last good
-                // record and carry on.  This is expected crash wear, not
-                // corruption.
-                truncateFile(path, frame_start);
-                break;
-            };
-            self.applyPayload(parsed) catch {
-                truncateFile(path, frame_start);
-                self.needs_scan = true;
-                break;
-            };
-            self.log_bytes = pos;
-        }
-    }
-
-    fn applyPayload(self: *ContentSet, payload: []const u8) !void {
-        switch (payload[0]) {
-            rec_upsert => {
-                const decoded = try decodeUpsert(payload);
-                if (!validRelPath(decoded.path)) return error.BadPath;
-                const gop = try self.map.getOrPut(decoded.path);
-                if (!gop.found_existing) {
-                    gop.key_ptr.* = try self.alloc.dupe(u8, decoded.path);
-                } else {
-                    self.unindexDir(gop.key_ptr.*, gop.value_ptr.*);
-                }
-                gop.value_ptr.* = decoded.rec;
-                self.indexDir(gop.key_ptr.*, decoded.rec);
-                if (decoded.rec.ver.origin == self.local_origin and
-                    decoded.rec.ver.seq >= self.local_next_seq)
-                    self.local_next_seq = decoded.rec.ver.seq + 1;
-            },
-            rec_ring_seq => {
-                if (payload.len != 9) return error.BadFrame;
-                const s = std.mem.readInt(u64, payload[1..9], .big);
-                if (s > self.ring_seq) self.ring_seq = s;
-            },
-            else => return error.BadFrame,
-        }
+    fn putMeta(self: *ContentSet, key: []const u8, v: u64) !void {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, v, .big);
+        var k = mval(key);
+        var d = mval(&buf);
+        try mdbCheck(c.mdb_put(self.wtxn, self.dbi_meta, &k, &d, 0));
     }
 };
 
@@ -471,11 +584,9 @@ pub fn validRelPath(path: []const u8) bool {
     return true;
 }
 
-fn encodeUpsert(buf: []u8, path: []const u8, rec: Record) ![]const u8 {
-    if (path.len > std.math.maxInt(u16)) return error.NameTooLong;
-    if (buf.len < upsert_fixed_len + path.len) return error.NameTooLong;
+fn encodeRecord(buf: []u8, rec: Record) []const u8 {
+    std.debug.assert(buf.len >= value_len);
     var w = Writer{ .buf = buf };
-    w.u8v(rec_upsert);
     w.u64v(rec.id.fsid);
     w.u64v(rec.id.fileid);
     w.u64v(rec.id.gen);
@@ -487,18 +598,14 @@ fn encodeUpsert(buf: []u8, path: []const u8, rec: Record) ![]const u8 {
     w.u16v(rec.mode);
     w.u8v(if (rec.is_dir) 1 else 0);
     w.u8v(@intFromEnum(rec.state));
+    w.i64v(rec.deleted_at);
     w.bytes(&rec.sha256);
-    w.u16v(@intCast(path.len));
-    w.bytes(path);
     return w.done();
 }
 
-const DecodedUpsert = struct { path: []const u8, rec: Record };
-
-fn decodeUpsert(payload: []const u8) !DecodedUpsert {
-    if (payload.len < upsert_fixed_len) return error.BadFrame;
-    var r = Reader{ .buf = payload };
-    if (r.u8v() != rec_upsert) return error.BadFrame;
+fn decodeRecord(buf: []const u8) !Record {
+    if (buf.len != value_len) return error.BadFrame;
+    var r = Reader{ .buf = buf };
     var rec = Record{};
     rec.id.fsid = r.u64v();
     rec.id.fileid = r.u64v();
@@ -511,81 +618,9 @@ fn decodeUpsert(payload: []const u8) !DecodedUpsert {
     rec.mode = r.u16v();
     rec.is_dir = r.u8v() != 0;
     rec.state = std.meta.intToEnum(State, r.u8v()) catch return error.BadFrame;
+    rec.deleted_at = r.i64v();
     r.bytesInto(&rec.sha256);
-    const plen = r.u16v();
-    const path = r.rest();
-    if (path.len != plen or plen == 0) return error.BadFrame;
-    return .{ .path = path, .rec = rec };
-}
-
-/// Read one framed record from buf starting at *pos.  Advances *pos past
-/// the frame on success; returns null on any short read or checksum
-/// mismatch (caller decides torn-tail vs corruption).
-fn parseFrame(buf: []const u8, pos: *usize) ?[]const u8 {
-    if (buf.len - pos.* < 8) return null;
-    const len = std.mem.readInt(u32, buf[pos.*..][0..4], .big);
-    const crc = std.mem.readInt(u32, buf[pos.* + 4 ..][0..4], .big);
-    if (len == 0 or len > max_load_bytes) return null;
-    pos.* += 8;
-    if (buf.len - pos.* < len) return null;
-    const payload = buf[pos.* .. pos.* + len];
-    if (std.hash.Crc32.hash(payload) != crc) return null;
-    pos.* += len;
-    return payload;
-}
-
-fn readWholeFile(alloc: Allocator, path: []const u8) ?[]u8 {
-    const path_z = alloc.dupeZ(u8, path) catch return null;
-    defer alloc.free(path_z);
-    const fd = posix.open(path_z, .{ .ACCMODE = .RDONLY }, 0) catch return null;
-    defer posix.close(fd);
-    var st: posix.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return null;
-    if (st.size < 0 or st.size > max_load_bytes) return null;
-    const size: usize = @intCast(st.size);
-    const data = alloc.alloc(u8, size) catch return null;
-    errdefer alloc.free(data);
-    var off: usize = 0;
-    while (off < size) {
-        const n = posix.read(fd, data[off..]) catch {
-            alloc.free(data);
-            return null;
-        };
-        if (n == 0) break;
-        off += n;
-    }
-    if (off != size) {
-        alloc.free(data);
-        return null;
-    }
-    return data;
-}
-
-extern "c" fn truncate(path: [*:0]const u8, length: c_long) c_int;
-
-fn truncateFile(path: []const u8, len: usize) void {
-    const path_z = std.posix.toPosixPath(path) catch return;
-    _ = truncate(&path_z, @intCast(len));
-}
-
-fn fsyncDir(path: []const u8) void {
-    const path_z = std.posix.toPosixPath(path) catch return;
-    const fd = posix.open(std.mem.sliceTo(&path_z, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
-    defer posix.close(fd);
-    posix.fsync(fd) catch {};
-}
-
-fn writeAll(fd: posix.fd_t, data: []const u8) !void {
-    var off: usize = 0;
-    while (off < data.len) {
-        off += try posix.write(fd, data[off..]);
-    }
-}
-
-fn appendInt(buf: *std.ArrayList(u8), alloc: Allocator, comptime T: type, v: T) !void {
-    var tmp: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &tmp, v, .big);
-    try buf.appendSlice(alloc, &tmp);
+    return rec;
 }
 
 const Writer = struct {
@@ -648,10 +683,6 @@ const Reader = struct {
     fn bytesInto(self: *Reader, out: []u8) void {
         @memcpy(out, self.buf[self.pos..][0..out.len]);
         self.pos += out.len;
-    }
-    fn rest(self: *Reader) []const u8 {
-        defer self.pos = self.buf.len;
-        return self.buf[self.pos..];
     }
 };
 
@@ -724,7 +755,7 @@ test "upsert, lookup, tombstone, dir index" {
     try std.testing.expectError(error.BadPath, cs.upsert("a//b", sampleRecord(3)));
 }
 
-test "persistence roundtrip incl. snapshot and seq recovery" {
+test "persistence roundtrip incl. flush and seq recovery" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -755,9 +786,11 @@ test "persistence roundtrip incl. snapshot and seq recovery" {
         try std.testing.expectEqual(@as(u64, 4096), rec.size);
         try std.testing.expectEqual(@as(u16, 0o644), rec.mode);
         try std.testing.expectEqualStrings("d", cs.dirPath(7, 8).?);
-        try std.testing.expectEqual(State.deleted, cs.lookup("gone.txt").?.state);
+        const gone = cs.lookup("gone.txt").?;
+        try std.testing.expectEqual(State.deleted, gone.state);
+        try std.testing.expect(gone.deleted_at > 0); // retention stamp persisted
 
-        // Mutate, flush (no snapshot), reopen: log replay path.
+        // Mutate, flush, reopen: committed batch survives.
         var r4 = sampleRecord(4);
         r4.size = 8192;
         try cs.upsert("a.txt", r4);
@@ -771,7 +804,7 @@ test "persistence roundtrip incl. snapshot and seq recovery" {
     }
 }
 
-test "torn log tail (kill -9 mid-write) truncates cleanly" {
+test "kill -9 discards only the uncommitted batch (gap #12)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -780,62 +813,130 @@ test "torn log tail (kill -9 mid-write) truncates cleanly" {
 
     {
         var cs = try ContentSet.open(alloc, dir, "test-node");
-        try cs.upsert("a.txt", sampleRecord(1));
-        try cs.flush();
-        cs.close();
+        try cs.upsert("committed.txt", sampleRecord(1));
+        try cs.flush(); // durable
+        try cs.upsert("uncommitted.txt", sampleRecord(2)); // pending only
+        cs.abortAndClose(); // crash: no commit, no orderly close
     }
-
-    // Simulate a torn write: garbage bytes appended after the good record.
-    const log_path = try std.fs.path.join(alloc, &.{ dir, log_name });
-    defer alloc.free(log_path);
-    const log_z = try alloc.dupeZ(u8, log_path);
-    defer alloc.free(log_z);
-    const fd = try posix.open(log_z, .{ .ACCMODE = .WRONLY, .APPEND = true }, 0);
-    try writeAll(fd, "\x00\x00\x00\x40partial");
-    posix.close(fd);
-
     {
         var cs = try ContentSet.open(alloc, dir, "test-node");
         defer cs.close();
-        try std.testing.expect(!cs.needs_scan); // torn tail is normal crash wear
-        try std.testing.expect(cs.lookup("a.txt") != null);
+        try std.testing.expect(!cs.needs_scan); // a crash is normal wear
+        try std.testing.expect(cs.lookup("committed.txt") != null);
+        try std.testing.expect(cs.lookup("uncommitted.txt") == null);
+        // Meta committed with the first batch; the record scan covers it.
+        try std.testing.expectEqual(@as(u64, 2), cs.local_next_seq);
 
-        // Log must be writable after truncation repair.
-        try cs.upsert("b.txt", sampleRecord(2));
+        // The env is fully writable after crash recovery.
+        try cs.upsert("after.txt", sampleRecord(3));
         try cs.flush();
     }
     {
         var cs = try ContentSet.open(alloc, dir, "test-node");
         defer cs.close();
-        try std.testing.expect(cs.lookup("a.txt") != null);
-        try std.testing.expect(cs.lookup("b.txt") != null);
+        try std.testing.expect(cs.lookup("committed.txt") != null);
+        try std.testing.expect(cs.lookup("after.txt") != null);
     }
 }
 
-test "corrupt snapshot falls back to scan flag" {
+test "corrupt env is moved aside and rebuilt via scan floor" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmpStateDir(alloc, &tmp);
     defer alloc.free(dir);
 
-    {
-        var cs = try ContentSet.open(alloc, dir, "test-node");
-        try cs.upsert("a.txt", sampleRecord(1));
-        try cs.snapshot();
-        cs.close();
-    }
-    const snap_path = try std.fs.path.join(alloc, &.{ dir, snap_name });
-    defer alloc.free(snap_path);
-    const snap_z = try alloc.dupeZ(u8, snap_path);
-    defer alloc.free(snap_z);
-    const fd = try posix.open(snap_z, .{ .ACCMODE = .WRONLY }, 0);
-    _ = try posix.pwrite(fd, "\xff", 20); // inside the record area
-    posix.close(fd);
+    // Garbage where data.mdb should be: env open must fail and fall back.
+    const csdb = try std.fs.path.join(alloc, &.{ dir, db_dir });
+    defer alloc.free(csdb);
+    try std.fs.cwd().makePath(csdb);
+    const data_path = try std.fs.path.join(alloc, &.{ csdb, "data.mdb" });
+    defer alloc.free(data_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = data_path, .data = &[_]u8{0xff} ** 4096 });
 
     var cs = try ContentSet.open(alloc, dir, "test-node");
     defer cs.close();
     try std.testing.expect(cs.needs_scan);
+    try cs.upsert("rebuilt.txt", sampleRecord(1));
+    try cs.flush();
+}
+
+test "tombstone GC respects the retention TTL (gap #7)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    const now = std.time.timestamp();
+    {
+        var cs = try ContentSet.open(alloc, dir, "test-node");
+        try cs.upsert("keep.txt", sampleRecord(1));
+        var tomb = sampleRecord(50); // local origin, high seq: meta floor
+        tomb.state = .deleted;
+        try cs.upsert("gone.txt", tomb);
+        try cs.flush();
+
+        try std.testing.expectEqual(@as(u64, 0), try cs.gcTombstones(now)); // within TTL
+        try std.testing.expect(cs.lookup("gone.txt") != null);
+        try std.testing.expectEqual(@as(u64, 1), try cs.gcTombstones(now + tombstone_ttl_sec + 1));
+        try std.testing.expect(cs.lookup("gone.txt") == null);
+        try std.testing.expect(cs.lookup("keep.txt") != null); // live records never collected
+        cs.close();
+    }
+    {
+        var cs = try ContentSet.open(alloc, dir, "test-node");
+        defer cs.close();
+        try std.testing.expect(cs.lookup("gone.txt") == null); // GC is durable
+        try std.testing.expect(cs.lookup("keep.txt") != null);
+        // The local seq floor survived the GC of the record that carried it.
+        try std.testing.expectEqual(@as(u64, 51), cs.local_next_seq);
+    }
+}
+
+test "gap #9 delete-vs-modify rule: LWW on (seq, origin) decides" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var cs = try ContentSet.open(alloc, dir, "test-node");
+    defer cs.close();
+
+    // Tombstone N lands.
+    var tomb = sampleRecord(5);
+    tomb.state = .deleted;
+    try cs.upsert("f.txt", tomb);
+
+    // Offline modify M > N (same origin, higher seq) resurrects.
+    var live = sampleRecord(6);
+    live.state = .live;
+    live.size = 12345;
+    switch (relate(live.ver, cs.lookup("f.txt").?.ver)) {
+        .newer, .conflict_incoming_wins => try cs.upsert("f.txt", live),
+        else => return error.RuleBroken,
+    }
+    try std.testing.expectEqual(State.live, cs.lookup("f.txt").?.state);
+
+    // A later tombstone beats the modify (delete wins; the daemon
+    // quarantines the divergent copy — installer.quarantine).
+    var tomb2 = sampleRecord(9);
+    tomb2.state = .deleted;
+    switch (relate(tomb2.ver, cs.lookup("f.txt").?.ver)) {
+        .newer, .conflict_incoming_wins => try cs.upsert("f.txt", tomb2),
+        else => return error.RuleBroken,
+    }
+    try std.testing.expectEqual(State.deleted, cs.lookup("f.txt").?.state);
+
+    // A stale modify (M < N) must NOT resurrect.
+    var stale = sampleRecord(4);
+    stale.state = .live;
+    switch (relate(stale.ver, cs.lookup("f.txt").?.ver)) {
+        .same, .older, .conflict_stored_wins => {},
+        else => return error.RuleBroken,
+    }
+    try std.testing.expectEqual(State.deleted, cs.lookup("f.txt").?.state);
 }
 
 test "empty first start requests a scan" {
@@ -878,8 +979,8 @@ test "validRelPath" {
     try std.testing.expect(validRelPath("a"));
     try std.testing.expect(validRelPath("a/b/c.txt"));
     try std.testing.expect(!validRelPath(""));
-    try std.testing.expect(!validRelPath("/a"));
-    try std.testing.expect(!validRelPath("a/"));
+    try std.testing.expect(!validRelPath(".."));
+    try std.testing.expect(!validRelPath(".."));
     try std.testing.expect(!validRelPath("a//b"));
     try std.testing.expect(!validRelPath("a/./b"));
     try std.testing.expect(!validRelPath("a/../b"));

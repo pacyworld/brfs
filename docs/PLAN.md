@@ -1,7 +1,8 @@
 # BrFS (BSD Replicated File System) — DFSR-style Replicated Folder Engine for FreeBSD
 
-Status: IMPLEMENTATION (v0.6, 2026-08-24) — Phase 0 + Phase 1 complete
-(POC end-to-end: T1-T8 + T10 green on the 3-VM rig, commit fb4b1b5)
+Status: IMPLEMENTATION (v0.7, 2026-08-24) — Phase 0 + Phase 1 complete
+(POC end-to-end: T1-T8 + T10 green on the 3-VM rig, commit fb4b1b5);
+Phase 2 underway: LMDB content-set swap landed (gaps #7/#9/#12 closed)
 Name: FINAL — **BrFS** ("Brrr... it's cold"). Daemon: `brfsd`, kmod: `brfs.ko`, utility: `brfsctl`.
 Owner: Daniel
 Target: FreeBSD 15.0+ (VFS event notification points / inotify landed 15.0-RELEASE)
@@ -106,8 +107,10 @@ Driver use case: replace cdn-sync.sh (rsync+lockf cron hack) for Pacy World CDN 
   zig version at scaffolding (mac_do_auto zig:015; McpBridge hit 0.16
   breakage).
 - Modules: events.zig (/dev/brfs consumer + ioctl setup — ONLY detection
-  path), contentset.zig ({id, ver, size, mtime, sha256}; POC append-only +
-  snapshot, checksummed, corrupt→rebuild-via-scan; LMDB/SQLite later),
+  path), contentset.zig ({id, ver, size, mtime, sha256, state}; LMDB-backed
+  since Phase 2 — vendored LMDB 1.0.0 in lib/lmdb, static, hash-verified
+  against databases/lmdb distinfo; the in-memory map stays the query layer,
+  LMDB is the write-through durable store under state_dir/csdb),
   journal.zig (per-path coalescing), protocol.zig (mutation-tested codec,
   securemilter-lib pattern), peer.zig/server.zig (full mesh,
   retries/backoff, PSK-in-HELLO POC, TLS/mTLS Phase 2), installer.zig (staging +
@@ -152,6 +155,36 @@ pairs. All ops idempotent. See docs/protocol.md.
   is a worker-thread or chunked-fsync question.
 - Phase 2: kernel hardening — fidelity vs dtrace oracle, ring sizing/drop
   behavior, overhead measurement, T9 matrix, unload veto while fd held.
+  **LMDB content-set swap DONE 2026-08-24** (closes design-review gaps
+  #7/#9/#12):
+  - contentset.zig persistence is now LMDB (vendored 1.0.0, lib/lmdb,
+    statically linked — no guest pkg dependency).  Every flush/checkpoint
+    is ONE write-txn commit (records + ring-seq checkpoint + local seq
+    counter atomic + fsync'd) → gap #12 crash consistency by construction;
+    torn-tail machinery deleted.  A corrupt env is moved aside
+    (csdb.corrupt-<ts>) and rebuilt via the scan/RESYNC floor.
+  - Gap #7 tombstone retention/GC: tombstones are durable first-class keys
+    carrying deleted_at (wall-clock retention stamp, NEVER ordering).
+    gcTombstones() runs hourly from the daemon timer and drops tombstones
+    older than 7 days (DFSR ConflictAndDeleted window).  The second half
+    of the locked retention rule — all-member-ack horizon — lands with
+    per-member ack tracking (still open; TTL alone is DFSR-equivalent).
+  - Gap #9 delete-vs-modify rule LOCKED: pure LWW on (seq, origin).  A
+    winning offline modify (M > tombstone N) RESURRECTS the file (fetch/
+    install over the tombstone; the deleting side has no copy to
+    quarantine); a winning tombstone quarantines the divergent live copy
+    (installer.quarantine, existing ConflictAndDeleted behavior).  Pinned
+    by unit tests in contentset.zig and resync.zig; T19 is the rig proof.
+  - Gotchas (accepted, documented): fixed 1 GiB map (sparse; MDB_MAP_FULL
+    runbook: stop brfsd, `mdb_copy -c csdb csdb.compact`, swap, start);
+    csdb shares state_dir's free-space precondition with quarantine
+    (gap #18); relative paths limited to 480 bytes (LMDB 511-byte key cap;
+    digest-key scheme is Phase 3 material if ever needed).  No migration
+    from the POC log/snapshot format — POC state is throwaway, the scan
+    floor rebuilds.
+  - LMDB ≠ the Phase 3 durable journal: the content set is current-state
+    KV (RESYNC diff source); the journal (tail-from-seq replay) still
+    arrives in Phase 3 and coexists.
   PLUS (promoted 2026-08-24, user): **TLS/mTLS between nodes** — rationale:
   (a) users will run BrFS across the public internet regardless of the
   LAN-only intent; (b) compliance regimes require encryption of all data in
