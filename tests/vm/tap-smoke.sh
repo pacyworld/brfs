@@ -33,7 +33,7 @@ have_event() { # op name-substr in the new log section
 pkill -x brfsd 2>/dev/null || true
 sleep 1
 kldstat -q -m brfs && kldunload brfs
-rm -rf "$TREE" /tmp/tap-smoke-outside
+rm -rf "$TREE" /tmp/tap-smoke-outside /tmp/tap-smoke-moved /tmp/tap-smoke-q.txt
 mkdir -p "$TREE/pre/existing"
 echo old > "$TREE/pre/existing/file.txt"
 kldload "$KMOD"
@@ -89,6 +89,46 @@ c1=$(grep "op=MOVE_FROM" $LOG | grep newfile | sed -e 's/.*cookie=\([^ ]*\).*/\1
 c2=$(grep "op=MOVE_TO" $LOG | grep renamed | sed -e 's/.*cookie=\([^ ]*\).*/\1/' | tail -1)
 [ -n "$c1" ] && [ "$c1" = "$c2" ] || fail "rename cookie pair ($c1 vs $c2)"
 ok "op battery"
+
+# --- move-out strip ------------------------------------------------------
+# A dir or file renamed OUT of the watched tree must stop emitting
+# (staging/quarantine locations share the patched vector; stale flags
+# there would spam the ring).  Moving back in must restore coverage.
+mkdir -p "$TREE/moveme/sub"
+echo x > "$TREE/moveme/sub/f.txt"
+echo q > "$TREE/quar.txt"
+sleep 1
+mv "$TREE/moveme" /tmp/tap-smoke-moved       # dir move-out
+mv "$TREE/quar.txt" /tmp/tap-smoke-q.txt     # file move-out
+sleep 2                                      # deferred unflag walk
+wc -l < $LOG | tr -d ' ' > $ID               # marker: nothing may follow
+echo y >> /tmp/tap-smoke-moved/sub/f.txt
+touch /tmp/tap-smoke-moved/sub/quiet.txt
+echo z >> /tmp/tap-smoke-q.txt
+sleep 1
+if sed -n "$(cat $ID),\$p" $LOG | grep -q "op="; then
+	sed -n "$(cat $ID),\$p" $LOG | grep "op=" | head -5
+	fail "events emitted from moved-out tree"
+else
+	ok "move-out strip (dir + file silent outside the tree)"
+fi
+
+mv /tmp/tap-smoke-moved "$TREE/back"
+mv /tmp/tap-smoke-q.txt "$TREE/quar-back.txt"
+sleep 2                                      # re-flag + deferred walk
+wc -l < $LOG | tr -d ' ' > $ID
+echo w >> "$TREE/back/sub/f.txt"
+touch "$TREE/back/sub/again.txt"
+echo v >> "$TREE/quar-back.txt"
+sleep 1
+# MODIFY self-events are NAMELESS: assert by count.  Two distinct files
+# written = two MODIFY subjects (different fileids, no dedup collapse) —
+# one re-flagged by the subtree walk (f.txt), one by the rename-time
+# cache_enter (quar-back.txt).
+modcount=$(sed -n "$(cat $ID),\$p" $LOG | grep -c "op=MODIFY " || true)
+[ "$modcount" -ge 2 ] || fail "MODIFY coverage after move-back-in ($modcount < 2)"
+have_event CREATE again.txt || fail "CREATE after move-back-in"
+ok "move-back-in re-flag"
 
 # --- DELROOT silence ----------------------------------------------------
 pkill -x brfsd; sleep 1

@@ -56,8 +56,10 @@
  *     vnode interlock via vn_irflag_set_cond, vpi_lock, ring/walk mtx);
  *   - never resolve paths in event context (no vn_fullpath); events carry
  *     (fsid, dir fileid, name) and userspace resolves;
- *   - vector patches are restored before module teardown, with a grace
- *     pause so in-flight tap calls drain before state is freed.
+ *   - vector patches are restored before module teardown, then an
+ *     epoch_wait_preempt() drains in-flight tap calls before state is
+ *     freed (hard guarantee; the tap enters a preemptible epoch section
+ *     on every invocation).
  */
 
 #include <sys/param.h>
@@ -65,6 +67,7 @@
 #include <sys/systm.h>
 #include <sys/conf.h>
 #include <sys/dirent.h>
+#include <sys/epoch.h>
 #include <sys/event.h>
 #include <sys/fcntl.h>
 #include <sys/inotify.h>
@@ -105,6 +108,15 @@ static struct selinfo	brfs_sel;
 static struct cdev	*brfs_cdev;
 static int		brfs_dev_open;		/* single-open flag */
 static int		brfs_dev_dying;		/* set when module is unloading */
+
+/*
+ * Preemptible epoch sectioning every tap invocation: the tap may sleep
+ * (VOP_GETATTR on a locked vnode, v_addpollinfo M_WAITOK), so the
+ * non-preemptible epoch flavour is not usable.  MOD_UNLOAD restores all
+ * patched vectors (no new tap call can start) and then epoch_wait_preempt()
+ * provides a hard drain guarantee before any state is freed.
+ */
+static epoch_t		brfs_epoch;
 
 /* ----------------------------------------------------------------
  * Tunables / sysctls
@@ -323,11 +335,20 @@ SYSCTL_PROC(_security_brfs, OID_AUTO, test_event,
  *     first P0.2 run panicked on open of a flagged dir in the window
  *     between kldunload's vector restore and the next ADDROOT.)
  *   - DELROOT/unload strip directory flags via an unflag walk (before
- *     vector restore); file PARENT flags self-heal via the decay path.
- *     Residual: a root rmdir'd while registered cannot be walked —
- *     leftover flags are safe (pollinfo invariant) and fade with vnode
- *     recycling.  A genuine inotify watch added inside our tree and then
- *     removed strips flags under it (inotify is oracle-only for BrFS).
+ *     vector restore), and file PARENT flags of directories the walk
+ *     itself stripped.  Residual: a root rmdir'd while registered cannot
+ *     be walked — leftover flags are safe (pollinfo invariant) and fade
+ *     with vnode recycling.  A genuine inotify watch added inside our
+ *     tree and then removed strips flags under it (inotify is
+ *     oracle-only for BrFS); brfsd re-pushes ADDROOT hourly as an
+ *     idempotent re-flag.
+ *   - Renames OUT of a watched tree strip flags at MOVE_FROM (file
+ *     PARENT flags immediately, directory flags + subtree via a deferred
+ *     unflag walk) so staging/quarantine locations — which share the
+ *     patched vector — stop emitting.  In-tree renames are re-flagged by
+ *     the MOVE_TO half (files + dirs directly; dir subtrees via walk) —
+ *     the rename's destination cache_enter runs BEFORE the post-hook, so
+ *     the MOVE_FROM strip would undo it.
  *
  * Vector patching: vfs_vector_op_register() bakes default ops into each
  * vop_vector at registration, so patching default_vnodeops would only
@@ -531,19 +552,24 @@ brfs_flag_dir(struct vnode *vp)
 
 /*
  * Strip our watch flag from a directory.  Skipped when genuine inotify
- * watches exist (then the flag is theirs).  Files' VIRF_INOTIFY_PARENT
- * is not stripped explicitly: with no flagged dirs left, the genuine
- * decay path (cache_vop_inotify) strips it on the next access, and
- * vnode recycling clears it eventually.
+ * watches exist (then the flag is theirs).  Returns true when this call
+ * stripped the flag, i.e. the directory was ours: the unflag walk uses
+ * that to decide whether child files' VIRF_INOTIFY_PARENT flags are also
+ * ours to strip (the genuine decay path, cache_vop_inotify, never runs
+ * for our flags — we do not forward to vop_stdinotify without genuine
+ * watches — so moved-out files would otherwise keep emitting self events
+ * from staging/quarantine until vnode recycling).
  */
-static void
+static bool
 brfs_unflag_dir(struct vnode *vp)
 {
 
 	if (brfs_has_inotify_watches(vp))
-		return;
-	if ((vn_irflag_read(vp) & VIRF_INOTIFY) != 0)
-		vn_irflag_unset(vp, VIRF_INOTIFY);
+		return (false);
+	if ((vn_irflag_read(vp) & VIRF_INOTIFY) == 0)
+		return (false);
+	vn_irflag_unset(vp, VIRF_INOTIFY);
+	return (true);
 }
 
 /*
@@ -552,8 +578,11 @@ brfs_unflag_dir(struct vnode *vp)
  * (vfs_inotify.c) but recursive.  When re != NULL (ADDROOT), every
  * visited directory's vop vector is patched and attributed to the root.
  * With unflag set, the walk instead strips VIRF_INOTIFY from directories
- * (DELROOT/unload); files' PARENT flags are left to decay (see
- * brfs_unflag_dir).
+ * (DELROOT/unload/move-out) and VIRF_INOTIFY_PARENT from files whose
+ * parent dir was stripped on this visit (see brfs_unflag_dir).  A child
+ * directory found already unflagged is not descended into, so a recycled
+ * (flag-less) directory mid-tree breaks the strip chain: residual flags
+ * below it are safe (pollinfo invariant) and fade with vnode recycling.
  *
  * Sleeps (readdir, namei, malloc): ioctl or taskqueue context only,
  * never the event path.  Does not descend into mounted filesystems
@@ -571,6 +600,7 @@ brfs_flag_subtree(struct vnode *startvp, struct brfs_root_entry *re,
 	char *buf;
 	size_t buflen;
 	u_int ndirs;
+	bool stripped;
 	int error;
 
 	buflen = 128 * sizeof(struct dirent);
@@ -601,7 +631,7 @@ brfs_flag_subtree(struct vnode *startvp, struct brfs_root_entry *re,
 		}
 
 		if (unflag) {
-			brfs_unflag_dir(vp);
+			stripped = brfs_unflag_dir(vp);
 		} else {
 			if (re != NULL)
 				brfs_vec_patch(__DECONST(struct vop_vector *,
@@ -645,6 +675,21 @@ brfs_flag_subtree(struct vnode *startvp, struct brfs_root_entry *re,
 				short ir;
 
 				ir = vn_irflag_read(cvp);
+				/*
+				 * Child dirs carry VIRF_INOTIFY_PARENT from
+				 * this (watched) parent on top of their own
+				 * VIRF_INOTIFY; PARENT alone passes the
+				 * INOTIFY() self-event gate, so leaving it
+				 * would let the walk's own readdir fire
+				 * IN_ACCESS back into the tap.  Strip it
+				 * when this parent was stripped by us.
+				 */
+				if (unflag && stripped &&
+				    (ir & VIRF_INOTIFY_PARENT) != 0) {
+					vn_irflag_unset(cvp,
+					    VIRF_INOTIFY_PARENT);
+					ir &= ~VIRF_INOTIFY_PARENT;
+				}
 				if ((ir & VIRF_MOUNTPOINT) != 0 ||
 				    (!unflag && (ir & VIRF_INOTIFY) != 0) ||
 				    (unflag && (ir & VIRF_INOTIFY) == 0)) {
@@ -667,6 +712,18 @@ brfs_flag_subtree(struct vnode *startvp, struct brfs_root_entry *re,
 				}
 				vrele(cvp);
 			} else {
+				/*
+				 * Unflag walk: strip the child's PARENT flag
+				 * only when its parent dir was stripped by us
+				 * on this visit — a parent left flagged has
+				 * genuine inotify watches, making its
+				 * children's PARENT flags genuine too.
+				 */
+				if (stripped &&
+				    (vn_irflag_read(cvp) &
+				    VIRF_INOTIFY_PARENT) != 0)
+					vn_irflag_unset(cvp,
+					    VIRF_INOTIFY_PARENT);
 				vrele(cvp);
 			}
 		}
@@ -686,10 +743,11 @@ brfs_flag_subtree(struct vnode *startvp, struct brfs_root_entry *re,
 }
 
 /*
- * Deferred walk of a populated directory renamed into a watched tree.
- * Preallocated pool: the event path must not allocate.  Pool exhaustion
- * only delays subtree flagging; the daemon's content-based announce of
- * the renamed directory prevents any state divergence.
+ * Deferred walk of a populated directory renamed into (flag) or out of
+ * (unflag) a watched tree.  Preallocated pool: the event path must not
+ * allocate.  Pool exhaustion only delays subtree flag adjustment; the
+ * daemon's content-based announce of the renamed directory prevents any
+ * state divergence.
  */
 #define	BRFS_WALK_POOL	8
 
@@ -697,6 +755,7 @@ static struct mtx	brfs_walk_mtx;
 static struct brfs_walkjob {
 	struct task	wj_task;
 	struct vnode	*wj_vp;		/* owned reference while set */
+	bool		wj_unflag;	/* strip instead of flag */
 } brfs_walkjobs[BRFS_WALK_POOL];
 
 static void
@@ -704,8 +763,9 @@ brfs_walk_task(void *ctx, int pending __unused)
 {
 	struct brfs_walkjob *wj = ctx;
 	struct vnode *vp = wj->wj_vp;
+	bool unflag = wj->wj_unflag;
 
-	(void)brfs_flag_subtree(vp, NULL, curthread, false);
+	(void)brfs_flag_subtree(vp, NULL, curthread, unflag);
 	mtx_lock(&brfs_walk_mtx);
 	wj->wj_vp = NULL;
 	mtx_unlock(&brfs_walk_mtx);
@@ -713,7 +773,7 @@ brfs_walk_task(void *ctx, int pending __unused)
 }
 
 static void
-brfs_walk_enqueue(struct vnode *vp)
+brfs_walk_enqueue(struct vnode *vp, bool unflag)
 {
 	u_int i;
 
@@ -723,6 +783,7 @@ brfs_walk_enqueue(struct vnode *vp)
 			continue;
 		vref(vp);
 		brfs_walkjobs[i].wj_vp = vp;
+		brfs_walkjobs[i].wj_unflag = unflag;
 		taskqueue_enqueue(taskqueue_thread,
 		    &brfs_walkjobs[i].wj_task);
 		mtx_unlock(&brfs_walk_mtx);
@@ -771,6 +832,7 @@ brfs_has_inotify_watches(struct vnode *vp)
 static int
 brfs_vop_inotify(struct vop_inotify_args *ap)
 {
+	struct epoch_tracker et;
 	struct vnode *vp, *dvp;
 	struct ucred *cred;
 	uint64_t dir_fileid, fileid, fsid, gen, dgen;
@@ -779,27 +841,10 @@ brfs_vop_inotify(struct vop_inotify_args *ap)
 	char namebuf[NAME_MAX + 1];
 	bool mutation;
 
+	epoch_enter_preempt(brfs_epoch, &et);
 	brfs_tap_seen++;
 	vp = ap->a_vp;
 	dvp = ap->a_dvp;
-
-	if (brfs_enabled && vp->v_type == VDIR) {
-		if ((vn_irflag_read(vp) & VIRF_INOTIFY) == 0)
-			brfs_flag_dir(vp);
-		/*
-		 * A directory arriving via rename may carry a populated
-		 * subtree whose vnodes bear no flags: queue the deferred
-		 * walk.  This must be independent of the upgrade above —
-		 * the MOVE_FROM half of the same rename already upgraded
-		 * the vnode, so the flag test alone would skip the import
-		 * case that needs the walk.  Reaching the tap at all means
-		 * the destination parent was flagged; for in-tree moves the
-		 * walk degenerates to one readdir of the top directory
-		 * (children are already flagged and skipped on sight).
-		 */
-		if (ap->a_event == IN_MOVED_TO)
-			brfs_walk_enqueue(vp);
-	}
 
 	op = 0;
 	mutation = true;
@@ -828,6 +873,126 @@ brfs_vop_inotify(struct vop_inotify_args *ap)
 		/* IN_ACCESS, IN_OPEN, IN_CLOSE_*: read-side noise. */
 		mutation = false;
 		break;
+	}
+
+	if (brfs_enabled && vp->v_type == VDIR) {
+		/*
+		 * Rename handling must distinguish move direction: the
+		 * INOTIFY_MOVE gate passes when ANY of source parent,
+		 * destination parent, or the subject is flagged, so a
+		 * MOVE_TO is delivered to the tap even when the directory
+		 * left the watched tree (source parent flagged) — an
+		 * unconditional re-flag here would undo the move-out
+		 * strip, and the "reaching the tap implies a flagged
+		 * destination parent" assumption does not hold.
+		 */
+		if (ap->a_event == IN_MOVED_FROM) {
+			/*
+			 * Move-out strip: a directory leaving a watched
+			 * tree (or carrying a stuck flag between two
+			 * unflagged parents) must stop emitting from its
+			 * new location — state_dir shares the patched
+			 * vector, so stale flags there spam the ring.
+			 * Strip our flag (genuine inotify watches keep
+			 * theirs) and queue the unflag walk for the
+			 * subtree.  An in-tree rename is re-flagged by
+			 * the MOVE_TO half below; both walks ride the
+			 * same FIFO taskqueue, so the strip strictly
+			 * precedes the re-flag.
+			 */
+			if ((vn_irflag_read(vp) & VIRF_INOTIFY) != 0 ||
+			    (dvp != NULL &&
+			    (vn_irflag_read(dvp) & VIRF_INOTIFY) != 0)) {
+				brfs_unflag_dir(vp);
+				/*
+				 * The dir also carries VIRF_INOTIFY_PARENT
+				 * from its (watched) source parent, which
+				 * alone passes the INOTIFY() self-event
+				 * gate — a readdir of the moved dir would
+				 * fire IN_ACCESS back into the tap and
+				 * undo the strip.  PARENT belongs to the
+				 * source parent's watch: strip it unless
+				 * that watch is genuine.  For an in-tree
+				 * rename the MOVE_TO half re-flags it
+				 * (the destination cache_enter runs before
+				 * this post-hook, so it cannot be relied
+				 * on).
+				 */
+				if (dvp != NULL &&
+				    !brfs_has_inotify_watches(dvp))
+					vn_irflag_unset(vp,
+					    VIRF_INOTIFY_PARENT);
+				brfs_walk_enqueue(vp, true);
+			}
+		} else if (ap->a_event == IN_MOVED_TO) {
+			/*
+			 * Arrival via rename: re-flag and queue the
+			 * subtree walk only when the destination parent
+			 * is flagged, i.e. the directory landed inside a
+			 * watched tree.  A populated subtree arrives with
+			 * unflagged vnodes; the walk imports them.  For
+			 * in-tree moves the walk degenerates to one
+			 * readdir of the top directory (children are
+			 * already flagged and skipped on sight).
+			 */
+			if (dvp != NULL &&
+			    (vn_irflag_read(dvp) & VIRF_INOTIFY) != 0) {
+				if ((vn_irflag_read(vp) & VIRF_INOTIFY) == 0)
+					brfs_flag_dir(vp);
+				/* The MOVE_FROM strip also removed PARENT;
+				 * re-establish it (cosmetic for BrFS — dir
+				 * mutations arrive as named events via the
+				 * parent — but keeps INOTIFY() self-event
+				 * gating consistent for genuine watchers). */
+				vn_irflag_set_cond(vp, VIRF_INOTIFY_PARENT);
+				brfs_walk_enqueue(vp, false);
+			}
+		} else if (mutation &&
+		    (vn_irflag_read(vp) & VIRF_INOTIFY) == 0) {
+			/*
+			 * Any other mutation event reaching the tap names
+			 * a dir inside a watched tree: upgrade on sight.
+			 * This also re-flags a directory whose recycled
+			 * vnode lost its flags.  Mutation-only: read-side
+			 * noise (IN_ACCESS from readdir — including the
+			 * kmod's OWN subtree walks) must not re-flag a
+			 * dir that was just stripped.
+			 */
+			brfs_flag_dir(vp);
+		}
+	} else if (brfs_enabled && ap->a_event == IN_MOVED_FROM &&
+	    (vn_irflag_read(vp) & VIRF_INOTIFY_PARENT) != 0 &&
+	    dvp != NULL && !brfs_has_inotify_watches(dvp)) {
+		/*
+		 * File move-out strip: VIRF_INOTIFY_PARENT belongs to the
+		 * source directory's watch.  Once the file leaves (e.g.
+		 * quarantined into state_dir) the flag would keep gating
+		 * self events (MODIFY/ATTRIB) to the tap from outside the
+		 * tree, and the genuine decay path never runs for our
+		 * flags.  Skip the strip when the source parent carries
+		 * genuine inotify watches — then the flag is theirs.  For
+		 * an in-tree rename the MOVE_TO half below re-flags the
+		 * vnode — cache_enter at the rename destination cannot be
+		 * relied on for this: it runs BEFORE this post-hook, so
+		 * the strip above would remove the flag it just set.
+		 * Hardlink caveat: a second link still inside the tree
+		 * loses self-event coverage until its next cache_enter
+		 * (named events via the flagged parent are unaffected).
+		 */
+		vn_irflag_unset(vp, VIRF_INOTIFY_PARENT);
+	} else if (brfs_enabled && ap->a_event == IN_MOVED_TO &&
+	    dvp != NULL && (vn_irflag_read(dvp) & VIRF_INOTIFY) != 0 &&
+	    (vn_irflag_read(vp) & VIRF_INOTIFY_PARENT) == 0) {
+		/*
+		 * File arrival in a watched tree: ensure PARENT is set.
+		 * Normally the rename's destination cache_enter does this,
+		 * but it executes before this post-hook — for an in-tree
+		 * rename the MOVE_FROM strip above removed that fresh flag.
+		 * Re-establishing it here is unconditional and also covers
+		 * filesystems whose rename omits the destination
+		 * cache_enter.
+		 */
+		vn_irflag_set_cond(vp, VIRF_INOTIFY_PARENT);
 	}
 
 	if (brfs_enabled && mutation) {
@@ -865,6 +1030,7 @@ brfs_vop_inotify(struct vop_inotify_args *ap)
 	    (dvp != NULL && brfs_has_inotify_watches(dvp)))
 		vop_stdinotify(ap);
 
+	epoch_exit_preempt(brfs_epoch, &et);
 	return (0);
 }
 
@@ -1297,9 +1463,19 @@ brfs_modevent(module_t mod __unused, int type, void *data __unused)
 			TASK_INIT(&brfs_walkjobs[i].wj_task, 0,
 			    brfs_walk_task, &brfs_walkjobs[i]);
 		knlist_init_mtx(&brfs_sel.si_note, &brfs_ring_mtx);
+		/*
+		 * Allocated before the cdev exists: the moment devfs
+		 * publishes the node an ADDROOT can patch vectors and the
+		 * tap can run.
+		 */
+		brfs_epoch = epoch_alloc("brfs", EPOCH_PREEMPT);
 		brfs_cdev = make_dev(&brfs_cdevsw, 0, UID_ROOT, GID_WHEEL,
 		    0600, BRFS_DEV_NAME);
-		return (brfs_cdev == NULL ? ENXIO : 0);
+		if (brfs_cdev == NULL) {
+			epoch_free(brfs_epoch);
+			return (ENXIO);
+		}
+		return (0);
 
 	case MOD_QUIESCE:
 		/*
@@ -1326,12 +1502,11 @@ brfs_modevent(module_t mod __unused, int type, void *data __unused)
 	case MOD_UNLOAD:
 		/*
 		 * Stop the tap first: restore every patched vop vector so
-		 * no new interposer call can start, then give in-flight
-		 * calls a grace period before freeing the state they
+		 * no new interposer call can start, then epoch-wait for
+		 * in-flight calls to drain before freeing the state they
 		 * touch.  In-flight tap calls are bounded (the only sleep
-		 * is a GETATTR on a caller-locked vnode); the pause covers
-		 * UFS/ZFS.  A hard guarantee needs an epoch-style drain —
-		 * Phase 2 hardening, noted in the P0.2 GO record.
+		 * is a GETATTR on a caller-locked vnode); the preemptible
+		 * epoch covers UFS/ZFS with a hard guarantee.
 		 */
 		rm_wlock(&brfs_roots_rm);
 		for (i = 0; i < brfs_roots_count; i++) {
@@ -1350,7 +1525,14 @@ brfs_modevent(module_t mod __unused, int type, void *data __unused)
 			    brfs_vecs[i].bp_orig;
 		brfs_vecs_count = 0;
 		rm_wunlock(&brfs_roots_rm);
-		pause("brfsunld", hz);
+
+		/*
+		 * Hard drain: with all vectors restored no new tap call
+		 * can start; wait out every call already inside its epoch
+		 * section.  Must precede the walk drain below — an
+		 * in-flight tap can still enqueue a deferred walk.
+		 */
+		epoch_wait_preempt(brfs_epoch);
 
 		/* Tap is quiescent: drain deferred subtree walks. */
 		for (i = 0; i < nitems(brfs_walkjobs); i++)
@@ -1387,6 +1569,7 @@ brfs_modevent(module_t mod __unused, int type, void *data __unused)
 		mtx_unlock(&brfs_ring_mtx);
 		mtx_destroy(&brfs_ring_mtx);
 		rm_destroy(&brfs_roots_rm);
+		epoch_free(brfs_epoch);
 		return (0);
 
 	default:

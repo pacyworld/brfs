@@ -1,8 +1,11 @@
 # BrFS (BSD Replicated File System) — DFSR-style Replicated Folder Engine for FreeBSD
 
-Status: IMPLEMENTATION (v0.7, 2026-08-24) — Phase 0 + Phase 1 complete
+Status: IMPLEMENTATION (v0.8, 2026-08-25) — Phase 0 + Phase 1 complete
 (POC end-to-end: T1-T8 + T10 green on the 3-VM rig, commit fb4b1b5);
-Phase 2 underway: LMDB content-set swap landed (gaps #7/#9/#12 closed)
+Phase 2 underway: LMDB content-set swap landed (gaps #7/#9/#12 closed),
+daemon hardening landed (async install completion + brfsctl socket),
+kernel hardening part 1 landed (epoch unload drain, move-out unflag,
+hourly ADDROOT re-push)
 Name: FINAL — **BrFS** ("Brrr... it's cold"). Daemon: `brfsd`, kmod: `brfs.ko`, utility: `brfsctl`.
 Owner: Daniel
 Target: FreeBSD 15.0+ (VFS event notification points / inotify landed 15.0-RELEASE)
@@ -207,6 +210,35 @@ pairs. All ops idempotent. See docs/protocol.md.
     the quarantined file back into the tree WITHOUT an echo marker — the
     tap announces it as fresh local content (operator override semantics).
     Covered by the ctl smoke block in tests/vm/repl-tests.sh.
+  **Kernel hardening (part 1) DONE 2026-08-25**:
+  - Epoch-style unload drain: every tap invocation runs inside a
+    preemptible epoch section (epoch_enter_preempt; the tap may sleep —
+    GETATTR, v_addpollinfo); MOD_UNLOAD restores all patched vectors and
+    then epoch_wait_preempt() gives a HARD drain guarantee, replacing the
+    pause(hz) grace.
+  - Move-out unflag: vnodes renamed OUT of watched trees are stripped at
+    MOVE_FROM (files: VIRF_INOTIFY_PARENT immediately, guarded by
+    no-genuine-watches on the source parent; dirs: VIRF_INOTIFY + PARENT
+    immediately + deferred unflag subtree walk that also strips child
+    PARENT flags when the parent was stripped by us).  MOVE_TO re-flags
+    only when the DESTINATION parent is flagged (the INOTIFY_MOVE gate
+    passes via the source parent too — an unconditional re-flag would
+    undo the strip).  Rig-found and fixed en route (dtrace + kmod
+    log_events on brfs-a): (a) the unflag walk's own readdirs fire
+    IN_ACCESS back into the tap (vop_readdir_post), whose upgrade-on-
+    sight re-flagged just-stripped dirs via their lingering PARENT flag —
+    upgrade-on-sight is now MUTATION-ONLY and the dir's PARENT is
+    stripped alongside INOTIFY; (b) cache_enter at the rename destination
+    runs BEFORE the post-hook, so the MOVE_FROM strip removed the fresh
+    flag for in-tree renames — the MOVE_TO half now re-establishes PARENT
+    unconditionally when the destination parent is flagged.
+  - Watch-removal flag-strip decision: DECIDED — daemon-side periodic
+    idempotent ADDROOT re-push (hourly, daemon.zig timerPass).  A
+    kernel-side flag refcount is infeasible: struct inotify_softc is
+    opaque and watch removal cannot be interposed.
+  - Verified: 60 host unit tests + kmod compile check; extended
+    tap-smoke.sh (new move-out/move-back-in battery) PASS on all 3 VMs;
+    repl-tests.sh T1–T8+T10 + ctl smoke PASS on the rig after redeploy.
   PLUS (promoted 2026-08-24, user): **TLS/mTLS between nodes** — rationale:
   (a) users will run BrFS across the public internet regardless of the
   LAN-only intent; (b) compliance regimes require encryption of all data in
@@ -420,8 +452,9 @@ Known limitations (documented, POC-accepted):
   (vfs_inotify.c:377 unsets unconditionally when the last watch goes) —
   coverage for that dir's direct children goes silent until the next
   ADDROOT re-register. inotify is oracle-only for BrFS; the daemon's
-  scan layer is the durability floor. Phase 2 decision: periodic
-  idempotent root re-push or a kernel-side flag refcount.
+  scan layer is the durability floor. RESOLVED 2026-08-25: brfsd
+  re-pushes ADDROOT hourly (idempotent re-walk/re-flag); a kernel-side
+  refcount is infeasible (inotify_softc opaque, no watch-removal hook).
 - Namespace scoping: ADDROOT flags the vnodes resolved in the caller's
   namespace. Writes via a different alias (e.g. host path into a jailed
   nullfs tree) are not covered by the alias registration. Deployment
@@ -433,8 +466,10 @@ Known limitations (documented, POC-accepted):
   MOVE_* ops.
 - Ring emits no IN_CLOSE_WRITE/IN_ACCESS/IN_OPEN (read-side noise);
   daemon coalescing is the quiescence signal for POC tests.
-- The unload grace for in-flight tap calls is pause(hz); a hard
-  epoch-style drain is Phase 2 hardening.
+- ~~The unload grace for in-flight tap calls is pause(hz); a hard
+  epoch-style drain is Phase 2 hardening.~~ RESOLVED 2026-08-25: the tap
+  runs inside a preemptible epoch section; MOD_UNLOAD does
+  epoch_wait_preempt() after vector restore — a hard drain guarantee.
 - Guest pkg/DNS through the rig NAT is broken (resolver failures) —
   build oracle/test tools on the host or in-guest from source.
 

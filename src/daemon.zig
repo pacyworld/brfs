@@ -57,6 +57,7 @@ const O_NONBLOCK: c_int = 0x0004;
 const checkpoint_interval_ms: i64 = 5_000;
 const rescan_cooldown_ms: i64 = 1_000;
 const gc_interval_ms: i64 = 3_600_000; // tombstone GC cadence (gap #7)
+const repush_interval_ms: i64 = 3_600_000; // watch-root re-push cadence (flag-strip mitigation)
 const max_violations: u32 = 8;
 
 /// udata sentinel marking ctl-socket client conns on the kqueue (peers
@@ -275,6 +276,7 @@ pub const Daemon = struct {
     last_rescan_ms: i64 = 0,
     last_checkpoint_ms: i64 = 0,
     last_gc_ms: i64 = 0,
+    last_repush_ms: i64 = 0,
     comp: CompletionWorker,
     comp_thread: ?std.Thread = null,
     running: bool = true,
@@ -1583,6 +1585,20 @@ pub const Daemon = struct {
             const collected = self.cs.gcTombstones(@intCast(@divFloor(now, 1000))) catch 0;
             if (collected > 0)
                 log(.info, "tombstone GC: {d} collected", .{collected});
+        }
+
+        // Watch-root re-push (watch-removal flag-strip mitigation).
+        // Removing the last genuine inotify watch on a directory strips
+        // VIRF_INOTIFY under it (vfs_inotify.c) even when the flag was
+        // ours, leaving a silent coverage gap; a kernel-side refcount is
+        // infeasible (struct inotify_softc is opaque, watch removal
+        // cannot be interposed).  ADDROOT is idempotent: re-resolve,
+        // re-flag, re-patch.  Also re-flags the root after it was
+        // renamed out of the tree and back.
+        if (now - self.last_repush_ms >= repush_interval_ms) {
+            self.last_repush_ms = now;
+            events.addRoot(self.dev_fd, self.cfg.replicated_path, 0) catch |err|
+                log(.warn, "watch-root re-push failed: {s}", .{@errorName(err)});
         }
     }
 
