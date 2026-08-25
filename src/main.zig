@@ -97,5 +97,6 @@ test {
     std.testing.refAllDecls(@import("installer.zig"));
     std.testing.refAllDecls(@import("resync.zig"));
     std.testing.refAllDecls(@import("server.zig"));
+    std.testing.refAllDecls(@import("ctl.zig"));
     std.testing.refAllDecls(@import("daemon.zig"));
 }

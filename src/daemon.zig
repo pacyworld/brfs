@@ -1,10 +1,18 @@
-//! daemon.zig — the brfsd core: one kqueue event loop + one drainer thread.
+//! daemon.zig — the brfsd core: one kqueue event loop + one drainer thread
+//! + one completion worker.
 //!
 //! Thread model (locked decision 7): the drainer thread owns the ring pop
 //! side (blocking read on /dev/brfs, batch push through a mutex-guarded
-//! queue, pipe-trick wakeup).  Everything else — journal, content set,
-//! peer protocol, installer, resync — runs on the single core thread, so
-//! no locking exists anywhere on the replication logic.
+//! queue, pipe-trick wakeup).  The completion worker owns the blocking
+//! half of installs (fsync/rename — a 200MB fsync stalled the core loop
+//! for tens of seconds on the rig and snowballed mesh-wide).  Everything
+//! else — journal, content set, peer protocol, installer fetch side,
+//! resync — runs on the single core thread, so no locking exists anywhere
+//! on the replication logic.  The completion worker is strictly FIFO and
+//! the ONLY writer of install results; ordering rules: an in-flight or
+//! completing fetch is the effective stored version for incoming announces
+//! (onAnnounce guard), and a result that lands under a newer stored record
+//! is reverted on disk (onInstalled).
 //!
 //! Event sources: drainer pipe (kernel events), listener (inbound peers),
 //! peer conns (EV_CLEAR reads, armed writes), EVFILT_SIGNAL shutdown, and
@@ -25,6 +33,7 @@ const peer_mod = @import("peer.zig");
 const server = @import("server.zig");
 const installer = @import("installer.zig");
 const resync = @import("resync.zig");
+const ctl = @import("ctl.zig");
 
 const ContentSet = contentset.ContentSet;
 const Journal = journal.Journal;
@@ -49,6 +58,10 @@ const checkpoint_interval_ms: i64 = 5_000;
 const rescan_cooldown_ms: i64 = 1_000;
 const gc_interval_ms: i64 = 3_600_000; // tombstone GC cadence (gap #7)
 const max_violations: u32 = 8;
+
+/// udata sentinel marking ctl-socket client conns on the kqueue (peers
+/// carry *Peer; ctl conns carry this tag's address).
+var ctl_conn_tag: u8 = 0;
 
 pub const Level = enum { info, warn, err };
 
@@ -128,9 +141,111 @@ const Incoming = struct {
     mtime_nsec: u32,
     deadline_ms: i64,
     retries: u8 = 0,
+    /// The fetch detached into the completion worker (blocking fsync +
+    /// rename off the core loop).  Completing entries are exempt from the
+    /// stall-timeout sweep — the worker owns them.
+    completing: bool = false,
 };
 
 const fetch_timeout_ms: i64 = 30_000;
+
+/// Completion worker: owns the blocking half of installs (fsync, divergent-
+/// destination hash/quarantine, rename, meta) so the core loop never waits
+/// on a ZFS TXG.  Exactly ONE worker, FIFO: results land in submission
+/// order — the same-path version-ordering argument depends on it.
+/// Core->worker: mutex-guarded job queue + kick pipe (kqueue on the worker,
+/// close(kick_wr) = drain-and-exit per house rules).  Worker->core:
+/// mutex-guarded result queue + the shared wake pipe.
+const CompletionWorker = struct {
+    alloc: Allocator,
+    inst: *installer.Installer,
+    kick_rd: posix.fd_t,
+    kick_wr: posix.fd_t,
+    wake_wr: posix.fd_t,
+    mutex: std.Thread.Mutex = .{},
+    jobs: std.ArrayList(installer.CompleteJob) = .empty,
+    res_mutex: std.Thread.Mutex = .{},
+    results: std.ArrayList(installer.CompleteResult) = .empty,
+
+    fn submit(self: *CompletionWorker, job: installer.CompleteJob) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.jobs.append(self.alloc, job) catch {
+            // OOM: drop the job (the file stays staged; the next announce/
+            // rescan re-drives the fetch).  Free what we own.
+            posix.close(job.fd);
+            self.alloc.free(job.path);
+            if (job.ack_peer) |ap| self.alloc.free(ap);
+            return;
+        };
+        _ = posix.write(self.kick_wr, "x") catch {};
+    }
+
+    fn popJob(self: *CompletionWorker) ?installer.CompleteJob {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.jobs.items.len == 0) return null;
+        return self.jobs.orderedRemove(0);
+    }
+
+    fn pushResult(self: *CompletionWorker, res: installer.CompleteResult) void {
+        self.res_mutex.lock();
+        defer self.res_mutex.unlock();
+        self.results.append(self.alloc, res) catch {
+            self.alloc.free(res.job.path);
+            if (res.job.ack_peer) |ap| self.alloc.free(ap);
+            return;
+        };
+        _ = posix.write(self.wake_wr, "x") catch {};
+    }
+
+    fn takeResults(self: *CompletionWorker, out: *std.ArrayList(installer.CompleteResult)) void {
+        self.res_mutex.lock();
+        defer self.res_mutex.unlock();
+        out.appendSlice(self.alloc, self.results.items) catch return;
+        self.results.clearRetainingCapacity();
+    }
+};
+
+/// Thread entry for the completion worker (spawned by Daemon.run).
+pub fn completionEntry(comp: *CompletionWorker) void {
+    completionMain(comp);
+}
+
+fn completionMain(comp: *CompletionWorker) void {
+    const kq = kqueue();
+    if (kq < 0) {
+        log(.err, "completion worker: kqueue failed — installs will stall", .{});
+        return;
+    }
+    var reg = [1]KEvent{makeKevent(@intCast(comp.kick_rd), c_event.EVFILT_READ, c_event.EV_ADD, null)};
+    var nchanges: c_int = 1; // registration + wait in ONE kevent (house rule)
+    var evlist: [4]KEvent = undefined;
+    var alive = true;
+    while (alive) {
+        const nev = kevent(kq, if (nchanges > 0) &reg else null, nchanges, &evlist, evlist.len, null);
+        nchanges = 0;
+        if (nev < 0) continue;
+        for (evlist[0..@intCast(nev)]) |*ev| {
+            // close(kick_wr) sets a PERSISTENT EV_EOF: drain what remains
+            // and exit (no new jobs can arrive — the core is shutting down).
+            if (ev.flags & c_event.EV_EOF != 0) alive = false;
+        }
+        var trash: [64]u8 = undefined;
+        while (true) {
+            const n = posix.read(comp.kick_rd, &trash) catch break;
+            if (n == 0) break;
+        }
+        while (comp.popJob()) |job| {
+            var j = job;
+            var res = installer.CompleteResult{ .job = j };
+            if (comp.inst.finishComplete(&j)) |_| {} else |e| {
+                res.err = e;
+            }
+            comp.pushResult(res);
+        }
+    }
+}
 
 pub const Daemon = struct {
     alloc: Allocator,
@@ -142,6 +257,7 @@ pub const Daemon = struct {
     dev_fd: posix.fd_t,
     kq: c_int = -1,
     listen_fd: posix.fd_t = -1,
+    ctl_fd: posix.fd_t = -1,
     wake_rd: posix.fd_t = -1,
     evq: EventQueue,
     peers: std.ArrayList(*Peer) = .empty,
@@ -159,12 +275,23 @@ pub const Daemon = struct {
     last_rescan_ms: i64 = 0,
     last_checkpoint_ms: i64 = 0,
     last_gc_ms: i64 = 0,
+    comp: CompletionWorker,
+    comp_thread: ?std.Thread = null,
     running: bool = true,
 
     pub fn init(alloc: Allocator, cfg: *const config.Config, psk: []const u8, dev_fd: posix.fd_t, wake_rd: posix.fd_t, wake_wr: posix.fd_t) !Daemon {
         var cs = try ContentSet.open(alloc, cfg.state_dir, cfg.node_id);
         errdefer cs.close();
         const inst = try installer.Installer.init(alloc, cfg.replicated_path, cfg.state_dir);
+
+        // Completion-worker kick pipe (both ends non-blocking; the worker
+        // drops wakeups on a full pipe — one is already pending).
+        const kpfds = try posix.pipe();
+        var fl = fcntl(kpfds[0], F_GETFL, @as(c_int, 0));
+        _ = fcntl(kpfds[0], F_SETFL, fl | O_NONBLOCK);
+        fl = fcntl(kpfds[1], F_GETFL, @as(c_int, 0));
+        _ = fcntl(kpfds[1], F_SETFL, fl | O_NONBLOCK);
+
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -176,6 +303,9 @@ pub const Daemon = struct {
             .evq = .{ .alloc = alloc, .wake_wr = wake_wr },
             .wake_rd = wake_rd,
             .incoming = std.StringHashMap(Incoming).init(alloc),
+            // inst back-pointer is wired in run() (the Daemon is moved by
+            // value out of init — &self.inst here would dangle).
+            .comp = .{ .alloc = alloc, .inst = undefined, .kick_rd = kpfds[0], .kick_wr = kpfds[1], .wake_wr = wake_wr },
         };
     }
 
@@ -230,6 +360,11 @@ pub const Daemon = struct {
     pub fn run(self: *Daemon) !void {
         const alloc = self.alloc;
 
+        // The Daemon's address is stable here (init moved it into the
+        // caller's frame): wire the worker's installer pointer and spawn.
+        self.comp.inst = &self.inst;
+        self.comp_thread = try std.Thread.spawn(.{}, completionEntry, .{&self.comp});
+
         self.kq = kqueue();
         if (self.kq < 0) return error.KqueueFailed;
 
@@ -272,6 +407,15 @@ pub const Daemon = struct {
             try self.peers.append(alloc, p);
         }
 
+        // Operator control socket (non-fatal: brfsctl degrades to stats).
+        if (ctl.listen(ctl.sock_path)) |fd| {
+            self.ctl_fd = fd;
+            self.stageChange(@intCast(fd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, null);
+            log(.info, "control socket: {s}", .{ctl.sock_path});
+        } else |err| {
+            log(.warn, "control socket {s} unavailable: {s}", .{ ctl.sock_path, @errorName(err) });
+        }
+
         // Startup reconciliation (gap #8): a non-primary with an empty set
         // pulls before announcing; everyone else scans now.
         self.resynced = self.cfg.primary or self.cs.map.count() > 0;
@@ -308,7 +452,14 @@ pub const Daemon = struct {
                     self.onWakePipe();
                 } else if (ev.filter == c_event.EVFILT_READ and ev.udata == null and @as(posix.fd_t, @intCast(ev.ident)) == self.listen_fd) {
                     self.onAccept();
+                } else if (ev.filter == c_event.EVFILT_READ and ev.udata == null and @as(posix.fd_t, @intCast(ev.ident)) == self.ctl_fd) {
+                    self.onCtlAccept();
                 } else if (ev.udata) |ud| {
+                    if (ud == @as(*anyopaque, @ptrCast(&ctl_conn_tag))) {
+                        if (ev.filter == c_event.EVFILT_READ)
+                            self.onCtlReadable(@intCast(ev.ident));
+                        continue;
+                    }
                     const p: *Peer = @ptrCast(@alignCast(ud));
                     if (ev.filter == c_event.EVFILT_READ) self.onPeerReadable(p);
                     if (ev.filter == c_event.EVFILT_WRITE) self.onPeerWritable(p);
@@ -319,11 +470,26 @@ pub const Daemon = struct {
             self.reapDead();
         }
 
-        // Clean shutdown: persist state, release the kernel watch root.
-        log(.info, "shutting down: checkpoint + snapshot", .{});
+        // Clean shutdown: stop the completion worker first — its pending
+        // results write the content set, so they must land BEFORE the
+        // final checkpoint.  close(kick_wr) = persistent EV_EOF: the worker
+        // drains remaining jobs and exits.
+        log(.info, "shutting down: completion worker drain, checkpoint", .{});
+        posix.close(self.comp.kick_wr);
+        self.comp.kick_wr = -1;
+        if (self.comp_thread) |th| {
+            th.join();
+            self.comp_thread = null;
+        }
+        self.drainCompletions();
         self.cs.checkpoint(self.jr.high_seq) catch {};
         self.cs.snapshot() catch {};
         events.delRoot(self.dev_fd, self.cfg.replicated_path) catch {};
+        if (self.ctl_fd >= 0) {
+            posix.close(self.ctl_fd);
+            std.fs.cwd().deleteFile(ctl.sock_path) catch {};
+            self.ctl_fd = -1;
+        }
     }
 
     fn nextTimeout(self: *Daemon, now: i64) i64 {
@@ -351,6 +517,11 @@ pub const Daemon = struct {
             const n = posix.read(self.wake_rd, &trash) catch break;
             if (n == 0) break;
         }
+        // Completions BEFORE kernel events: the install result updates the
+        // content set so the install's own ATTRIB shadow event (which the
+        // echo marker may already have consumed once) still finds the
+        // record in place and gets absorbed instead of re-announced.
+        self.drainCompletions();
         self.batch.clearRetainingCapacity();
         self.evq.take(&self.batch);
         const now = peer_mod.nowMs();
@@ -417,7 +588,15 @@ pub const Daemon = struct {
         // events, but ONLY if the file still matches what we installed.
         if (self.jr.peekEcho(rel)) |echo| {
             const swallowed = switch (echo.kind) {
-                .install => self.verifyInstallEcho(rel, echo),
+                .install => blk: {
+                    // Identity-marked echo (async completion): the event's
+                    // subject must BE the staged file — O(1), never re-hashes
+                    // a big install on the core loop.
+                    if (echo.fileid != 0)
+                        break :blk bev.fileid == echo.fileid and
+                            (echo.gen == 0 or bev.gen == 0 or bev.gen == echo.gen);
+                    break :blk self.verifyInstallEcho(rel, echo);
+                },
                 .move_from => blk: {
                     const abs = self.inst.absPath(rel) catch break :blk false;
                     defer self.alloc.free(abs);
@@ -426,7 +605,10 @@ pub const Daemon = struct {
                 },
             };
             if (swallowed) {
-                self.jr.clearEcho(rel);
+                // Identity-marked install echoes persist until onInstalled
+                // clears them: one install emits TWO events (MOVE_TO +
+                // ATTRIB) and both must swallow.
+                if (echo.fileid == 0) self.jr.clearEcho(rel);
                 if (bev.seq > self.jr.high_seq) self.jr.high_seq = bev.seq;
                 return;
             }
@@ -767,6 +949,16 @@ pub const Daemon = struct {
                 }
             }
         }
+        // An in-flight or completing fetch is the effective stored version:
+        // an announce that would LOSE to it must not restart the fetch —
+        // async completion reopened the same-path ordering the synchronous
+        // complete() gave for free (V1 installing while V2 is announced).
+        if (self.incoming.get(m.path)) |inc| {
+            switch (contentset.relate(m.ver, inc.ver)) {
+                .same, .older, .conflict_stored_wins => return,
+                else => {},
+            }
+        }
         const stored = self.cs.lookup(m.path);
         if (stored) |rec| {
             switch (contentset.relate(m.ver, rec.ver)) {
@@ -939,10 +1131,7 @@ pub const Daemon = struct {
             self.inst.abortFetch(m.path);
             return;
         };
-        // Echo marker BEFORE the rename: the resulting kernel event must
-        // find it (rule 6).
-        self.jr.noteEcho(m.path, .install, meta.sha256, meta.size) catch {};
-        const installed = self.inst.complete(m.path) catch |err| {
+        var job = self.inst.beginComplete(m.path) catch |err| {
             log(.warn, "install {s} failed: {s}", .{ m.path, @errorName(err) });
             if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
             // protocol.md: a hash mismatch REQUEUES (bounded — the file
@@ -954,11 +1143,93 @@ pub const Daemon = struct {
             }
             return;
         };
-        if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
+        // Identity echo marker BEFORE the worker's rename: the resulting
+        // kernel events (MOVE_TO + ATTRIB) must find it (rule 6), and the
+        // fileid/gen swallow never re-hashes a big install on this loop.
+        self.jr.noteEchoFile(m.path, job.sha256, job.size, job.fileid, job.gen) catch {};
+        // Resolve the install's own nameless self events from the first
+        // moment they can arrive (they may beat the completion result).
+        self.cs.learnId(self.tree_fsid, job.fileid, job.gen, m.path) catch {};
+        if (p.node_id) |nid| job.ack_peer = self.alloc.dupe(u8, nid) catch null;
+        if (self.incoming.getPtr(m.path)) |e| e.completing = true;
+        self.comp.submit(job);
+        log(.info, "install queued {s} v=({x},{d}) size={d}", .{ m.path, m.ver.origin, m.ver.seq, meta.size });
+    }
 
-        self.upsertFromWire(m.path, m.ver, false, meta.mode, meta.size, meta.mtime_sec, meta.mtime_nsec, installed);
-        self.pushTo(p, .{ .fetch_ack = .{ .ver = m.ver, .path = m.path, .sha256 = installed } });
-        log(.info, "installed {s} v=({x},{d}) size={d}", .{ m.path, m.ver.origin, m.ver.seq, meta.size });
+    /// Completion worker -> core: an install finished (or failed).
+    fn onInstalled(self: *Daemon, res: *installer.CompleteResult) void {
+        const path = res.job.path;
+        defer self.alloc.free(path);
+        defer if (res.job.ack_peer) |ap| self.alloc.free(ap);
+
+        if (res.err) |err| {
+            log(.warn, "install {s} failed: {s}", .{ path, @errorName(err) });
+            self.cs.dropId(self.tree_fsid, res.job.fileid);
+            self.jr.clearEcho(path);
+            self.dropIncoming(path, res.job.ver);
+            return;
+        }
+
+        // A newer tombstone/record may have landed while the worker was
+        // fsyncing: the set is the authority — undo the on-disk install.
+        if (self.cs.lookup(path)) |rec| {
+            switch (contentset.relate(res.job.ver, rec.ver)) {
+                .same => {
+                    // Idempotent duplicate; already recorded.
+                    self.jr.clearEcho(path);
+                    self.dropIncoming(path, res.job.ver);
+                    return;
+                },
+                .older, .conflict_stored_wins => {
+                    log(.info, "install {s} v=({x},{d}) superseded mid-flight; reverting", .{
+                        path, res.job.ver.origin, res.job.ver.seq,
+                    });
+                    // NO clearEcho here: the move_from marker must live
+                    // until our revert-delete's kernel event arrives.
+                    self.jr.noteEcho(path, .move_from, res.job.sha256, res.job.size) catch {};
+                    self.inst.tombstone(path, false) catch {};
+                    self.cs.dropId(self.tree_fsid, res.job.fileid);
+                    self.dropIncoming(path, res.job.ver);
+                    return;
+                },
+                .newer, .conflict_incoming_wins => {},
+            }
+        }
+
+        self.upsertFromWire(path, res.job.ver, false, res.job.mode, res.job.size, res.job.mtime_sec, res.job.mtime_nsec, res.job.sha256);
+        // ACK the serving node if still connected (advisory; a missing ACK
+        // is a no-op on the sender).
+        if (res.job.ack_peer) |nid| {
+            for (self.peers.items) |q| {
+                if (q.state == .ready and q.node_id != null and
+                    std.mem.eql(u8, q.node_id.?, nid))
+                {
+                    self.pushTo(q, .{ .fetch_ack = .{ .ver = res.job.ver, .path = path, .sha256 = res.job.sha256 } });
+                    break;
+                }
+            }
+        }
+        // The install's echo window closes here (both kernel events of the
+        // install had their chance to swallow on the identity marker).
+        self.jr.clearEcho(path);
+        self.dropIncoming(path, res.job.ver);
+        log(.info, "installed {s} v=({x},{d}) size={d}", .{ path, res.job.ver.origin, res.job.ver.seq, res.job.size });
+    }
+
+    /// Drop the incoming entry IF it still belongs to this version (a newer
+    /// fetch may have replaced it while the worker installed the old one).
+    fn dropIncoming(self: *Daemon, path: []const u8, ver: Version) void {
+        if (self.incoming.getPtr(path)) |e| {
+            if (!e.ver.eql(ver)) return;
+        }
+        if (self.incoming.fetchRemove(path)) |kv| self.alloc.free(kv.key);
+    }
+
+    fn drainCompletions(self: *Daemon) void {
+        var results: std.ArrayList(installer.CompleteResult) = .empty;
+        defer results.deinit(self.alloc);
+        self.comp.takeResults(&results);
+        for (results.items) |*res| self.onInstalled(res);
     }
 
     fn onFetchAck(self: *Daemon, p: *Peer, m: protocol.FetchAck) void {
@@ -1168,6 +1439,17 @@ pub const Daemon = struct {
                 self.upsertFromWire(m.path, m.ver, m.is_dir, m.mode, m.size, m.mtime_sec, m.mtime_nsec, m.sha256);
             },
             .fetch => {
+                // An in-flight or completing fetch already covers this
+                // entry (the same record streams from every ready peer on
+                // a multi-peer RESYNC — without this, C's pull from A and B
+                // double-fetched and the two completion jobs shared one
+                // staging path: the second rename found it gone).
+                if (self.incoming.get(m.path)) |inc| {
+                    switch (contentset.relate(m.ver, inc.ver)) {
+                        .same, .older, .conflict_stored_wins => return,
+                        else => {},
+                    }
+                }
                 if (m.is_dir) {
                     const abs = self.inst.absPath(m.path) catch return;
                     defer self.alloc.free(abs);
@@ -1265,6 +1547,9 @@ pub const Daemon = struct {
         defer expired_f.deinit(self.alloc);
         var iit = self.incoming.iterator();
         while (iit.next()) |e| {
+            // The completion worker owns completing entries: a 200MB fsync
+            // legitimately exceeds the stall window.
+            if (e.value_ptr.completing) continue;
             if (e.value_ptr.deadline_ms <= now)
                 expired_f.append(self.alloc, e.key_ptr.*) catch break;
         }
@@ -1309,6 +1594,207 @@ pub const Daemon = struct {
             if (std.mem.endsWith(u8, ent.name, ".part"))
                 dir.deleteFile(ent.name) catch {};
         }
+    }
+
+    // ---- control socket (/var/run/brfsd.sock, brfsctl backend) ----
+
+    fn onCtlAccept(self: *Daemon) void {
+        // Edge-triggered (EV_CLEAR): drain the accept queue.
+        while (true) {
+            const cfd = ctl.accept(self.ctl_fd) catch return; // WouldBlock = drained
+            self.stageChange(@intCast(cfd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, @ptrCast(&ctl_conn_tag));
+        }
+    }
+
+    fn onCtlReadable(self: *Daemon, cfd: posix.fd_t) void {
+        defer posix.close(cfd); // close removes the knote
+        var buf: [ctl.max_request]u8 = undefined;
+        const n = posix.read(cfd, &buf) catch return;
+        if (n == 0) return;
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.alloc);
+        self.handleCtl(buf[0..n], &out);
+        if (out.items.len > ctl.max_response) {
+            out.shrinkRetainingCapacity(ctl.max_response);
+            out.appendSlice(self.alloc, "\n... (truncated)\n") catch {};
+        }
+        var off: usize = 0;
+        while (off < out.items.len) {
+            const w = posix.write(cfd, out.items[off..]) catch return;
+            if (w == 0) return;
+            off += w;
+        }
+    }
+
+    fn ctlPrint(self: *Daemon, out: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) void {
+        const s = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
+        defer self.alloc.free(s);
+        out.appendSlice(self.alloc, s) catch {};
+    }
+
+    fn handleCtl(self: *Daemon, req: []const u8, out: *std.ArrayList(u8)) void {
+        switch (ctl.parseCommand(req)) {
+            .status => self.ctlStatus(out),
+            .peers => self.ctlPeers(out),
+            .backlog => self.ctlBacklog(out),
+            .journal => self.ctlJournal(out),
+            .resync => self.ctlResync(out),
+            .conflicts_list => self.ctlConflictsList(out),
+            .conflicts_restore => |name| self.ctlConflictsRestore(out, name),
+            .conflicts_prune => |filter| self.ctlConflictsPrune(out, filter),
+            .unknown => out.appendSlice(self.alloc, "ERR unknown command (status|peers|backlog|journal|resync|conflicts list|restore <name>|prune [substr])\n") catch {},
+        }
+    }
+
+    fn ctlStatus(self: *Daemon, out: *std.ArrayList(u8)) void {
+        var live: u64 = 0;
+        var tombs: u64 = 0;
+        var it = self.cs.map.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.state == .live) live += 1 else tombs += 1;
+        }
+        var completing: u64 = 0;
+        var iit = self.incoming.iterator();
+        while (iit.next()) |e| {
+            if (e.value_ptr.completing) completing += 1;
+        }
+        self.ctlPrint(out, "node_id: {s}\n", .{self.cfg.node_id});
+        self.ctlPrint(out, "primary: {}\n", .{self.cfg.primary});
+        self.ctlPrint(out, "resynced: {}\n", .{self.resynced});
+        self.ctlPrint(out, "tree: {s}\n", .{self.cfg.replicated_path});
+        self.ctlPrint(out, "state_dir: {s}\n", .{self.cfg.state_dir});
+        self.ctlPrint(out, "records: {d} live, {d} tombstones\n", .{ live, tombs });
+        self.ctlPrint(out, "local_next_seq: {d}\n", .{self.cs.local_next_seq});
+        self.ctlPrint(out, "ring_seq: {d}\n", .{self.cs.ring_seq});
+        self.ctlPrint(out, "state_at_open: {s}\n", .{if (self.cs.needs_scan) "empty/corrupt (rebuilt via scan floor)" else "loaded"});
+        self.ctlPrint(out, "incoming: {d} fetches ({d} completing)\n", .{ self.incoming.count(), completing });
+    }
+
+    fn ctlPeers(self: *Daemon, out: *std.ArrayList(u8)) void {
+        for (self.peers.items) |p| {
+            var abuf: [64]u8 = undefined;
+            const addr_s = if (p.addr) |a| std.fmt.bufPrint(&abuf, "{f}", .{a}) catch "?" else "-";
+            self.ctlPrint(out, "{s}\t{s}\t{s}\t{s}\twbuf={d}\n", .{
+                p.node_id orelse "?",
+                @tagName(p.state),
+                if (p.outbound) "outbound" else "inbound",
+                addr_s,
+                p.wbuf.items.len,
+            });
+        }
+    }
+
+    fn ctlBacklog(self: *Daemon, out: *std.ArrayList(u8)) void {
+        self.comp.mutex.lock();
+        const comp_jobs = self.comp.jobs.items.len;
+        self.comp.mutex.unlock();
+        self.ctlPrint(out, "journal pending: {d}\n", .{self.jr.pendingCount()});
+        self.ctlPrint(out, "incoming fetches: {d}\n", .{self.incoming.count()});
+        self.ctlPrint(out, "completion queue: {d}\n", .{comp_jobs});
+    }
+
+    fn ctlJournal(self: *Daemon, out: *std.ArrayList(u8)) void {
+        self.ctlPrint(out, "pending: {d}\n", .{self.jr.pendingCount()});
+        self.ctlPrint(out, "moves in flight: {d}\n", .{self.jr.moves.count()});
+        self.ctlPrint(out, "echo markers: {d}\n", .{self.jr.echoes.count()});
+        self.ctlPrint(out, "high_seq: {d}\n", .{self.jr.high_seq});
+    }
+
+    fn ctlResync(self: *Daemon, out: *std.ArrayList(u8)) void {
+        var n: u64 = 0;
+        for (self.peers.items) |p| {
+            if (p.state == .ready) {
+                self.sendResyncReq(p);
+                n += 1;
+            }
+        }
+        self.need_rescan = true; // local floor too
+        self.ctlPrint(out, "resync requested: {d} peers, local rescan scheduled\n", .{n});
+    }
+
+    fn ctlConflictsList(self: *Daemon, out: *std.ArrayList(u8)) void {
+        var dir = std.fs.cwd().openDir(self.inst.conflicts, .{ .iterate = true }) catch {
+            out.appendSlice(self.alloc, "ERR cannot open conflicts dir\n") catch {};
+            return;
+        };
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |ent| {
+            const st = dir.statFile(ent.name) catch null;
+            self.ctlPrint(out, "{s}\t{s}\t{d}\n", .{
+                ent.name,
+                @tagName(ent.kind),
+                if (st) |s| s.size else 0,
+            });
+        }
+    }
+
+    fn ctlConflictsRestore(self: *Daemon, out: *std.ArrayList(u8), name: []const u8) void {
+        // Quarantined names are "{path}.{ms-stamp}": restore strips the
+        // stamp.  No echo marker: the rename INTO the tree is announced as
+        // fresh local content (the operator's intent).
+        if (!contentset.validRelPath(name)) {
+            out.appendSlice(self.alloc, "ERR bad conflicts name\n") catch {};
+            return;
+        }
+        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse {
+            out.appendSlice(self.alloc, "ERR name has no timestamp suffix\n") catch {};
+            return;
+        };
+        const suffix = name[dot + 1 ..];
+        if (suffix.len == 0) {
+            out.appendSlice(self.alloc, "ERR name has no timestamp suffix\n") catch {};
+            return;
+        }
+        for (suffix) |ch| {
+            if (!std.ascii.isDigit(ch)) {
+                out.appendSlice(self.alloc, "ERR name has no timestamp suffix\n") catch {};
+                return;
+            }
+        }
+        const target = name[0..dot];
+        if (!contentset.validRelPath(target)) {
+            out.appendSlice(self.alloc, "ERR bad restore target\n") catch {};
+            return;
+        }
+        const src = std.fs.path.join(self.alloc, &.{ self.inst.conflicts, name }) catch return;
+        defer self.alloc.free(src);
+        const dst = std.fs.path.join(self.alloc, &.{ self.inst.root, target }) catch return;
+        defer self.alloc.free(dst);
+        if (std.fs.path.dirname(dst)) |dir| {
+            const abs = std.fs.path.join(self.alloc, &.{ self.inst.root, dir }) catch return;
+            defer self.alloc.free(abs);
+            std.fs.cwd().makePath(abs) catch {};
+        }
+        const src_z = std.posix.toPosixPath(src) catch return;
+        const dst_z = std.posix.toPosixPath(dst) catch return;
+        posix.rename(&src_z, &dst_z) catch |err| {
+            self.ctlPrint(out, "ERR restore failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.ctlPrint(out, "restored {s} -> {s}\n", .{ name, target });
+    }
+
+    fn ctlConflictsPrune(self: *Daemon, out: *std.ArrayList(u8), filter: ?[]const u8) void {
+        var dir = std.fs.cwd().openDir(self.inst.conflicts, .{ .iterate = true }) catch {
+            out.appendSlice(self.alloc, "ERR cannot open conflicts dir\n") catch {};
+            return;
+        };
+        defer dir.close();
+        var pruned: u64 = 0;
+        var it = dir.iterate();
+        while (it.next() catch null) |ent| {
+            if (filter) |f| {
+                if (std.mem.indexOf(u8, ent.name, f) == null) continue;
+            }
+            if (ent.kind == .directory)
+                dir.deleteTree(ent.name) catch continue
+            else
+                dir.deleteFile(ent.name) catch continue;
+            pruned += 1;
+        }
+        self.ctlPrint(out, "pruned {d}\n", .{pruned});
     }
 };
 

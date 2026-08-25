@@ -55,12 +55,20 @@ pub const Rename = struct {
 
 /// What the installer expects its own activity to look like.
 /// install: next content event for the path must match (sha256, size) to
-/// be swallowed.  move_from: the path must be ABSENT (our own rename's
-/// FROM half) to be swallowed.  Mismatch on either = genuine local change.
+/// be swallowed — or, when fileid != 0 (async completion worker), the
+/// event's subject (fileid, gen) must BE the staged file: an O(1) compare
+/// that never re-hashes a big file on the core loop.  fileid-marked
+/// install echoes are NOT consumed by swallowing: an install emits two
+/// events (MOVE_TO + ATTRIB) and both must swallow — the daemon's
+/// completion callback clears the marker.  move_from: the path must be
+/// ABSENT (our own rename's FROM half) to be swallowed.  Mismatch on
+/// either = genuine local change.
 pub const Echo = struct {
     kind: EchoKind,
     sha256: [32]u8,
     size: u64,
+    fileid: u64 = 0,
+    gen: u64 = 0,
 
     pub const EchoKind = enum { install, move_from };
 };
@@ -308,6 +316,17 @@ pub const Journal = struct {
         gop.value_ptr.* = .{ .kind = kind, .sha256 = sha256, .size = size };
     }
 
+    /// Install echo carrying the staged file's identity: the swallow is an
+    /// O(1) (fileid, gen) compare against the kernel event's subject, and
+    /// the marker persists (both the MOVE_TO and the ATTRIB of one install
+    /// must swallow) until the daemon's completion callback clears it.
+    pub fn noteEchoFile(self: *Journal, path: []const u8, sha256: [32]u8, size: u64, fileid: u64, gen: u64) !void {
+        const gop = try self.echoes.getOrPut(path);
+        if (!gop.found_existing)
+            gop.key_ptr.* = try self.alloc.dupe(u8, path);
+        gop.value_ptr.* = .{ .kind = .install, .sha256 = sha256, .size = size, .fileid = fileid, .gen = gen };
+    }
+
     /// Inspect (without consuming) a pending echo marker.
     pub fn peekEcho(self: *Journal, path: []const u8) ?Echo {
         return self.echoes.get(path);
@@ -488,6 +507,22 @@ test "echo marker lifecycle" {
     try t.expect(j.peekEcho("f.txt") != null);
     j.clearEcho("f.txt");
     try t.expect(j.peekEcho("f.txt") == null);
+}
+
+test "identity echo marker carries the staged fileid/gen" {
+    var j = Journal.init(t.allocator, 100);
+    defer j.deinit();
+    const sha = [_]u8{7} ** 32;
+    try j.noteEchoFile("big.bin", sha, 200 << 20, 4242, 77);
+    const e = j.peekEcho("big.bin").?;
+    try t.expectEqual(Echo.EchoKind.install, e.kind);
+    try t.expectEqual(@as(u64, 4242), e.fileid);
+    try t.expectEqual(@as(u64, 77), e.gen);
+    // Plain noteEcho stays identity-less (sha/size fallback path).
+    try j.noteEcho("old.txt", .install, sha, 1);
+    try t.expectEqual(@as(u64, 0), j.peekEcho("old.txt").?.fileid);
+    j.clearEcho("big.bin");
+    try t.expect(j.peekEcho("big.bin") == null);
 }
 
 test "high_seq tracks the maximum seen" {

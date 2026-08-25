@@ -4,11 +4,12 @@
 //! torn files); LWW loser quarantined to state_dir/conflicts/, never
 //! silently dropped.
 //!
-//! Flow for an incoming ANNOUNCE: beginFetch -> writeChunk* -> complete
-//! (hash verify -> quarantine divergent existing dest -> note echo marker
-//! -> rename into place -> mode+mtime -> FETCH_ACK by the caller).
-//! Delete side: tombstone() removes the path (dirs recursively — the
-//! sender's per-file tombstones may not all have arrived).
+//! Flow for an incoming ANNOUNCE: beginFetch -> writeChunk* -> the split
+//! complete: beginComplete (core thread: incremental-hash verify, detach)
+//! -> completion worker (finishComplete: fsync -> quarantine divergent
+//! existing dest -> rename into place -> mode+mtime) -> daemon onInstalled
+//! (upsert + FETCH_ACK).  Delete side: tombstone() removes the path (dirs
+//! recursively — the sender's per-file tombstones may not all have arrived).
 //!
 //! staging/ and conflicts/ live under state_dir, which init() verifies is
 //! on the SAME filesystem as the replicated root (rename must not EXDEV).
@@ -59,6 +60,33 @@ pub fn fsidOf(path: []const u8) !u64 {
 }
 
 pub const chunk_size: usize = 1024 * 1024;
+
+/// The two halves of an install, split so the blocking fsync/rename can
+/// run on the daemon's completion worker instead of the core loop (a 200MB
+/// fsync blocked the loop for tens of seconds on the rig, stalling the
+/// whole mesh — Phase 2 fix).
+pub const CompleteJob = struct {
+    path: []u8, // owned (travels to the result for freeing)
+    ver: contentset.Version,
+    fd: posix.fd_t, // owned; finishComplete fsyncs + closes it
+    size: u64,
+    sha256: [32]u8, // verified actual content hash
+    mode: u16,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    /// Staged file identity: the install echo swallows by fileid/gen
+    /// compare (O(1)) instead of re-hashing the installed file on the
+    /// core loop.
+    fileid: u64,
+    gen: u64,
+    /// Serving node's id for the FETCH_ACK (advisory; owned).
+    ack_peer: ?[]u8 = null,
+};
+
+pub const CompleteResult = struct {
+    job: CompleteJob,
+    err: ?anyerror = null,
+};
 
 const Fetch = struct {
     fd: posix.fd_t,
@@ -220,27 +248,76 @@ pub const Installer = struct {
     }
 
     /// Hash-verify the staged file and atomically rename it into the tree.
-    /// A divergent existing destination is quarantined first (it is either
-    /// an LWW loser or pre-seed local content — never silently overwritten).
+    /// Synchronous convenience (= beginComplete + finishComplete on the
+    /// caller's thread); the daemon uses the split form.
     /// Returns the installed sha256 for the caller's FETCH_ACK + echo note.
     pub fn complete(self: *Installer, path: []const u8) ![32]u8 {
+        var job = try self.beginComplete(path);
+        defer self.alloc.free(job.path);
+        try self.finishComplete(&job);
+        return job.sha256;
+    }
+
+    /// Core-thread half of an install: verify the staged content (the hash
+    /// was computed incrementally at writeChunk — this is just the final)
+    /// and detach the fetch into a job for the completion worker.
+    /// HashMismatch keeps the synchronous requeue semantics (staging
+    /// dropped, fetch forgotten).
+    pub fn beginComplete(self: *Installer, path: []const u8) !CompleteJob {
         const kv = self.fetches.fetchRemove(path) orelse return error.NoFetch;
         const f = kv.value;
-        defer self.freeFetch(kv.key, f);
-
-        try posix.fsync(f.fd);
-        posix.close(f.fd);
-        f.fd = -1;
-
-        var scratch: [4096]u8 = undefined;
-        const spath = try self.stagingPath(&scratch, f.path, f.ver);
-        errdefer std.fs.cwd().deleteFile(spath) catch {};
 
         var actual: [32]u8 = undefined;
         f.hasher.final(&actual);
-        if (!std.mem.eql(u8, &actual, &f.sha256)) return error.HashMismatch;
+        const bad = !std.mem.eql(u8, &actual, &f.sha256);
 
-        const dest = try std.fs.path.join(self.alloc, &.{ self.root, path });
+        var st: posix.Stat = undefined;
+        const stat_ok = std.c.fstat(f.fd, &st) == 0;
+
+        if (bad or !stat_ok) {
+            var scratch: [4096]u8 = undefined;
+            if (self.stagingPath(&scratch, f.path, f.ver)) |sp| {
+                std.fs.cwd().deleteFile(sp) catch {};
+            } else |_| {}
+            self.freeFetch(kv.key, f);
+            return if (bad) error.HashMismatch else error.StatFailed;
+        }
+
+        const job = CompleteJob{
+            // kv.key IS f.path (same allocation): ownership moves to the job.
+            .path = @constCast(kv.key),
+            .ver = f.ver,
+            .fd = f.fd,
+            .size = f.size,
+            .sha256 = actual,
+            .mode = f.mode,
+            .mtime_sec = f.mtime_sec,
+            .mtime_nsec = f.mtime_nsec,
+            .fileid = @intCast(st.ino),
+            .gen = @intCast(st.gen),
+        };
+        f.fd = -1; // ownership moved
+        self.alloc.destroy(f);
+        return job;
+    }
+
+    /// Worker-thread half of an install: fsync + quarantine-divergent +
+    /// rename + meta.  Blocks freely.  Reads only root/staging/conflicts
+    /// (immutable post-init) plus its own stack — thread-safe by
+    /// construction.  Consumes job.fd.  On failure the staging file is
+    /// removed.
+    pub fn finishComplete(self: *Installer, job: *const CompleteJob) !void {
+        var scratch: [4096]u8 = undefined;
+        const spath = try self.stagingPath(&scratch, job.path, job.ver);
+        errdefer std.fs.cwd().deleteFile(spath) catch {};
+
+        posix.fsync(job.fd) catch |e| {
+            posix.close(job.fd);
+            return e;
+        };
+        posix.close(job.fd);
+
+        const dest = try std.fs.path.join(self.alloc, &.{ self.root, job.path });
         defer self.alloc.free(dest);
 
         // Quarantine a divergent destination; identical content just gets
@@ -248,11 +325,11 @@ pub const Installer = struct {
         if (statPath(dest)) |st| {
             if (isDir(st)) return error.DestIsDir;
             const existing = hashFile(dest) catch null;
-            if (existing == null or !std.mem.eql(u8, &existing.?, &actual))
-                try self.quarantine(path);
+            if (existing == null or !std.mem.eql(u8, &existing.?, &job.sha256))
+                try self.quarantine(job.path);
         } else |_| {}
 
-        if (std.fs.path.dirname(path)) |dir| {
+        if (std.fs.path.dirname(job.path)) |dir| {
             const abs = try std.fs.path.join(self.alloc, &.{ self.root, dir });
             defer self.alloc.free(abs);
             try std.fs.cwd().makePath(abs);
@@ -260,9 +337,8 @@ pub const Installer = struct {
 
         // Mode + mtime policy: replicate mode bits and mtime (not uid/gid).
         try posix.rename(spath, dest);
-        applyMeta(dest, f.mode, f.mtime_sec, f.mtime_nsec);
+        applyMeta(dest, job.mode, job.mtime_sec, job.mtime_nsec);
         fsyncParentDir(dest);
-        return actual;
     }
 
     /// Move root/path into conflicts/ (timestamped).  No-op if absent.
@@ -445,6 +521,44 @@ test "fetch, chunk, install lands content atomically" {
     const st = try statPath(installed);
     try t.expectEqual(@as(u32, 0o644), @as(u32, @intCast(st.mode)) & 0o7777);
     try t.expectEqual(@as(i64, 1_700_000_000), @as(i64, @intCast(st.mtim.sec)));
+}
+
+test "split complete: core-side verify + worker-side install" {
+    const alloc = t.allocator;
+    var rig = try TestRig.make(alloc);
+    defer rig.destroy(alloc);
+
+    const data = "split install content";
+    const ann = announceOf(data, 3);
+    try rig.inst.beginFetch("split.txt", ann);
+    try rig.inst.writeChunk("split.txt", ann.ver, 0, data);
+
+    var job = try rig.inst.beginComplete("split.txt");
+    defer alloc.free(job.path);
+    try t.expect(!rig.inst.fetchInProgress("split.txt")); // detached
+    try t.expect(job.fileid != 0); // staged identity for the echo swallow
+    try t.expectEqual(ann.sha256, job.sha256); // verified at handoff
+    try rig.inst.finishComplete(&job);
+
+    const got = try readTreeFile(alloc, &rig, "split.txt");
+    defer alloc.free(got);
+    try t.expectEqualStrings(data, got);
+}
+
+test "split complete: hash mismatch stays synchronous and drops staging" {
+    const alloc = t.allocator;
+    var rig = try TestRig.make(alloc);
+    defer rig.destroy(alloc);
+    var ann = announceOf("correct", 1);
+    try rig.inst.beginFetch("f", ann);
+    try rig.inst.writeChunk("f", ann.ver, 0, "corrupt");
+    ann.sha256[0] ^= 0xff;
+    rig.inst.fetches.get("f").?.sha256 = ann.sha256;
+    try t.expectError(error.HashMismatch, rig.inst.beginComplete("f"));
+    try t.expect(!rig.inst.fetchInProgress("f"));
+    var buf: [4096]u8 = undefined;
+    const sp = try rig.inst.stagingPath(&buf, "f", ann.ver);
+    try t.expectError(error.FileNotFound, statPath(sp));
 }
 
 test "out-of-order chunk is a hard error" {

@@ -158,6 +158,19 @@ else
 	fail "T7 echo: announce counts a=$na b=$nb c=$nc"
 fi
 
+# --------------------------------------------- ctl socket smoke (Phase 2)
+note "ctl socket: brfsctl status/peers/backlog/journal/resync/conflicts"
+ctl_ok=1
+R $A "doas /tmp/brfsctl status" | grep -q "node_id: a" || { ctl_ok=0; fail "ctl status"; }
+ready_n=$(R $A "doas /tmp/brfsctl peers" | grep -c "	ready	")
+[ "$ready_n" = "2" ] || { ctl_ok=0; fail "ctl peers ready=$ready_n"; }
+R $A "doas /tmp/brfsctl backlog" | grep -q "journal pending:" || { ctl_ok=0; fail "ctl backlog"; }
+R $A "doas /tmp/brfsctl journal" | grep -q "high_seq:" || { ctl_ok=0; fail "ctl journal"; }
+R $A "doas /tmp/brfsctl conflicts list" >/dev/null || { ctl_ok=0; fail "ctl conflicts list"; }
+R $A "doas /tmp/brfsctl resync" | grep -q "resync requested: 2 peers" || { ctl_ok=0; fail "ctl resync"; }
+[ $ctl_ok -eq 1 ] && ok "ctl socket smoke"
+sleep 3   # let the requested resync settle before T8
+
 # ------------------------------------------------------------------ T8
 note "T8 kill -9 mid-FETCH"
 R $A "dd if=/dev/urandom of=$TREE/big.bin bs=1m count=200 2>/dev/null"
@@ -166,7 +179,10 @@ sleep 1   # announce out, fetch in flight
 CTL $B kill9
 sleep 1
 CTL $B start
-wait_file $B big.bin "$want" 180 && wait_file $C big.bin "$want" 180 \
+# 300s: on a loaded host (nightly zfs-send|xz backup hogs freebsd-dev1)
+# the 1MiB-chunk pull degrades to ~1MB/s — progress, not a stall, so the
+# daemon correctly never aborts; the budget must outlast a slow rig.
+wait_file $B big.bin "$want" 300 && wait_file $C big.bin "$want" 300 \
 	&& ok "T8" || fail "T8 kill -9"
 
 # ----------------------------------------------------------------- T10

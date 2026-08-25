@@ -1,12 +1,13 @@
 //! brfsctl — BrFS operator utility.
 //!
-//! Implemented now: `stats` — reads the security.brfs.* sysctl counters
-//! (works without a running brfsd; the kernel module is the source).
-//! Phase 1 adds the brfsd control socket (/var/run/brfsd.sock) commands:
-//! status, peers, backlog, resync, conflicts.
+//! `stats` reads the security.brfs.* sysctl counters (works without a
+//! running brfsd; the kernel module is the source).  Everything else talks
+//! to brfsd's control socket (/var/run/brfsd.sock — 0600, so run via doas):
+//! status, peers, backlog, journal, resync, conflicts list|restore|prune.
 
 const std = @import("std");
 const posix = std.posix;
+const ctl = @import("brfs_ctl");
 
 extern "c" fn sysctlbyname(
     name: [*:0]const u8,
@@ -54,6 +55,30 @@ fn cmdStats() u8 {
     return 0;
 }
 
+/// One-shot remote command: connect, send one line, print until EOF.
+/// Blocking I/O is right for a CLI (the no-blocking rules govern daemons).
+fn cmdRemote(req: []const u8) u8 {
+    var addr = std.net.Address.initUnix(ctl.sock_path) catch return 1;
+    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return 1;
+    defer posix.close(fd);
+    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
+        out("brfsctl: cannot connect to {s} (brfsd not running? permission?)\n", .{ctl.sock_path});
+        return 1;
+    };
+    var off: usize = 0;
+    while (off < req.len) {
+        off += posix.write(fd, req[off..]) catch return 1;
+    }
+    posix.shutdown(fd, .send) catch {};
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = posix.read(fd, &buf) catch return 1;
+        if (n == 0) break;
+        _ = posix.write(1, buf[0..n]) catch return 1;
+    }
+    return 0;
+}
+
 pub fn main() !u8 {
     var args = std.process.args();
     _ = args.skip();
@@ -65,9 +90,38 @@ pub fn main() !u8 {
     if (std.mem.eql(u8, cmd, "stats"))
         return cmdStats();
 
-    if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or
-        std.mem.eql(u8, cmd, "-h"))
-    {
+    const eq = std.mem.eql;
+    if (eq(u8, cmd, "status") or eq(u8, cmd, "peers") or eq(u8, cmd, "backlog") or
+        eq(u8, cmd, "journal") or eq(u8, cmd, "resync"))
+        return cmdRemote(cmd);
+
+    if (eq(u8, cmd, "conflicts")) {
+        const sub = args.next() orelse "list";
+        if (eq(u8, sub, "list"))
+            return cmdRemote("conflicts list");
+        if (eq(u8, sub, "restore")) {
+            const name = args.next() orelse {
+                out("brfsctl: conflicts restore needs a name (see conflicts list)\n", .{});
+                return 2;
+            };
+            var buf: [ctl.max_request]u8 = undefined;
+            const req = std.fmt.bufPrint(&buf, "conflicts restore {s}", .{name}) catch return 2;
+            return cmdRemote(req);
+        }
+        if (eq(u8, sub, "prune")) {
+            if (args.next()) |filter| {
+                var buf: [ctl.max_request]u8 = undefined;
+                const req = std.fmt.bufPrint(&buf, "conflicts prune {s}", .{filter}) catch return 2;
+                return cmdRemote(req);
+            }
+            return cmdRemote("conflicts prune");
+        }
+        out("brfsctl: unknown conflicts subcommand '{s}'\n", .{sub});
+        usage();
+        return 2;
+    }
+
+    if (eq(u8, cmd, "help") or eq(u8, cmd, "--help") or eq(u8, cmd, "-h")) {
         usage();
         return 0;
     }
@@ -81,8 +135,18 @@ fn usage() void {
     const text =
         "usage: brfsctl <command>\n" ++
         "\n" ++
-        "Commands:\n" ++
-        "  stats    Show security.brfs.* kernel counters\n" ++
-        "  help     Show this help\n";
+        "Commands (kernel, no daemon needed):\n" ++
+        "  stats                       Show security.brfs.* kernel counters\n" ++
+        "\n" ++
+        "Commands (control socket, brfsd must run; root):\n" ++
+        "  status                      Node state, content-set counts, ring seq\n" ++
+        "  peers                       Mesh peers: id, state, direction, wbuf\n" ++
+        "  backlog                     Journal/fetch/completion queue depths\n" ++
+        "  journal                     Journal stats (moves, echoes, high_seq)\n" ++
+        "  resync                      RESYNC_REQ to all peers + local rescan\n" ++
+        "  conflicts list              List quarantined (conflict-loser) files\n" ++
+        "  conflicts restore <name>    Move a quarantined file back into the tree\n" ++
+        "  conflicts prune [substr]    Delete quarantined entries (all or matching)\n" ++
+        "  help                        Show this help\n";
     _ = posix.write(1, text) catch {};
 }

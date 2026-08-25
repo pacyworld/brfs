@@ -38,12 +38,20 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(brfsd);
 
+    const ctl_proto_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const brfsctl_mod = b.createModule(.{
         .root_source_file = b.path("ctl/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    brfsctl_mod.addImport("brfs_ctl", ctl_proto_mod);
 
     const brfsctl = b.addExecutable(.{
         .name = "brfsctl",

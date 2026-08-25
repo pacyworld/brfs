@@ -149,10 +149,9 @@ pairs. All ops idempotent. See docs/protocol.md.
   vault pool (RUNNING: brfs-a/b/c, vmctl-brfs); P0.4 repo scaffolding.
 - Phase 1: POC end-to-end ON brfs.ko from day one. T1–T8 green on 3 VMs with
   mid-test daemon restarts. **DONE 2026-08-24 (fb4b1b5)**: T1–T8 + T10 PASS
-  (tests/vm/repl-tests.sh), tap-smoke green on all 3 VMs after. Known POC
-  limitation logged for Phase 2: big-file install blocks the core loop
-  (fsync) — conns stall but converge; incremental hashing landed, the rest
-  is a worker-thread or chunked-fsync question.
+  (tests/vm/repl-tests.sh), tap-smoke green on all 3 VMs after.
+  ~~Known POC limitation: big-file install blocks the core loop (fsync)~~ —
+  RESOLVED in Phase 2 (completion worker, see below).
 - Phase 2: kernel hardening — fidelity vs dtrace oracle, ring sizing/drop
   behavior, overhead measurement, T9 matrix, unload veto while fd held.
   **LMDB content-set swap DONE 2026-08-24** (closes design-review gaps
@@ -185,6 +184,29 @@ pairs. All ops idempotent. See docs/protocol.md.
   - LMDB ≠ the Phase 3 durable journal: the content set is current-state
     KV (RESYNC diff source); the journal (tail-from-seq replay) still
     arrives in Phase 3 and coexists.
+  **Daemon hardening DONE 2026-08-24** (second Phase 2 daemon commit):
+  - Installer fsync/rename OFF the core loop: complete() split into
+    beginComplete (core: incremental-hash final, fstat, detach) +
+    finishComplete (single FIFO completion worker: fsync, divergent-dest
+    hash+quarantine, rename, meta).  The 200MB-install core-loop stall
+    (~30-70s, mesh-snowballing) is gone; the rig log shows the core loop
+    processing the install's own kernel events 19ms after handoff.
+    Ordering rules that keep async completion correct: an in-flight or
+    completing fetch is the effective stored version for both ANNOUNCE and
+    RESYNC_ENTRY (the resync path was the hole — a restart pull from TWO
+    peers double-fetched, and the duplicate jobs shared one staging path:
+    second rename -> FileNotFound); a completion result landing under a
+    newer stored record is reverted on disk; one install's MOVE_TO+ATTRIB
+    events are swallowed by an O(1) fileid/gen identity marker (persisting
+    until the completion callback — NO re-hash of the installed file on the
+    core loop).
+  - brfsctl control socket /var/run/brfsd.sock (0600, unix, text protocol:
+    one-line request, response until EOF): status, peers, backlog, journal,
+    resync, conflicts list|restore <name>|prune [substr].  Handled on the
+    core kqueue (no threads); responses capped at 16KB.  Restore renames
+    the quarantined file back into the tree WITHOUT an echo marker — the
+    tap announces it as fresh local content (operator override semantics).
+    Covered by the ctl smoke block in tests/vm/repl-tests.sh.
   PLUS (promoted 2026-08-24, user): **TLS/mTLS between nodes** — rationale:
   (a) users will run BrFS across the public internet regardless of the
   LAN-only intent; (b) compliance regimes require encryption of all data in
