@@ -18,6 +18,11 @@ cd "$(dirname "$0")/.."
 echo "==> zig build test"
 zig build test
 
+# zig build test does NOT fully analyze the exe targets (a daemon.zig
+# callsite error slipped through 2026-08-26): build the binaries too.
+echo "==> zig build (brfsd + brfsctl)"
+zig build
+
 echo "==> kmod build"
 make -C kmod >/dev/null
 test -f kmod/brfs.ko

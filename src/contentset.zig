@@ -124,6 +124,10 @@ const dbi_records_name = "records";
 const dbi_meta_name = "meta";
 const meta_local_next_seq = "local_next_seq";
 const meta_ring_seq = "ring_seq";
+/// Seq reservation window: how far flush()/reserveSeqs() keep the
+/// persisted ceiling ahead of the next issuable seq.  Bursts larger than
+/// this between commits take the forced-reserve path in nextVersion().
+const seq_reserve_window: u64 = 65536;
 
 /// Record value layout: fixed 104 bytes, big-endian.  The path is the LMDB
 /// key and is not repeated in the value.
@@ -179,6 +183,15 @@ pub const ContentSet = struct {
     wtxn: ?*c.MDB_txn = null,
     local_origin: u64,
     local_next_seq: u64 = 1,
+    /// Reserved high-water for local version seqs, persisted in the meta
+    /// DBI.  INVARIANT: every issued (local_origin, seq) satisfies
+    /// seq < local_seq_ceiling AS PERSISTED, so a crash between flushes
+    /// can never restart the counter behind an already-announced version
+    /// (rig-proven 2026-08-25: kill -9 after a 4000-announce burst
+    /// restarted at seq 1; the version reuse poisoned LWW mesh-wide —
+    /// peers dropped the re-announces as duplicates of unrelated
+    /// records, and phantom re-origins won the compare).
+    local_seq_ceiling: u64 = 1,
     ring_seq: u64 = 0,
     needs_scan: bool = false,
 
@@ -225,6 +238,10 @@ pub const ContentSet = struct {
         // the startup scan builds it.
         if (self.map.count() == 0 and self.local_next_seq == 1 and self.ring_seq == 0)
             self.needs_scan = true;
+
+        // Reserve the first seq window before returning: from here on the
+        // persisted ceiling is always strictly ahead of any issued seq.
+        self.reserveSeqs() catch return error.EnvOpen;
 
         return self;
     }
@@ -315,7 +332,14 @@ pub const ContentSet = struct {
         try mdbCheck(c.mdb_txn_begin(self.env, null, c.MDB_RDONLY, &txn));
         defer c.mdb_txn_abort(txn);
 
-        if (self.getMeta(txn, meta_local_next_seq)) |v| self.local_next_seq = v;
+        // The persisted value is the reserved CEILING (never itself
+        // issued): resume allocation there, skipping the window's unused
+        // tail — gaps in the seq stream are harmless (the version vector
+        // is a per-origin max and resync is record-driven).
+        if (self.getMeta(txn, meta_local_next_seq)) |v| {
+            self.local_seq_ceiling = v;
+            self.local_next_seq = v;
+        }
         if (self.getMeta(txn, meta_ring_seq)) |v| self.ring_seq = v;
 
         var cur: ?*c.MDB_cursor = null;
@@ -406,11 +430,33 @@ pub const ContentSet = struct {
         try self.learnId(fsid, fileid, 0, "");
     }
 
+    /// Persist a reserved ceiling seq_reserve_window ahead of the next
+    /// issuable seq.  Called at open (first window) and by nextVersion
+    /// when a burst exhausts the window mid-flight; flush() tops it up
+    /// opportunistically on every commit.
+    fn reserveSeqs(self: *ContentSet) !void {
+        try self.ensureTxn();
+        self.local_seq_ceiling = self.local_next_seq + seq_reserve_window;
+        try self.flush();
+    }
+
     /// Allocate the next local version.  The counter persists via the meta
-    /// DBI at every commit; a state loss that resets it is healed by the
-    /// scan fallback re-announcing (fresh higher-seq stream restarts at the
-    /// recomputed max + 1).
+    /// DBI at every commit — as a RESERVED CEILING, so a crash mid-burst
+    /// resumes strictly ahead of every announced seq (never reuse).
     pub fn nextVersion(self: *ContentSet) Version {
+        if (self.local_next_seq >= self.local_seq_ceiling) {
+            // Window exhausted mid-burst (more than seq_reserve_window
+            // versions issued since the last commit): commit the pending
+            // batch and reserve the next window BEFORE issuing past the
+            // persisted ceiling.
+            self.reserveSeqs() catch {
+                // Commit failed (flush marks needs_scan on failure): keep
+                // the daemon live with an in-memory-only bump; the scan
+                // floor rebuilds state and the next successful commit
+                // re-establishes the invariant.
+                self.local_seq_ceiling = self.local_next_seq + seq_reserve_window;
+            };
+        }
         const v = Version{ .origin = self.local_origin, .seq = self.local_next_seq };
         self.local_next_seq += 1;
         return v;
@@ -475,11 +521,15 @@ pub const ContentSet = struct {
         try self.flush();
     }
 
-    /// Commit the pending write txn (records + ring-seq + local seq in ONE
-    /// atomic fsync'd commit — gap #12).
+    /// Commit the pending write txn (records + ring-seq + local seq
+    /// ceiling in ONE atomic fsync'd commit — gap #12).
     pub fn flush(self: *ContentSet) !void {
         if (self.wtxn == null) return;
-        self.putMeta(meta_local_next_seq, self.local_next_seq) catch |e| {
+        // Top up the reserved ceiling so the window stays a full
+        // seq_reserve_window ahead at every commit boundary.
+        if (self.local_next_seq + seq_reserve_window > self.local_seq_ceiling)
+            self.local_seq_ceiling = self.local_next_seq + seq_reserve_window;
+        self.putMeta(meta_local_next_seq, self.local_seq_ceiling) catch |e| {
             self.abortTxn();
             return e;
         };
@@ -781,7 +831,9 @@ test "persistence roundtrip incl. flush and seq recovery" {
         defer cs.close();
         try std.testing.expect(!cs.needs_scan);
         try std.testing.expectEqual(@as(u64, 4242), cs.ring_seq);
-        try std.testing.expectEqual(@as(u64, 4), cs.local_next_seq);
+        // Ceiling semantics: reopen resumes ahead of every issued seq
+        // (the persisted value is a reserved ceiling, not the last next).
+        try std.testing.expect(cs.local_next_seq >= 4);
         const rec = cs.lookup("a.txt").?;
         try std.testing.expectEqual(@as(u64, 4096), rec.size);
         try std.testing.expectEqual(@as(u16, 0o644), rec.mode);
@@ -800,7 +852,7 @@ test "persistence roundtrip incl. flush and seq recovery" {
         var cs = try ContentSet.open(alloc, dir, "test-node");
         defer cs.close();
         try std.testing.expectEqual(@as(u64, 8192), cs.lookup("a.txt").?.size);
-        try std.testing.expectEqual(@as(u64, 5), cs.local_next_seq);
+        try std.testing.expect(cs.local_next_seq >= 5);
     }
 }
 
@@ -824,8 +876,9 @@ test "kill -9 discards only the uncommitted batch (gap #12)" {
         try std.testing.expect(!cs.needs_scan); // a crash is normal wear
         try std.testing.expect(cs.lookup("committed.txt") != null);
         try std.testing.expect(cs.lookup("uncommitted.txt") == null);
-        // Meta committed with the first batch; the record scan covers it.
-        try std.testing.expectEqual(@as(u64, 2), cs.local_next_seq);
+        // The reserved ceiling committed with the first batch keeps the
+        // counter ahead of the committed record's seq after the crash.
+        try std.testing.expect(cs.local_next_seq >= 2);
 
         // The env is fully writable after crash recovery.
         try cs.upsert("after.txt", sampleRecord(3));
@@ -836,6 +889,31 @@ test "kill -9 discards only the uncommitted batch (gap #12)" {
         defer cs.close();
         try std.testing.expect(cs.lookup("committed.txt") != null);
         try std.testing.expect(cs.lookup("after.txt") != null);
+    }
+}
+
+test "kill -9 mid-burst never reuses an announced version seq" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var issued: [3]u64 = undefined;
+    {
+        var cs = try ContentSet.open(alloc, dir, "test-node");
+        // Announces go out immediately; nothing commits before the crash.
+        for (0..3) |i| issued[i] = cs.nextVersion().seq;
+        cs.abortAndClose(); // kill -9: pending batch (incl. nothing) lost
+    }
+    {
+        var cs = try ContentSet.open(alloc, dir, "test-node");
+        defer cs.close();
+        // The reserved ceiling persisted at open: the reloaded counter is
+        // strictly ahead of every seq the dead incarnation announced.
+        for (issued) |s| try std.testing.expect(cs.local_next_seq > s);
+        const v = cs.nextVersion();
+        for (issued) |s| try std.testing.expect(v.seq != s);
     }
 }
 
@@ -890,7 +968,7 @@ test "tombstone GC respects the retention TTL (gap #7)" {
         try std.testing.expect(cs.lookup("gone.txt") == null); // GC is durable
         try std.testing.expect(cs.lookup("keep.txt") != null);
         // The local seq floor survived the GC of the record that carried it.
-        try std.testing.expectEqual(@as(u64, 51), cs.local_next_seq);
+        try std.testing.expect(cs.local_next_seq >= 51);
     }
 }
 

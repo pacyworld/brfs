@@ -81,6 +81,10 @@ pub const CompleteJob = struct {
     gen: u64,
     /// Serving node's id for the FETCH_ACK (advisory; owned).
     ack_peer: ?[]u8 = null,
+    /// Conflict name the divergent destination was quarantined to
+    /// (owned; set by finishComplete).  The daemon needs it to restore
+    /// the winner's content when a superseded install is reverted.
+    quarantined: ?[]u8 = null,
 };
 
 pub const CompleteResult = struct {
@@ -254,8 +258,21 @@ pub const Installer = struct {
     pub fn complete(self: *Installer, path: []const u8) ![32]u8 {
         var job = try self.beginComplete(path);
         defer self.alloc.free(job.path);
+        defer if (job.quarantined) |q| self.alloc.free(q);
         try self.finishComplete(&job);
         return job.sha256;
+    }
+
+    /// Discard a staged install that lost the version race before the
+    /// worker landed it: close the fd and remove the staging file.  The
+    /// tree is never touched (no kernel events, no quarantine, no echo).
+    /// Does NOT consume job.path (the caller frees it).
+    pub fn discardComplete(self: *Installer, job: *const CompleteJob) void {
+        posix.close(job.fd);
+        var scratch: [4096]u8 = undefined;
+        if (self.stagingPath(&scratch, job.path, job.ver)) |sp| {
+            std.fs.cwd().deleteFile(sp) catch {};
+        } else |_| {}
     }
 
     /// Core-thread half of an install: verify the staged content (the hash
@@ -306,7 +323,7 @@ pub const Installer = struct {
     /// (immutable post-init) plus its own stack — thread-safe by
     /// construction.  Consumes job.fd.  On failure the staging file is
     /// removed.
-    pub fn finishComplete(self: *Installer, job: *const CompleteJob) !void {
+    pub fn finishComplete(self: *Installer, job: *CompleteJob) !void {
         var scratch: [4096]u8 = undefined;
         const spath = try self.stagingPath(&scratch, job.path, job.ver);
         errdefer std.fs.cwd().deleteFile(spath) catch {};
@@ -321,12 +338,13 @@ pub const Installer = struct {
         defer self.alloc.free(dest);
 
         // Quarantine a divergent destination; identical content just gets
-        // replaced (idempotent re-install).
+        // replaced (idempotent re-install).  Remember where it went: a
+        // superseded install's revert restores it.
         if (statPath(dest)) |st| {
             if (isDir(st)) return error.DestIsDir;
             const existing = hashFile(dest) catch null;
             if (existing == null or !std.mem.eql(u8, &existing.?, &job.sha256))
-                try self.quarantine(job.path);
+                job.quarantined = try self.quarantine(job.path);
         } else |_| {}
 
         if (std.fs.path.dirname(job.path)) |dir| {
@@ -341,15 +359,16 @@ pub const Installer = struct {
         fsyncParentDir(dest);
     }
 
-    /// Move root/path into conflicts/ (timestamped).  No-op if absent.
-    pub fn quarantine(self: *Installer, path: []const u8) !void {
+    /// Move root/path into conflicts/ (timestamped).  Returns the owned
+    /// conflict name; null when nothing was there to quarantine.
+    pub fn quarantine(self: *Installer, path: []const u8) !?[]u8 {
         const src = try std.fs.path.join(self.alloc, &.{ self.root, path });
         defer self.alloc.free(src);
-        _ = statPath(src) catch return; // nothing to quarantine
+        _ = statPath(src) catch return null; // nothing to quarantine
 
         const stamp = std.time.milliTimestamp();
         const name = try std.fmt.allocPrint(self.alloc, "{s}.{d}", .{ path, stamp });
-        defer self.alloc.free(name);
+        errdefer self.alloc.free(name);
         const dst = try std.fs.path.join(self.alloc, &.{ self.conflicts, name });
         defer self.alloc.free(dst);
         if (std.fs.path.dirname(dst)) |dir|
@@ -357,6 +376,7 @@ pub const Installer = struct {
 
         try posix.rename(src, dst);
         fsyncParentDir(dst);
+        return name;
     }
 
     /// Apply a tombstone: remove the path (dirs recursively — the sender's

@@ -239,6 +239,43 @@ pairs. All ops idempotent. See docs/protocol.md.
   - Verified: 60 host unit tests + kmod compile check; extended
     tap-smoke.sh (new move-out/move-back-in battery) PASS on all 3 VMs;
     repl-tests.sh T1–T8+T10 + ctl smoke PASS on the rig after redeploy.
+  **Daemon correctness fixes 2026-08-26** (found by the new
+  ring-overflow rig test + T5 stress):
+  - Version-seq preallocation (crash safety): the persisted meta
+    local_next_seq is now a RESERVED CEILING kept seq_reserve_window
+    (65536) ahead of the next issuable seq — bumped at open and topped
+    up at every commit; nextVersion() force-commits and re-reserves if a
+    burst exhausts the window.  Before, announces between flushes were
+    lost on kill -9 and the restarted daemon re-issued already-announced
+    (origin, seq) versions for DIFFERENT paths — peers dropped them as
+    duplicates and LWW diverged (rig-proven with a 6000-file storm).
+  - Rescan in-flight guard: resync.scan() takes an InFlight predicate
+    (daemon's incoming map) and never announces/tombstones paths the
+    fetch/install machinery owns.  Before, an install-storm ring
+    overflow → rescan re-origined in-flight installs as fresh LOCAL
+    versions (2058 phantom announces on the rig); three files whose
+    origin seqs lost LWW were tombstoned mesh-wide (content survived in
+    conflicts/, restored by hand).
+  - Never land a losing install: a fetch that lost the version race
+    while transferring is discarded pre-landing (staging deleted, no
+    tree mutation, no quarantine of the winner); a winning local upsert
+    aborts a losing in-flight fetch; the superseded-mid-flight revert
+    now keeps the identity echo marker through the revert's DELETE
+    (a delete-swallow closes it) and RESTORES the quarantined divergent
+    copy (the winner's content) instead of leaving a live record with
+    no file on disk.
+  - T5 now polls for convergence (60s) instead of a fixed 5s sleep — an
+    announce-race fetch restart recovered by the stall re-drive takes
+    ~17s on the rig.
+  - New rig tests: t-ringoverflow.sh (6000-create storm with the daemon
+    kill -9'd: ring drops, OVERFLOW marker, rescan convergence, no
+    phantom announces), t9-lifecycle.sh (T9 matrix: veto/clean
+    unload/M_BRFS freed/replication after reload, N rounds),
+    t-overhead.sh (syscall microbench + 13k-file find, loaded vs
+    unloaded — tap cost within noise for find/open-close, ~25% on a
+    worst-case single-file 20k-write storm, ~4us/op).
+  - run_tests.sh now also builds the exe targets: `zig build test` does
+    NOT fully analyze them (a broken daemon.zig call site passed green).
   PLUS (promoted 2026-08-24, user): **TLS/mTLS between nodes** — rationale:
   (a) users will run BrFS across the public internet regardless of the
   LAN-only intent; (b) compliance regimes require encryption of all data in

@@ -51,6 +51,20 @@ fn recordFromStat(fsid: u64, st: posix.Stat, is_dir: bool, ver: contentset.Versi
     };
 }
 
+/// In-flight fetch guard: paths owned by the fetch/install machinery
+/// (staged, installing, or completing).  Such a path can exist on disk
+/// with no committed record yet (the worker's rename lands before the
+/// completion upserts the record) — without this guard the rescan floor
+/// re-origins remote content as fresh LOCAL versions (rig-proven
+/// 2026-08-25: a 6000-file install storm overflowed a peer's ring, the
+/// rescan phantom-announced 2058 in-flight installs with the local
+/// origin, and three files whose origin seqs lost the LWW compare were
+/// tombstoned mesh-wide).
+pub const InFlight = struct {
+    ctx: *const anyopaque,
+    contains: *const fn (ctx: *const anyopaque, rel: []const u8) bool,
+};
+
 /// Walk the tree, reconcile against the content set, synthesize journal
 /// entries (debounced/coalesced with any live ring events) for deltas.
 ///
@@ -67,6 +81,7 @@ pub fn scan(
     cs: *contentset.ContentSet,
     j: *journal.Journal,
     now_ms: i64,
+    inflight: ?InFlight,
 ) !ScanStats {
     var stats = ScanStats{};
     const root_fsid = installer.fsidOf(root) catch 0;
@@ -88,6 +103,11 @@ pub fn scan(
         defer alloc.free(rel);
         try seen.put(try alloc.dupe(u8, rel), {});
         stats.seen += 1;
+
+        // In-flight fetch/install owns this path (see InFlight above).
+        if (inflight) |inf| {
+            if (inf.contains(inf.ctx, rel)) continue;
+        }
 
         const abs = try std.fs.path.join(alloc, &.{ root, rel });
         defer alloc.free(abs);
@@ -129,6 +149,10 @@ pub fn scan(
     var it = cs.map.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.state == .live and !seen.contains(e.key_ptr.*)) {
+            // A re-fetch in flight means the absence is transient.
+            if (inflight) |inf| {
+                if (inf.contains(inf.ctx, e.key_ptr.*)) continue;
+            }
             try j.add(.{ .path = e.key_ptr.*, .op = .delete, .is_dir = e.value_ptr.is_dir, .seq = cs.ring_seq }, now_ms);
             stats.announced_deleted += 1;
         }
@@ -251,7 +275,7 @@ test "first scan announces the seeded tree" {
     var j = journal.Journal.init(alloc, 10);
     defer j.deinit();
 
-    const stats = try scan(alloc, rig.root, &cs, &j, 0);
+    const stats = try scan(alloc, rig.root, &cs, &j, 0, null);
     try t.expectEqual(@as(u64, 3), stats.seen); // a.txt, sub, sub/b.txt
     try t.expectEqual(@as(u64, 3), stats.announced_new);
     try t.expectEqual(@as(usize, 3), j.pendingCount());
@@ -267,6 +291,72 @@ test "first scan announces the seeded tree" {
     for (works) |w| try t.expect(w == .upsert);
 }
 
+fn testInflightContains(ctx: *const anyopaque, rel: []const u8) bool {
+    const set: *const std.StringHashMap(void) = @ptrCast(@alignCast(ctx));
+    return set.contains(rel);
+}
+
+test "scan skips in-flight fetch paths (no phantom re-origin)" {
+    const alloc = t.allocator;
+    var rig = try Rig.make(alloc);
+    defer rig.destroy(alloc);
+    // landed.txt: committed record, on disk, no fetch -> untouched.
+    // midflight.txt: on disk (install rename landed) with NO record yet
+    // and an in-flight fetch -> must be skipped, never announced as new.
+    try rig.write(alloc, "landed.txt", "aaa");
+    try rig.write(alloc, "midflight.txt", "bbb");
+
+    var cs = try contentset.ContentSet.open(alloc, rig.state, "test");
+    defer cs.close();
+    var j = journal.Journal.init(alloc, 10);
+    defer j.deinit();
+
+    var rec = contentset.Record{
+        .ver = .{ .origin = 0xaaaa, .seq = 7 },
+        .is_dir = false,
+        .state = .live,
+    };
+    rec.size = 3;
+    const abs = try std.fs.path.join(alloc, &.{ rig.root, "landed.txt" });
+    defer alloc.free(abs);
+    const st = installer.statPath(abs) catch unreachable;
+    rec.mtime_sec = @intCast(st.mtim.sec);
+    rec.mtime_nsec = @intCast(@max(st.mtim.nsec, 0));
+    _ = installer.hashFile(abs) catch unreachable;
+    rec.sha256 = installer.hashFile(abs) catch unreachable;
+    try cs.upsert("landed.txt", rec);
+
+    var flight = std.StringHashMap(void).init(alloc);
+    defer flight.deinit();
+    try flight.put("midflight.txt", {});
+    // refetch.txt: live record, absent on disk, re-fetch in flight ->
+    // the delete pass must not tombstone it either.
+    var rec2 = contentset.Record{
+        .ver = .{ .origin = 0xaaaa, .seq = 9 },
+        .is_dir = false,
+        .state = .live,
+    };
+    rec2.size = 12;
+    try cs.upsert("refetch.txt", rec2);
+    try flight.put("refetch.txt", {});
+    const inf = InFlight{ .ctx = &flight, .contains = testInflightContains };
+
+    const stats = try scan(alloc, rig.root, &cs, &j, 0, inf);
+    try t.expectEqual(@as(u64, 2), stats.seen);
+    try t.expectEqual(@as(u64, 0), stats.announced_new); // midflight.txt NOT re-origined
+    try t.expectEqual(@as(u64, 0), stats.announced_modified);
+    try t.expectEqual(@as(u64, 0), stats.announced_deleted); // refetch.txt NOT tombstoned
+    try t.expectEqual(@as(usize, 0), j.pendingCount());
+
+    // Without the guard the same scan announces midflight.txt as new and
+    // refetch.txt as deleted.
+    var j2 = journal.Journal.init(alloc, 10);
+    defer j2.deinit();
+    const stats2 = try scan(alloc, rig.root, &cs, &j2, 0, null);
+    try t.expectEqual(@as(u64, 1), stats2.announced_new);
+    try t.expectEqual(@as(u64, 1), stats2.announced_deleted);
+}
+
 test "clean restart scan announces nothing" {
     const alloc = t.allocator;
     var rig = try Rig.make(alloc);
@@ -277,7 +367,7 @@ test "clean restart scan announces nothing" {
         var cs = try contentset.ContentSet.open(alloc, rig.state, "test");
         var j = journal.Journal.init(alloc, 10);
         defer j.deinit();
-        _ = try scan(alloc, rig.root, &cs, &j, 0);
+        _ = try scan(alloc, rig.root, &cs, &j, 0, null);
         // Simulate the journal processing pass: record the file live.
         const abs = try std.fs.path.join(alloc, &.{ rig.root, "a.txt" });
         defer alloc.free(abs);
@@ -304,7 +394,7 @@ test "clean restart scan announces nothing" {
         defer cs.close();
         var j = journal.Journal.init(alloc, 10);
         defer j.deinit();
-        const stats = try scan(alloc, rig.root, &cs, &j, 0);
+        const stats = try scan(alloc, rig.root, &cs, &j, 0, null);
         try t.expectEqual(@as(u64, 0), stats.announced_new);
         try t.expectEqual(@as(u64, 0), stats.announced_modified);
         try t.expectEqual(@as(u64, 0), stats.announced_deleted);
@@ -325,7 +415,7 @@ test "offline modify, create, and delete are caught" {
         defer cs.close();
         var j = journal.Journal.init(alloc, 10);
         defer j.deinit();
-        _ = try scan(alloc, rig.root, &cs, &j, 0);
+        _ = try scan(alloc, rig.root, &cs, &j, 0, null);
         // Simulate processing: both files recorded live with local vers.
         for ([_][]const u8{ "mod.txt", "del.txt" }, 1..) |rel, seq| {
             const abs = try std.fs.path.join(alloc, &.{ rig.root, rel });
@@ -358,7 +448,7 @@ test "offline modify, create, and delete are caught" {
     defer cs.close();
     var j = journal.Journal.init(alloc, 10);
     defer j.deinit();
-    const stats = try scan(alloc, rig.root, &cs, &j, 0);
+    const stats = try scan(alloc, rig.root, &cs, &j, 0, null);
     try t.expectEqual(@as(u64, 1), stats.announced_new);
     try t.expectEqual(@as(u64, 1), stats.announced_modified);
     try t.expectEqual(@as(u64, 1), stats.announced_deleted);
@@ -400,7 +490,7 @@ test "file resurrecting over a tombstone gets a fresh local version" {
 
     var j = journal.Journal.init(alloc, 10);
     defer j.deinit();
-    const stats = try scan(alloc, rig.root, &cs, &j, 0);
+    const stats = try scan(alloc, rig.root, &cs, &j, 0, null);
     try t.expectEqual(@as(u64, 1), stats.announced_new);
     // Still a tombstone in the set until the journal entry processes; the
     // work item is an upsert (resurrection announced with a fresh local

@@ -120,10 +120,17 @@ rb=0; rc=0; wait $pb || rb=$?; wait $pc || rc=$?
 if [ $rb -ne 0 ] || [ $rc -ne 0 ]; then
 	fail "T5 write side failed (b=$rb c=$rc) — tree not admin-writable?"
 else
-sleep 5
-sa=$(sha_on $A $TREE/race.txt); sb=$(sha_on $B $TREE/race.txt); sc=$(sha_on $C $TREE/race.txt)
+# Poll for convergence: an announce race can restart a fetch mid-flight,
+# and the stall detector's re-drive legitimately exceeds a fixed 5s sleep
+# (rig-proven: fetch-swap on a flapping conn recovered at ~17s).
+i=0
+while [ $i -lt 60 ]; do
+	sa=$(sha_on $A $TREE/race.txt); sb=$(sha_on $B $TREE/race.txt); sc=$(sha_on $C $TREE/race.txt)
+	[ -n "$sa" ] && [ "$sa" = "$sb" ] && [ "$sa" = "$sc" ] && break
+	sleep 1; i=$((i + 1))
+done
 if [ -n "$sa" ] && [ "$sa" = "$sb" ] && [ "$sa" = "$sc" ]; then
-	ok "T5 converged (all = $sa)"
+	ok "T5 converged (all = $sa, ${i}s)"
 else
 	fail "T5 divergence: a=$sa b=$sb c=$sc"
 fi

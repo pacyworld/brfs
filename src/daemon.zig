@@ -422,7 +422,7 @@ pub const Daemon = struct {
         // pulls before announcing; everyone else scans now.
         self.resynced = self.cfg.primary or self.cs.map.count() > 0;
         if (self.resynced) {
-            const stats = try resync.scan(alloc, self.cfg.replicated_path, &self.cs, &self.jr, peer_mod.nowMs());
+            const stats = try resync.scan(alloc, self.cfg.replicated_path, &self.cs, &self.jr, peer_mod.nowMs(), self.scanInflight());
             log(.info, "startup scan: seen={d} new={d} mod={d} del={d} same={d}", .{
                 stats.seen, stats.announced_new, stats.announced_modified, stats.announced_deleted, stats.unchanged,
             });
@@ -609,8 +609,10 @@ pub const Daemon = struct {
             if (swallowed) {
                 // Identity-marked install echoes persist until onInstalled
                 // clears them: one install emits TWO events (MOVE_TO +
-                // ATTRIB) and both must swallow.
-                if (echo.fileid == 0) self.jr.clearEcho(rel);
+                // ATTRIB) and both must swallow.  A delete matching the
+                // identity closes the window instead: the subject is dead
+                // (a superseded install's revert), nothing more can come.
+                if (echo.fileid == 0 or op == .delete) self.jr.clearEcho(rel);
                 if (bev.seq > self.jr.high_seq) self.jr.high_seq = bev.seq;
                 return;
             }
@@ -710,6 +712,22 @@ pub const Daemon = struct {
             .sha256 = sha,
         } });
         log(.info, "announce {s} v=({x},{d}) size={d}{s}", .{ e.path, ver.origin, ver.seq, rec.size, if (is_dir) " dir" else "" });
+
+        // The winning local change aborts a losing in-flight fetch
+        // (saves the transfer; a completing fetch is the worker's — the
+        // pre-landing discard and the superseded-revert cover it).
+        if (self.incoming.get(e.path)) |inf| {
+            const iv = inf.ver;
+            const completing = inf.completing;
+            if (!completing) switch (contentset.relate(ver, iv)) {
+                .newer, .conflict_incoming_wins => {
+                    log(.info, "aborting losing fetch {s} v=({x},{d})", .{ e.path, iv.origin, iv.seq });
+                    self.inst.abortFetch(e.path);
+                    if (self.incoming.fetchRemove(e.path)) |kv| self.alloc.free(kv.key);
+                },
+                else => {},
+            };
+        }
     }
 
     fn processDelete(self: *Daemon, e: *journal.Entry) void {
@@ -1145,6 +1163,23 @@ pub const Daemon = struct {
             }
             return;
         };
+        // Never land a losing install (T5 cascade, rig-proven 2026-08-26):
+        // a local upsert that beat this fetch while it was transferring
+        // would have the worker quarantine the WINNER's content and the
+        // superseded-install revert then lose the file on disk entirely.
+        // Discard the staging file instead: the tree is never touched.
+        if (self.cs.lookup(m.path)) |rec| {
+            switch (contentset.relate(m.ver, rec.ver)) {
+                .same, .older, .conflict_stored_wins => {
+                    log(.info, "install {s} v=({x},{d}) lost the race before landing; discarding", .{ m.path, m.ver.origin, m.ver.seq });
+                    self.inst.discardComplete(&job);
+                    self.alloc.free(job.path);
+                    self.dropIncoming(m.path, m.ver);
+                    return;
+                },
+                .newer, .conflict_incoming_wins => {},
+            }
+        }
         // Identity echo marker BEFORE the worker's rename: the resulting
         // kernel events (MOVE_TO + ATTRIB) must find it (rule 6), and the
         // fileid/gen swallow never re-hashes a big install on this loop.
@@ -1163,6 +1198,7 @@ pub const Daemon = struct {
         const path = res.job.path;
         defer self.alloc.free(path);
         defer if (res.job.ack_peer) |ap| self.alloc.free(ap);
+        defer if (res.job.quarantined) |q| self.alloc.free(q);
 
         if (res.err) |err| {
             log(.warn, "install {s} failed: {s}", .{ path, @errorName(err) });
@@ -1186,11 +1222,22 @@ pub const Daemon = struct {
                     log(.info, "install {s} v=({x},{d}) superseded mid-flight; reverting", .{
                         path, res.job.ver.origin, res.job.ver.seq,
                     });
-                    // NO clearEcho here: the move_from marker must live
-                    // until our revert-delete's kernel event arrives.
-                    self.jr.noteEcho(path, .move_from, res.job.sha256, res.job.size) catch {};
+                    // NO clearEcho / NO marker replacement: the install's
+                    // identity marker (set pre-submit) covers our revert
+                    // too — the MOVE_TO + ATTRIB of the landing AND the
+                    // DELETE of the revert all carry the loser's fileid
+                    // (a delete-swallow closes the marker).  Keep the
+                    // id-index mapping so the late nameless ATTRIB still
+                    // resolves to the path and finds the marker.
                     self.inst.tombstone(path, false) catch {};
-                    self.cs.dropId(self.tree_fsid, res.job.fileid);
+                    // Restore the divergent copy the worker quarantined:
+                    // it is the winning version's content.  Without the
+                    // restore the winner's record stays live with no file
+                    // on disk and the next rescan tombstones it mesh-wide
+                    // (T5 cascade).  No echo marker for the restore: the
+                    // journal's unchanged-check absorbs it (or it is a
+                    // genuinely newer local edit, which MUST announce).
+                    self.restoreQuarantined(path, res.job.quarantined);
                     self.dropIncoming(path, res.job.ver);
                     return;
                 },
@@ -1216,6 +1263,22 @@ pub const Daemon = struct {
         self.jr.clearEcho(path);
         self.dropIncoming(path, res.job.ver);
         log(.info, "installed {s} v=({x},{d}) size={d}", .{ path, res.job.ver.origin, res.job.ver.seq, res.job.size });
+    }
+
+    /// Rename a quarantined divergent copy back into the tree (revert of
+    /// a superseded install).  No echo marker: the restored content either
+    /// matches the winning stored record byte-for-byte (the journal's
+    /// unchanged-check absorbs the events) or it is a genuinely newer
+    /// local edit, which MUST announce forward.
+    fn restoreQuarantined(self: *Daemon, path: []const u8, qname: ?[]const u8) void {
+        const qn = qname orelse return;
+        const src = std.fs.path.join(self.alloc, &.{ self.inst.conflicts, qn }) catch return;
+        defer self.alloc.free(src);
+        const dst = self.inst.absPath(path) catch return;
+        defer self.alloc.free(dst);
+        posix.rename(src, dst) catch |err| {
+            log(.warn, "restore {s} from quarantine failed: {s}", .{ path, @errorName(err) });
+        };
     }
 
     /// Drop the incoming entry IF it still belongs to this version (a newer
@@ -1261,8 +1324,10 @@ pub const Daemon = struct {
         // changes.  A dir tombstone removes the subtree: mark every live
         // descendant we know about.
         self.markEchoSubtree(m.path, m.is_dir);
-        if (quarantine_loser)
-            self.inst.quarantine(m.path) catch {};
+        if (quarantine_loser) {
+            if (self.inst.quarantine(m.path) catch null) |qn|
+                self.alloc.free(qn); // informational; nothing to restore here
+        }
         self.inst.tombstone(m.path, m.is_dir) catch |err| {
             log(.warn, "tombstone {s}: {s}", .{ m.path, @errorName(err) });
         };
@@ -1471,7 +1536,7 @@ pub const Daemon = struct {
             self.resynced = true;
             // Post-join scan: local-only files (never in the group) join
             // the mesh as fresh local content.
-            const stats = resync.scan(self.alloc, self.cfg.replicated_path, &self.cs, &self.jr, peer_mod.nowMs()) catch return;
+            const stats = resync.scan(self.alloc, self.cfg.replicated_path, &self.cs, &self.jr, peer_mod.nowMs(), self.scanInflight()) catch return;
             log(.info, "post-join scan: seen={d} new={d} mod={d} del={d}", .{
                 stats.seen, stats.announced_new, stats.announced_modified, stats.announced_deleted,
             });
@@ -1479,6 +1544,17 @@ pub const Daemon = struct {
     }
 
     // ---- periodic ----
+
+    /// Rescan-floor in-flight guard (resync.InFlight): the fetch/install
+    /// machinery owns these paths; the scan must not re-origin them.
+    fn incomingContains(ctx: *const anyopaque, rel: []const u8) bool {
+        const self: *const Daemon = @ptrCast(@alignCast(ctx));
+        return self.incoming.contains(rel);
+    }
+
+    fn scanInflight(self: *Daemon) resync.InFlight {
+        return .{ .ctx = self, .contains = incomingContains };
+    }
 
     fn timerPass(self: *Daemon) void {
         const now = peer_mod.nowMs();
@@ -1537,7 +1613,7 @@ pub const Daemon = struct {
         if (self.need_rescan and now - self.last_rescan_ms >= rescan_cooldown_ms and self.resynced) {
             self.need_rescan = false;
             self.last_rescan_ms = now;
-            const stats = resync.scan(self.alloc, self.cfg.replicated_path, &self.cs, &self.jr, now) catch return;
+            const stats = resync.scan(self.alloc, self.cfg.replicated_path, &self.cs, &self.jr, now, self.scanInflight()) catch return;
             log(.info, "rescan: seen={d} new={d} mod={d} del={d}", .{
                 stats.seen, stats.announced_new, stats.announced_modified, stats.announced_deleted,
             });
