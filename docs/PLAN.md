@@ -155,8 +155,20 @@ pairs. All ops idempotent. See docs/protocol.md.
   (tests/vm/repl-tests.sh), tap-smoke green on all 3 VMs after.
   ~~Known POC limitation: big-file install blocks the core loop (fsync)~~ —
   RESOLVED in Phase 2 (completion worker, see below).
-- Phase 2: kernel hardening — fidelity vs dtrace oracle, ring sizing/drop
-  behavior, overhead measurement, T9 matrix, unload veto while fd held.
+- Phase 2: kernel hardening — **DONE 2026-08-26**: epoch-style unload
+  drain (preemptible epoch section around the tap + epoch_wait_preempt in
+  MOD_UNLOAD, replacing pause(hz)); move-out unflag (MOVE_FROM strips,
+  MOVE_TO re-flags only when the destination parent is flagged — plus two
+  rig-found interaction bugs: readdir IN_ACCESS self-events fighting the
+  unflag walk, and destination cache_enter running before the post-hook);
+  watch-removal flag-strip decision (hourly daemon ADDROOT re-push — a
+  kernel refcount is infeasible); ring sizing/drop (t-ringoverflow.sh:
+  6000-create storm vs kill -9'd daemon, drops + OVERFLOW marker + rescan
+  convergence); overhead (t-overhead.sh: find/open-close within noise,
+  +25% on a worst-case single-file write storm); T9 matrix
+  (t9-lifecycle.sh, N rounds, M_BRFS leak check); T11 full fidelity under
+  load (t11-fidelity.sh: genuine inotify watcher as oracle, 24k events
+  matched, 6058 rename cookies paired, zero drops).
   **LMDB content-set swap DONE 2026-08-24** (closes design-review gaps
   #7/#9/#12):
   - contentset.zig persistence is now LMDB (vendored 1.0.0, lib/lmdb,
