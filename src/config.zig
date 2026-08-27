@@ -21,6 +21,18 @@ pub const Config = struct {
     /// treats its local tree as authoritative; a non-primary with an empty
     /// set pulls via RESYNC before announcing anything local.
     primary: bool = false,
+    /// TLS/mTLS configuration.  All three paths required to enable TLS.
+    /// When set, all peer connections (inbound + outbound) use TLS 1.3
+    /// with KTLS offload (if kernel supports it).  The PSK handshake
+    /// still runs over the encrypted channel as defense in depth.
+    tls_cert: []const u8 = "",
+    tls_key: []const u8 = "",
+    tls_ca: []const u8 = "",
+
+    /// True when TLS cert+key are configured (enables mTLS on peer conns).
+    pub fn tlsEnabled(self: *const Config) bool {
+        return self.tls_cert.len > 0 and self.tls_key.len > 0;
+    }
 
     /// Validate cross-field rules that parsing alone cannot catch.
     pub fn validate(self: *const Config) !void {
@@ -72,6 +84,9 @@ pub fn load(path: [*:0]const u8) ?Config {
     if (getString(root, "listen")) |v| cfg.listen = v;
     if (getString(root, "psk_file")) |v| cfg.psk_file = v;
     if (root.lookup("primary")) |obj| cfg.primary = obj.toBool();
+    if (getString(root, "tls_cert")) |v| cfg.tls_cert = v;
+    if (getString(root, "tls_key")) |v| cfg.tls_key = v;
+    if (getString(root, "tls_ca")) |v| cfg.tls_ca = v;
 
     if (root.lookup("rate_limit")) |obj| {
         cfg.rate_limit = switch (obj.objectType()) {

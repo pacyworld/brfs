@@ -10,6 +10,17 @@ fn addLmdb(b: *std.Build, mod: *std.Build.Module) void {
     mod.addCSourceFiles(.{ .root = b.path("lib/lmdb"), .files = lmdb_files });
 }
 
+/// Link base-system OpenSSL for TLS/KTLS support.
+/// The rig VMs have base-system libssl.so.35 (OpenSSL 3.5.x); the host
+/// also has a ports-installed /usr/local/lib/libssl.so.12 which Zig's
+/// default search order picks up first.  Use addObjectFile with the
+/// explicit base-system .so to guarantee the correct library.
+fn addOpenSsl(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    mod.addObjectFile(b.path("lib/ssl-link/libssl.so"));
+    mod.addObjectFile(b.path("lib/ssl-link/libcrypto.so"));
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -31,6 +42,7 @@ pub fn build(b: *std.Build) void {
     });
     brfsd_mod.addImport("ucl", ucl_mod);
     addLmdb(b, brfsd_mod);
+    addOpenSsl(b, brfsd_mod);
 
     const brfsd = b.addExecutable(.{
         .name = "brfsd",
@@ -67,6 +79,7 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("ucl", ucl_mod);
     addLmdb(b, test_mod);
+    addOpenSsl(b, test_mod);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

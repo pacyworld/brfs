@@ -34,6 +34,7 @@ const server = @import("server.zig");
 const installer = @import("installer.zig");
 const resync = @import("resync.zig");
 const ctl = @import("ctl.zig");
+const tls_mod = @import("tls.zig");
 
 const ContentSet = contentset.ContentSet;
 const Journal = journal.Journal;
@@ -280,11 +281,30 @@ pub const Daemon = struct {
     comp: CompletionWorker,
     comp_thread: ?std.Thread = null,
     running: bool = true,
+    tls_ctx: ?tls_mod.TlsContext = null,
 
     pub fn init(alloc: Allocator, cfg: *const config.Config, psk: []const u8, dev_fd: posix.fd_t, wake_rd: posix.fd_t, wake_wr: posix.fd_t) !Daemon {
         var cs = try ContentSet.open(alloc, cfg.state_dir, cfg.node_id);
         errdefer cs.close();
         const inst = try installer.Installer.init(alloc, cfg.replicated_path, cfg.state_dir);
+
+        // TLS context (optional: only when cert+key are configured).
+        var tls_ctx: ?tls_mod.TlsContext = null;
+        if (cfg.tlsEnabled()) {
+            const ca: ?[*:0]const u8 = if (cfg.tls_ca.len > 0)
+                @ptrCast(cfg.tls_ca.ptr)
+            else
+                null;
+            tls_ctx = tls_mod.TlsContext.init(
+                @ptrCast(cfg.tls_cert.ptr),
+                @ptrCast(cfg.tls_key.ptr),
+                ca,
+            ) catch |err| {
+                log(.err, "TLS init failed: {s}", .{@errorName(err)});
+                return error.TlsInitFailed;
+            };
+            log(.info, "TLS enabled (KTLS offload if kernel supports it)", .{});
+        }
 
         // Completion-worker kick pipe (both ends non-blocking; the worker
         // drops wakeups on a full pipe — one is already pending).
@@ -305,6 +325,7 @@ pub const Daemon = struct {
             .evq = .{ .alloc = alloc, .wake_wr = wake_wr },
             .wake_rd = wake_rd,
             .incoming = std.StringHashMap(Incoming).init(alloc),
+            .tls_ctx = tls_ctx,
             // inst back-pointer is wired in run() (the Daemon is moved by
             // value out of init — &self.inst here would dangle).
             .comp = .{ .alloc = alloc, .inst = undefined, .kick_rd = kpfds[0], .kick_wr = kpfds[1], .wake_wr = wake_wr },
@@ -321,7 +342,7 @@ pub const Daemon = struct {
         // connect error (ECONNREFUSED), poisoning the conn for no reason.
         if (p.state != .connecting)
             self.stageChange(@intCast(p.fd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, p);
-        if (p.state == .connecting or p.wantsWrite())
+        if (p.state == .connecting or p.state == .tls_handshake or p.wantsWrite())
             self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
     }
 
@@ -801,8 +822,15 @@ pub const Daemon = struct {
                 self.alloc.destroy(p);
                 return;
             };
+            if (self.tls_ctx) |ctx| {
+                p.startTls(ctx) catch {
+                    self.dropPeer(p, peer_mod.nowMs(), "TLS init failed (inbound)");
+                    return;
+                };
+            }
             self.registerPeerFd(p);
-            self.sendHello(p);
+            if (p.state != .tls_handshake)
+                self.sendHello(p);
         }
     }
 
@@ -814,7 +842,19 @@ pub const Daemon = struct {
             };
             log(.info, "connected to peer {s}", .{peerName(p)});
             self.stageChange(@intCast(p.fd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, p);
-            self.sendHello(p);
+            if (self.tls_ctx) |ctx| {
+                p.startTls(ctx) catch {
+                    self.dropPeer(p, peer_mod.nowMs(), "TLS init failed (outbound)");
+                    return;
+                };
+                self.driveTlsHandshake(p);
+            } else {
+                self.sendHello(p);
+            }
+            return;
+        }
+        if (p.state == .tls_handshake) {
+            self.driveTlsHandshake(p);
             return;
         }
         p.writeReady() catch {
@@ -824,6 +864,10 @@ pub const Daemon = struct {
 
     fn onPeerReadable(self: *Daemon, p: *Peer) void {
         if (p.state == .connecting) return; // completion is the WRITE event
+        if (p.state == .tls_handshake) {
+            self.driveTlsHandshake(p);
+            return;
+        }
         p.readReady() catch {
             self.dropPeer(p, peer_mod.nowMs(), "read failed");
             return;
@@ -858,13 +902,36 @@ pub const Daemon = struct {
     }
 
     fn flushPeer(self: *Daemon, p: *Peer) void {
-        if (p.state == .connecting or p.state == .closed) return;
+        if (p.state == .connecting or p.state == .tls_handshake or p.state == .closed) return;
         p.writeReady() catch {
             self.dropPeer(p, peer_mod.nowMs(), "write failed");
             return;
         };
         if (p.wantsWrite())
             self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+    }
+
+    /// Drive the TLS handshake forward.  Called from onPeerReadable and
+    /// onPeerWritable when the peer is in .tls_handshake state.  On
+    /// completion, sends HELLO.  On want_read/want_write, re-arms the
+    /// appropriate kqueue filter (already done via EV_CLEAR on the fd).
+    fn driveTlsHandshake(self: *Daemon, p: *Peer) void {
+        const result = p.tlsHandshake() catch {
+            self.dropPeer(p, peer_mod.nowMs(), "TLS handshake failed");
+            return;
+        };
+        switch (result) {
+            .complete => {
+                log(.info, "TLS handshake complete with {s}", .{peerName(p)});
+                self.sendHello(p);
+            },
+            .want_read => {
+                // EV_CLEAR on the READ filter is already armed.
+            },
+            .want_write => {
+                self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
+            },
+        }
     }
 
     fn sendHello(self: *Daemon, p: *Peer) void {

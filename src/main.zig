@@ -99,4 +99,5 @@ test {
     std.testing.refAllDecls(@import("server.zig"));
     std.testing.refAllDecls(@import("ctl.zig"));
     std.testing.refAllDecls(@import("daemon.zig"));
+    std.testing.refAllDecls(@import("tls.zig"));
 }

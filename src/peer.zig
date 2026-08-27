@@ -18,6 +18,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const protocol = @import("protocol.zig");
 const contentset = @import("contentset.zig");
+const tls = @import("tls.zig");
 
 pub const wbuf_cap: usize = 64 * 1024 * 1024;
 pub const rbuf_cap: usize = protocol.max_frame + 4 + 4096;
@@ -27,7 +28,8 @@ pub const backoff_max_ms: i64 = 30_000;
 
 pub const State = enum {
     connecting, // outbound, non-blocking connect in flight
-    handshake, // connected; HELLO sent, peer HELLO pending
+    tls_handshake, // TCP connected; TLS handshake in progress
+    handshake, // TLS done (or no TLS); HELLO sent, peer HELLO pending
     ready,
     closed,
 };
@@ -62,6 +64,8 @@ pub const Peer = struct {
     next_retry_ms: i64 = 0,
     backoff_ms: i64 = backoff_initial_ms,
     moves: std.AutoHashMap(u32, RemoteMove), // cookie -> pending MOVE_FROM
+    /// TLS connection state (null when TLS not configured or not yet started).
+    tls_conn: ?tls.TlsConn = null,
 
     pub fn init(alloc: Allocator) Peer {
         return .{ .alloc = alloc, .moves = std.AutoHashMap(u32, RemoteMove).init(alloc) };
@@ -76,6 +80,7 @@ pub const Peer = struct {
         self.moves.deinit();
         if (self.node_id) |n| self.alloc.free(n);
         if (self.known_id) |n| self.alloc.free(n);
+        if (self.tls_conn) |*tc| tc.deinit();
     }
 
     pub fn noteRemoteMove(self: *Peer, cookie: u32, path: []const u8, ver: contentset.Version, is_dir: bool, now_ms: i64) !void {
@@ -115,6 +120,11 @@ pub const Peer = struct {
     }
 
     pub fn closeFd(self: *Peer) void {
+        if (self.tls_conn) |*tc| {
+            tc.shutdown();
+            tc.deinit();
+            self.tls_conn = null;
+        }
         if (self.fd >= 0) {
             posix.close(self.fd);
             self.fd = -1;
@@ -168,14 +178,43 @@ pub const Peer = struct {
         self.state = .handshake;
     }
 
+    /// Start TLS on an already-connected socket.  Transitions to
+    /// .tls_handshake state.  The daemon calls tlsHandshake() when the
+    /// socket becomes readable/writable.
+    pub fn startTls(self: *Peer, ctx: tls.TlsContext) !void {
+        self.tls_conn = if (self.outbound)
+            try tls.TlsConn.initClient(ctx, self.fd)
+        else
+            try tls.TlsConn.initServer(ctx, self.fd);
+        self.state = .tls_handshake;
+    }
+
+    /// Continue the TLS handshake.  Returns the result so the daemon can
+    /// re-arm the appropriate kqueue filter.  On .complete, transitions
+    /// to .handshake (ready for HELLO exchange).
+    pub fn tlsHandshake(self: *Peer) !tls.HandshakeResult {
+        var tc = &(self.tls_conn orelse return error.NoTlsConn);
+        const result = tc.doHandshake() catch |err| switch (err) {
+            tls.TlsError.HandshakeFailed => return error.TlsHandshakeFailed,
+            else => return error.TlsHandshakeFailed,
+        };
+        if (result == .complete) {
+            self.state = .handshake;
+            self.backoff_ms = backoff_initial_ms;
+        }
+        return result;
+    }
+
     /// EVFILT_WRITE fired on a connecting socket: check SO_ERROR.
-    /// Returns true when the connect completed (HELLO may be sent).
+    /// Returns true when the connect completed.  The daemon will then
+    /// call startTls() if TLS is configured, else proceed to HELLO.
     pub fn connectResult(self: *Peer) !bool {
         var err: c_int = 0;
         var len: posix.socklen_t = @sizeOf(c_int);
         if (std.c.getsockopt(self.fd, posix.SOL.SOCKET, posix.SO.ERROR, &err, &len) != 0)
             return error.SocketError;
         if (err != 0) return error.ConnectFailed;
+        // State transition decided by the daemon (TLS vs no-TLS).
         self.state = .handshake;
         self.backoff_ms = backoff_initial_ms;
         return true;
@@ -199,31 +238,62 @@ pub const Peer = struct {
     }
 
     /// Drain the outbound buffer (called on EVFILT_WRITE).
+    /// When TLS is active, uses SSL_write (KTLS makes this a kernel op).
     pub fn writeReady(self: *Peer) !void {
         while (self.wbuf.items.len > 0) {
-            const n = posix.write(self.fd, self.wbuf.items) catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => return err,
-            };
-            if (n == 0) return error.PeerGone;
-            self.wbuf.replaceRange(self.alloc, 0, n, &.{}) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-            };
+            if (self.tls_conn) |*tc| {
+                const result = tc.write(self.wbuf.items) catch
+                    return error.PeerGone;
+                switch (result) {
+                    .ok => |n| {
+                        if (n == 0) return error.PeerGone;
+                        self.wbuf.replaceRange(self.alloc, 0, n, &.{}) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                        };
+                    },
+                    .want_read, .want_write => return,
+                }
+            } else {
+                const n = posix.write(self.fd, self.wbuf.items) catch |err| switch (err) {
+                    error.WouldBlock => return,
+                    else => return err,
+                };
+                if (n == 0) return error.PeerGone;
+                self.wbuf.replaceRange(self.alloc, 0, n, &.{}) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                };
+            }
         }
     }
 
     /// Pull available bytes into rbuf (called on EVFILT_READ with EV_CLEAR:
     /// drain until WouldBlock).
+    /// When TLS is active, uses SSL_read (KTLS makes this a kernel op).
     pub fn readReady(self: *Peer) !void {
         var tmp: [65536]u8 = undefined;
         while (true) {
-            const n = posix.read(self.fd, &tmp) catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => return err,
-            };
-            if (n == 0) return error.PeerGone; // orderly close
-            if (self.rbuf.items.len + n > rbuf_cap) return error.PeerSaturated;
-            try self.rbuf.appendSlice(self.alloc, tmp[0..n]);
+            if (self.tls_conn) |*tc| {
+                const result = tc.read(&tmp) catch |err| switch (err) {
+                    tls.TlsError.ConnectionClosed => return error.PeerGone,
+                    else => return error.PeerGone,
+                };
+                switch (result) {
+                    .ok => |n| {
+                        if (n == 0) return error.PeerGone;
+                        if (self.rbuf.items.len + n > rbuf_cap) return error.PeerSaturated;
+                        try self.rbuf.appendSlice(self.alloc, tmp[0..n]);
+                    },
+                    .want_read, .want_write => return,
+                }
+            } else {
+                const n = posix.read(self.fd, &tmp) catch |err| switch (err) {
+                    error.WouldBlock => return,
+                    else => return err,
+                };
+                if (n == 0) return error.PeerGone;
+                if (self.rbuf.items.len + n > rbuf_cap) return error.PeerSaturated;
+                try self.rbuf.appendSlice(self.alloc, tmp[0..n]);
+            }
         }
     }
 
