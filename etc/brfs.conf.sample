@@ -37,3 +37,10 @@ primary = false
 
 # Outbound transfer cap in bytes/sec; 0 = unlimited.
 rate_limit = 0
+
+# Event classes to drop at intake (gap #11, selective filtering). The
+# kernel tap is emit-all by design; filtering happens in the daemon.
+# Dropped content classes are recovered by the scan floor, NOT in real
+# time — use this to shed noisy classes (attrib = mode/mtime churn), not
+# for content filtering. "overflow" is never droppable. Restart to change.
+# events_drop = ["attrib"]

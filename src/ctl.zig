@@ -31,6 +31,15 @@ pub const Command = union(enum) {
     conflicts_restore: []const u8,
     /// Delete conflicts/ entries (all, or those containing the argument).
     conflicts_prune: ?[]const u8,
+    /// Prometheus text exposition of daemon state + per-member vector lag
+    /// (the convergence health check).  brfsctl prepends the kernel
+    /// counters (security.brfs.* via sysctl).
+    metrics,
+    /// Mass-delete guard state (gap #17).
+    massdelete,
+    /// Release the guard latch + schedule a rescan (the suppressed deletes
+    /// re-derive as honest tombstones — the operator confirmed intent).
+    massdelete_resume,
     unknown,
 };
 
@@ -54,6 +63,12 @@ pub fn parseCommand(line: []const u8) Command {
             return .{ .conflicts_restore = name };
         }
         if (eq(u8, sub, "prune")) return .{ .conflicts_prune = it.next() };
+        return .unknown;
+    }
+    if (eq(u8, verb, "metrics")) return .metrics;
+    if (eq(u8, verb, "massdelete")) {
+        const sub = arg orelse return .massdelete;
+        if (eq(u8, sub, "resume")) return .massdelete_resume;
         return .unknown;
     }
     return .unknown;
@@ -104,6 +119,10 @@ test "parseCommand matrix" {
     try t.expect(restore == .conflicts_restore);
     try t.expectEqualStrings("sub/file.txt.12345", restore.conflicts_restore);
     try t.expect(parseCommand("conflicts restore") == .unknown);
+    try t.expect(parseCommand("metrics") == .metrics);
+    try t.expect(parseCommand("massdelete") == .massdelete);
+    try t.expect(parseCommand("massdelete resume") == .massdelete_resume);
+    try t.expect(parseCommand("massdelete bogus") == .unknown);
     try t.expect(parseCommand("bogus") == .unknown);
     try t.expect(parseCommand("") == .unknown);
     try t.expect(parseCommand("conflicts bogus") == .unknown);

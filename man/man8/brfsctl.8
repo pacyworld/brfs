@@ -1,0 +1,87 @@
+.Dd August 28, 2026
+.Dt BRFSCTL 8
+.Os
+.Sh NAME
+.Nm brfsctl
+.Nd BrFS operator utility
+.Sh SYNOPSIS
+.Nm
+.Cm stats
+.Nm
+.Cm status | peers | backlog | journal | resync
+.Nm
+.Cm conflicts Cm list
+.Nm
+.Cm conflicts Cm restore Ar name
+.Nm
+.Cm conflicts Cm prune Op Ar substr
+.Nm
+.Cm massdelete Op Cm resume
+.Sh DESCRIPTION
+The
+.Nm
+utility is the operator surface of BrFS.
+The
+.Cm stats
+command reads the
+.Va security.brfs.*
+kernel counters directly and works without a running daemon; every other
+command talks to the
+.Xr brfsd 8
+control socket
+.Pa /var/run/brfsd.sock ,
+which is mode 0600, so run these as root (e.g. via doas).
+.Sh COMMANDS
+.Bl -tag -width "conflicts restore name"
+.It Cm stats
+Show kernel-module counters: enabled state, total events, ring drops,
+ring size.
+Works with no daemon running (the kernel module is the source).
+.It Cm status
+Node state: node_id, primary/resynced flags, tree and state_dir paths,
+content-set counts (live records and tombstones), sequence counters,
+in-flight fetches, and the mass-delete guard state.
+.It Cm peers
+Mesh peers: node id, connection state, direction, address, write-buffer
+depth.
+.It Cm backlog
+Queue depths: pending journal entries, incoming fetches, completion
+queue.
+.It Cm journal
+Journal statistics: pending entries, renames in flight, echo markers,
+high water sequence.
+.It Cm resync
+Send RESYNC_REQ to every ready peer and schedule a local rescan.
+Use after freeing disk space (a fetch aborted by
+.Er ENOSPC
+is not retried automatically) or to force convergence.
+.It Cm conflicts Cm list
+List quarantined files (conflict losers) under
+.Pa state_dir/conflicts/ .
+.It Cm conflicts Cm restore Ar name
+Move a quarantined file back into the tree (strips the timestamp suffix);
+it rejoins as fresh local content and is announced.
+.It Cm conflicts Cm prune Op Ar substr
+Delete quarantined entries: all of them, or those whose names contain
+.Ar substr .
+.It Cm massdelete
+Show the mass-delete guard state (clear or latched, current window
+count).
+.It Cm massdelete Cm resume
+Release a latched mass-delete guard and schedule a rescan.
+The deletes suppressed by the guard are re-derived as honest tombstones:
+an intentional bulk delete still converges mesh-wide, one operator
+confirmation later.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh SEE ALSO
+.Xr brfs 4 ,
+.Xr brfs.conf 5 ,
+.Xr brfsd 8
+.Sh HISTORY
+The
+.Nm
+utility first appeared in the BrFS POC in August 2026.
+.Sh AUTHORS
+.An Daniel Morante Aq Mt daniel@morante.net

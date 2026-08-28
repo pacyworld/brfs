@@ -1,0 +1,20 @@
+# devfs ruleset for a jailed brfsd (gap #16).
+#
+# brfs.ko loads on the HOST kernel (jails cannot kldload); a jailed brfsd
+# consumes /dev/brfs through the jail's devfs ruleset.  Registration is
+# namespace-clean: the ioctl path resolves in the jailed caller's
+# namespace, and the kmod filters by dir fileid lineage, so a jail can
+# only watch subtrees it can resolve.
+#
+# Install as /etc/devfs.rules on the host, then point the jail at it:
+#   jail.conf:  devfs_ruleset = 10;
+#
+# Ruleset 4 (devfsrules_jail_vnet) is the stock default for vnet jails;
+# this sample extends the classic ruleset instead — pick ONE base include
+# style to match your jail.
+
+[devfsrules_brfs=10]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add include $devfsrules_unhide_login
+add path brfs unhide

@@ -121,6 +121,43 @@ pub fn main() !u8 {
         return 2;
     }
 
+    if (eq(u8, cmd, "metrics")) {
+        // Kernel counters first (sysctl — the kernel module is the
+        // source), then the daemon's exposition from the control socket.
+        const events_total = readU64("security.brfs.event_count") orelse {
+            out("brfsctl: brfs.ko is not loaded (security.brfs.* unavailable)\n", .{});
+            return 1;
+        };
+        var mbuf: [1024]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&mbuf, "# TYPE brfs_kmod_events counter\n" ++
+            "brfs_kmod_events {d}\n" ++
+            "# TYPE brfs_kmod_ring_drops counter\n" ++
+            "brfs_kmod_ring_drops {d}\n" ++
+            "# TYPE brfs_kmod_ring_size gauge\n" ++
+            "brfs_kmod_ring_size {d}\n" ++
+            "# TYPE brfs_kmod_tap_seen counter\n" ++
+            "brfs_kmod_tap_seen {d}\n" ++
+            "# TYPE brfs_kmod_tap_emitted counter\n" ++
+            "brfs_kmod_tap_emitted {d}\n", .{
+            events_total,
+            readU64("security.brfs.ring_drops") orelse 0,
+            readU64("security.brfs.ring_size") orelse 0,
+            readU64("security.brfs.tap_seen") orelse 0,
+            readU64("security.brfs.tap_emitted") orelse 0,
+        }) catch return 1;
+        _ = posix.write(1, hdr) catch return 1;
+        return cmdRemote("metrics");
+    }
+
+    if (eq(u8, cmd, "massdelete")) {
+        const sub = args.next() orelse return cmdRemote("massdelete");
+        if (eq(u8, sub, "resume"))
+            return cmdRemote("massdelete resume");
+        out("brfsctl: unknown massdelete subcommand '{s}'\n", .{sub});
+        usage();
+        return 2;
+    }
+
     if (eq(u8, cmd, "help") or eq(u8, cmd, "--help") or eq(u8, cmd, "-h")) {
         usage();
         return 0;
@@ -144,9 +181,12 @@ fn usage() void {
         "  backlog                     Journal/fetch/completion queue depths\n" ++
         "  journal                     Journal stats (moves, echoes, high_seq)\n" ++
         "  resync                      RESYNC_REQ to all peers + local rescan\n" ++
+        "  metrics                     Prometheus text exposition (kernel + daemon)\n" ++
         "  conflicts list              List quarantined (conflict-loser) files\n" ++
         "  conflicts restore <name>    Move a quarantined file back into the tree\n" ++
         "  conflicts prune [substr]    Delete quarantined entries (all or matching)\n" ++
+        "  massdelete                  Mass-delete guard state\n" ++
+        "  massdelete resume           Release the guard latch (confirms the deletes)\n" ++
         "  help                        Show this help\n";
     _ = posix.write(1, text) catch {};
 }

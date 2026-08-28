@@ -61,6 +61,20 @@ pub fn fsidOf(path: []const u8) !u64 {
 
 pub const chunk_size: usize = 1024 * 1024;
 
+/// Headroom kept free on the staging filesystem: the csdb env (same fs),
+/// the conflicts dir, and general fs health — ZFS write performance
+/// degrades sharply as it approaches full.
+pub const free_space_reserve: u64 = 64 * 1024 * 1024;
+
+/// Gap #18 precondition: refuse to stage what cannot fit.  Checked BEFORE
+/// opening the staging file so a too-big announce costs nothing; the
+/// fetch stays in the incoming map, times out as a stall, and the next
+/// ANNOUNCE/resync round retries once space exists (T15 recovery path).
+pub fn spaceCheck(free: u64, incoming: u64) error{NoSpaceLeft}!void {
+    if (free < free_space_reserve) return error.NoSpaceLeft;
+    if (incoming > free - free_space_reserve) return error.NoSpaceLeft;
+}
+
 /// The two halves of an install, split so the blocking fsync/rename can
 /// run on the daemon's completion worker instead of the core loop (a 200MB
 /// fsync blocked the loop for tens of seconds on the rig, stalling the
@@ -164,9 +178,21 @@ pub const Installer = struct {
         });
     }
 
+    /// Bytes available to an unprivileged writer on the staging filesystem
+    /// (f_bavail — the usable number; clamped at zero: it can go negative
+    /// past the reserved-blocks threshold).
+    pub fn stagingFreeBytes(self: *const Installer) !u64 {
+        var st: StatfsHeader = undefined;
+        const path_z = try std.posix.toPosixPath(self.staging);
+        if (statfs(&path_z, &st) != 0) return error.StatfsFailed;
+        if (st.f_bavail <= 0) return 0;
+        return @as(u64, @intCast(st.f_bavail)) * st.f_bsize;
+    }
+
     /// Open a staging file for an incoming version of path.
     pub fn beginFetch(self: *Installer, path: []const u8, ann: anytype) !void {
         if (self.fetches.contains(path)) return error.FetchInProgress;
+        try spaceCheck(try self.stagingFreeBytes(), ann.size);
         var scratch: [4096]u8 = undefined;
         const spath = try self.stagingPath(&scratch, path, ann.ver);
         const fd = try posix.open(spath, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o600);
@@ -666,6 +692,31 @@ test "tombstone removes files and trees" {
     // Idempotent: deleting again is a no-op.
     try rig.inst.tombstone("d2", true);
     try rig.inst.tombstone("d/f.txt", false);
+}
+
+test "spaceCheck enforces the staging reserve" {
+    const r = free_space_reserve;
+    try t.expectError(error.NoSpaceLeft, spaceCheck(0, 0));
+    try t.expectError(error.NoSpaceLeft, spaceCheck(r - 1, 0));
+    try t.expectError(error.NoSpaceLeft, spaceCheck(r, 1));
+    try t.expectError(error.NoSpaceLeft, spaceCheck(r + 100, 101));
+    try spaceCheck(r + 100, 100);
+    try spaceCheck(r, 0);
+}
+
+test "beginFetch refuses a fetch that cannot fit" {
+    const alloc = t.allocator;
+    var rig = try TestRig.make(alloc);
+    defer rig.destroy(alloc);
+
+    var ann = announceOf("x", 1);
+    ann.size = std.math.maxInt(u64) / 2;
+    try t.expectError(error.NoSpaceLeft, rig.inst.beginFetch("huge.bin", ann));
+    try t.expect(!rig.inst.fetchInProgress("huge.bin"));
+
+    // A sane size stages fine on the same rig.
+    try rig.inst.beginFetch("small.bin", announceOf("x", 1));
+    rig.inst.abortFetch("small.bin");
 }
 
 test "staging on a different filesystem is rejected at init" {

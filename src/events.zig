@@ -142,6 +142,28 @@ pub fn drain(fd: posix.fd_t, buf: []align(@alignOf(Event)) u8) ![]const Event {
     return ptr[0..count];
 }
 
+/// Bit for an op in a drop mask (ops number from 1).  OVERFLOW is never
+/// droppable — config.zig rejects it at parse.  Total function: unknown
+/// (future/garbage) ops map to 0 = never dropped.
+pub fn opBit(op: Op) u32 {
+    const raw = @intFromEnum(op);
+    if (raw == 0 or raw > @intFromEnum(Op.overflow)) return 0;
+    return @as(u32, 1) << (@intCast(raw - 1));
+}
+
+/// Op name -> Op for the config's events_drop list.
+pub fn opFromName(name: []const u8) ?Op {
+    const eq = std.mem.eql;
+    if (eq(u8, name, "create")) return .create;
+    if (eq(u8, name, "modify")) return .modify;
+    if (eq(u8, name, "delete")) return .delete;
+    if (eq(u8, name, "move_from")) return .move_from;
+    if (eq(u8, name, "move_to")) return .move_to;
+    if (eq(u8, name, "attrib")) return .attrib;
+    if (eq(u8, name, "overflow")) return .overflow;
+    return null;
+}
+
 pub fn opName(op: u32) []const u8 {
     const e: Op = @enumFromInt(op);
     return switch (e) {
@@ -177,4 +199,20 @@ test "opName covers all ops" {
     try std.testing.expectEqualStrings("CREATE", opName(1));
     try std.testing.expectEqualStrings("OVERFLOW", opName(7));
     try std.testing.expectEqualStrings("UNKNOWN", opName(999));
+}
+
+test "opBit/opFromName round-trip" {
+    try std.testing.expectEqual(@as(u32, 1), opBit(.create));
+    try std.testing.expectEqual(@as(u32, 1) << 5, opBit(.attrib));
+    // Unknown ops are never droppable (no shift overflow).
+    try std.testing.expectEqual(@as(u32, 0), opBit(@enumFromInt(0)));
+    try std.testing.expectEqual(@as(u32, 0), opBit(@enumFromInt(99)));
+    try std.testing.expectEqual(Op.attrib, opFromName("attrib").?);
+    try std.testing.expectEqual(Op.move_from, opFromName("move_from").?);
+    try std.testing.expect(opFromName("bogus") == null);
+    // Every named op round-trips (opName returns uppercase for logs).
+    inline for (.{ "create", "modify", "delete", "move_from", "move_to", "attrib", "overflow" }) |name| {
+        const op = opFromName(name).?;
+        try std.testing.expect(std.ascii.eqlIgnoreCase(name, opName(@intFromEnum(op))));
+    }
 }

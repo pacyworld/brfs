@@ -124,6 +124,7 @@ const dbi_records_name = "records";
 const dbi_meta_name = "meta";
 const meta_local_next_seq = "local_next_seq";
 const meta_ring_seq = "ring_seq";
+const meta_root_fsid = "root_fsid";
 /// Seq reservation window: how far flush()/reserveSeqs() keep the
 /// persisted ceiling ahead of the next issuable seq.  Bursts larger than
 /// this between commits take the forced-reserve path in nextVersion().
@@ -165,6 +166,14 @@ fn mvalSlice(v: *const c.MDB_val) []const u8 {
     return p[0..v.mv_size];
 }
 
+/// All-member-ack horizon (gap #7): supplied by the daemon, which tracks
+/// each member's announced version vector (from RESYNC_REQs).
+pub const AckHorizon = struct {
+    ctx: *const anyopaque,
+    /// True when every configured member's vector covers ver.
+    covers: *const fn (ctx: *const anyopaque, ver: Version) bool,
+};
+
 pub const ContentSet = struct {
     alloc: Allocator,
     state_dir: []const u8,
@@ -193,6 +202,12 @@ pub const ContentSet = struct {
     /// records, and phantom re-origins won the compare).
     local_seq_ceiling: u64 = 1,
     ring_seq: u64 = 0,
+    /// Gap #16: the watched root's fsid, stamped on first-ever start.  On
+    /// later opens a mismatch means the fs was force-unmounted (the path
+    /// now resolves on the parent fs) or legitimately rebuilt — the daemon
+    /// freezes scans/local announces rather than tombstoning a "vanished"
+    /// tree mesh-wide.  0 = legacy db, stamp on next start.
+    root_fsid: u64 = 0,
     needs_scan: bool = false,
 
     /// Open (creating if needed) state_dir/csdb and load every record.
@@ -341,6 +356,7 @@ pub const ContentSet = struct {
             self.local_next_seq = v;
         }
         if (self.getMeta(txn, meta_ring_seq)) |v| self.ring_seq = v;
+        if (self.getMeta(txn, meta_root_fsid)) |v| self.root_fsid = v;
 
         var cur: ?*c.MDB_cursor = null;
         try mdbCheck(c.mdb_cursor_open(txn, self.dbi_records, &cur));
@@ -511,6 +527,15 @@ pub const ContentSet = struct {
         self.dropId(rec.id.fsid, rec.id.fileid);
     }
 
+    /// Gap #16: stamp the watched root's fsid (first-ever start).  Read
+    /// side: root_fsid loaded by open(); a mismatch against the live fsid
+    /// freezes the daemon's scans (forced-unmount protection).
+    pub fn setRootFsid(self: *ContentSet, fsid: u64) !void {
+        self.root_fsid = fsid;
+        try self.ensureTxn();
+        try self.flush();
+    }
+
     /// Persist the current ring consumption point (USN analog).  Cheap;
     /// the daemon calls it on a timer and at shutdown.  Replays after a
     /// crash are safe because every downstream op is idempotent.
@@ -537,6 +562,10 @@ pub const ContentSet = struct {
             self.abortTxn();
             return e;
         };
+        self.putMeta(meta_root_fsid, self.root_fsid) catch |e| {
+            self.abortTxn();
+            return e;
+        };
         const txn = self.wtxn.?;
         self.wtxn = null; // commit consumes the handle either way
         mdbCheck(c.mdb_txn_commit(txn)) catch |e| {
@@ -555,18 +584,22 @@ pub const ContentSet = struct {
         try self.flush();
     }
 
-    /// Gap #7: drop tombstones older than tombstone_ttl_sec.  Live records
-    /// are never collected.  Returns the number collected.  (The
-    /// all-member-ack horizon half of the retention rule lands with
-    /// per-member ack tracking; TTL alone matches DFSR's window.)
-    pub fn gcTombstones(self: *ContentSet, now_sec: i64) !u64 {
+    /// Gap #7: drop tombstones past the retention rule.  Live records are
+    /// never collected.  A tombstone is collectable when EITHER the 7-day
+    /// TTL expired (the DFSR ConflictAndDeleted window — the fallback for
+    /// members gone too long) OR the all-member-ack horizon reports every
+    /// configured member's version vector covers it (they have all SEEN
+    /// the delete — early collection).  Returns the number collected.
+    pub fn gcTombstones(self: *ContentSet, now_sec: i64, horizon: ?AckHorizon) !u64 {
         var doomed: std.ArrayList([]const u8) = .empty;
         defer doomed.deinit(self.alloc);
         var it = self.map.iterator();
         while (it.next()) |e| {
             const r = e.value_ptr;
             if (r.state != .deleted or r.deleted_at == 0) continue;
-            if (now_sec - r.deleted_at < tombstone_ttl_sec) continue;
+            const ttl_expired = now_sec - r.deleted_at >= tombstone_ttl_sec;
+            const acked = if (horizon) |h| h.covers(h.ctx, r.ver) else false;
+            if (!ttl_expired and !acked) continue;
             doomed.append(self.alloc, e.key_ptr.*) catch break;
         }
         if (doomed.items.len == 0) return 0;
@@ -587,6 +620,32 @@ pub const ContentSet = struct {
             n += self.removeFromMap(p);
         }
         try self.flush();
+        return n;
+    }
+
+    /// Live records strictly under a dir path — the mass-delete guard's
+    /// blast-radius weight for dir tombstones (a dir tombstone cascades
+    /// to the whole subtree on receivers).  O(n) map walk; dir deletes
+    /// only.
+    pub fn liveDescendants(self: *const ContentSet, path: []const u8) u64 {
+        var n: u64 = 0;
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.state != .live) continue;
+            const k = e.key_ptr.*;
+            if (k.len > path.len and std.mem.startsWith(u8, k, path) and k[path.len] == '/') n += 1;
+        }
+        return n;
+    }
+
+    /// Live-record count (O(n) map walk — the mass-delete guard calls it
+    /// only past its absolute floor, never per event).
+    pub fn liveCount(self: *const ContentSet) u64 {
+        var n: u64 = 0;
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.state == .live) n += 1;
+        }
         return n;
     }
 
@@ -955,9 +1014,9 @@ test "tombstone GC respects the retention TTL (gap #7)" {
         try cs.upsert("gone.txt", tomb);
         try cs.flush();
 
-        try std.testing.expectEqual(@as(u64, 0), try cs.gcTombstones(now)); // within TTL
+        try std.testing.expectEqual(@as(u64, 0), try cs.gcTombstones(now, null)); // within TTL
         try std.testing.expect(cs.lookup("gone.txt") != null);
-        try std.testing.expectEqual(@as(u64, 1), try cs.gcTombstones(now + tombstone_ttl_sec + 1));
+        try std.testing.expectEqual(@as(u64, 1), try cs.gcTombstones(now + tombstone_ttl_sec + 1, null));
         try std.testing.expect(cs.lookup("gone.txt") == null);
         try std.testing.expect(cs.lookup("keep.txt") != null); // live records never collected
         cs.close();
@@ -970,6 +1029,40 @@ test "tombstone GC respects the retention TTL (gap #7)" {
         // The local seq floor survived the GC of the record that carried it.
         try std.testing.expect(cs.local_next_seq >= 51);
     }
+}
+
+test "tombstone GC: all-member-ack horizon collects before TTL (gap #7)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    const H = struct {
+        cover: bool,
+        fn covers(ctx: *const anyopaque, ver: Version) bool {
+            _ = ver;
+            const h: *const @This() = @ptrCast(@alignCast(ctx));
+            return h.cover;
+        }
+    };
+    var yes = H{ .cover = true };
+    var no = H{ .cover = false };
+
+    var cs = try ContentSet.open(alloc, dir, "test-node");
+    defer cs.close();
+    var tomb = sampleRecord(7);
+    tomb.state = .deleted;
+    try cs.upsert("seen-by-all.txt", tomb);
+    try cs.flush();
+
+    const now = std.time.timestamp();
+    // Horizon says no: retained within TTL.
+    try std.testing.expectEqual(@as(u64, 0), try cs.gcTombstones(now, .{ .ctx = &no, .covers = H.covers }));
+    try std.testing.expect(cs.lookup("seen-by-all.txt") != null);
+    // Horizon says all members have seen it: collected immediately.
+    try std.testing.expectEqual(@as(u64, 1), try cs.gcTombstones(now, .{ .ctx = &yes, .covers = H.covers }));
+    try std.testing.expect(cs.lookup("seen-by-all.txt") == null);
 }
 
 test "gap #9 delete-vs-modify rule: LWW on (seq, origin) decides" {

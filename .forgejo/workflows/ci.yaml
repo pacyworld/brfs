@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: FreeBSD
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Zig unit tests (contentset/journal/protocol/installer/resync/ctl/
+      # guard/TLS) — the full host-side suite.
+      - name: Unit tests
+        run: zig build test
+
+      # Exe targets: zig build test does NOT fully analyze brfsd/brfsctl
+      # (rig-proven harness lesson), so build them explicitly.
+      - name: Build brfsd + brfsctl
+        run: zig build -Doptimize=ReleaseSafe
+
+      # Compile check of the kernel module against this host's /usr/src.
+      # (A kmod built for a different point release is never shipped; the
+      # rig VMs rebuild in-guest.)
+      - name: kmod compile check
+        run: make -C kmod
+
+      - name: Man page lint
+        run: |
+          for m in man/man4/*.4 man/man5/*.5 man/man8/*.8; do
+            # STYLE notes about sibling pages not yet installed in the
+            # system manpath are expected pre-install; fail on WARNINGs.
+            if mandoc -T lint "$m" 2>&1 | grep -q 'WARNING\|ERROR'; then
+              mandoc -T lint "$m"
+              exit 1
+            fi
+          done

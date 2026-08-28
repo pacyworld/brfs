@@ -303,6 +303,72 @@ pairs. All ops idempotent. See docs/protocol.md.
   RTT per file — ~20 MB/s ceiling at a 50 ms cross-region RTT, fine for
   POC), node add/remove, >3 nodes, resync skip-on-(size,sha),
   upstreamable registration API if patch fallback used.
+- **Code-review backlog landings 2026-08-28** (gaps #7/#10/#11/#14/#15/
+  #16/#17/#18/#19 + man pages + CI + metrics):
+  - #18 staging free-space precondition: beginFetch refuses a fetch whose
+    announced size exceeds f_bavail minus a 64 MiB reserve BEFORE staging
+    a byte; the stall/expire + resync round retries once space exists.
+  - #17 mass-delete guard (src/guard.zig): local tombstone transitions
+    counted in a 10 s window; >= 64 AND > 50% of the live tree latches
+    the guard (local tombstones suppressed — scan-derived deletes funnel
+    through the same choke point, so the floor cannot re-derive the storm
+    while latched).  Dir deletes are weighted by live-descendant count
+    (rig-proven: the subtree-cascading dir tombstone fired pre-latch).
+    `brfsctl massdelete resume` releases the latch + opens a 2-minute
+    bypass window (the re-derived storm would re-trip on its own
+    threshold) + schedules the rescan that converges an intentional
+    delete.  Rig test: t-guard.sh.
+  - #19 SIGHUP runtime reconfig: reloads PSK (re-read from psk_file, new
+    handshakes only), adds NEW peers (outbound dials; removals need a
+    restart), rate_limit value; identity/topology/TLS changes log a
+    warning and keep running values.  Rig-proven under nohup
+    supervision: signals are now blocked process-wide in main() BEFORE
+    any thread spawns and SIGHUP's disposition is reset from SIG_IGN —
+    EVFILT_SIGNAL never reports an ignored signal, and a process signal
+    lands on ANY unmasked thread (the drainer/completion threads
+    inherited the unblocked mask and the process died silently).
+    Rig test: t-sighup.sh.
+  - #10 fetch source selection: the announce/resync source is tried
+    first; a NACK-missing for the CURRENT attempt falls back to another
+    ready peer (tried-list per fetch, no loops), keeping staged bytes;
+    NACKs for superseded attempts are ignored.  docs/protocol.md carries
+    the rule.  Plus the root fix the rig forced: RESYNC_REQ is now always
+    an empty-vector FULL pull — a conn drop mid-announce-burst leaves
+    holes the per-origin-MAX vector cannot express, and vector-diff
+    resync answered "0 entries" while the requester was missing 934
+    records (t-ringoverflow permanent divergence; healed instantly once
+    full pulls landed).
+  - #11 selective event filtering: daemon-side `events_drop` op-class
+    list (kmod tap stays emit-all — per-root kernel attribution would
+    need the hot-path lineage walk rejected in #13; br_mask ABI field
+    stays reserved).  Dropped classes are scan-floor-recovered, never
+    real-time; overflow is never droppable.
+  - #16 forced unmount: runtime scans + re-push re-check the root fsid
+    and freeze on mismatch (no tombstone storm of the "vanished" tree);
+    startup with the fs down fails fast at ADDROOT; a rebuilt fs (fsid
+    changed vs the LMDB-stamped root_fsid) freezes until the operator
+    wipes state_dir.  ZFS fsid mount-stability verified empirically.
+    Rig test: t-unmount.sh (testz scratch dataset).  Jailed-brfsd devfs
+    ruleset sample: etc/devfs.rules.sample.
+  - #7 all-member-ack horizon: every member's RESYNC_REQ vector is
+    recorded (resync.MemberVector, keyed by fnv1a64(node_id)); a
+    tombstone is GC-collectable when TTL-expired OR covered by every
+    configured peer's vector (early collection on a healthy mesh; a
+    member never heard from keeps TTL as the only bound).
+  - #14/#15 writeups (KBI assertion, MAC rejection rationale) + #11/#16
+    decision records: docs/design-decisions.md.
+  - Man pages: man/man4/brfs.4, man/man5/brfs.conf.5, man/man8/brfsd.8,
+    man/man8/brfsctl.8 — mandoc -T lint WARNING-free (STYLE notes about
+    sibling Xr cross-refs resolve only once installed in the system
+    manpath — mandoc lint ignores MANPATH).
+  - CI: .forgejo/workflows/ci.yaml (unit tests, exe build, kmod compile
+    check, mandoc lint gate on WARNING/ERROR).
+  - Metrics: `brfsctl metrics` — Prometheus text: kernel counters via
+    sysctl + daemon gauges via the ctl socket, incl.
+    brfs_member_vector_lag (per-member seq distance between our content
+    set and the member's last announced vector — the "is the mesh caught
+    up" gauge; note it reflects the member's LAST resync, so fresh writes
+    show lag until the peer's next RESYNC_REQ).
 
 ## Test matrix (T1–T11)
 

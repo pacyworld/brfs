@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const ucl = @import("ucl");
+const events = @import("events.zig");
 
 pub const max_peers = 16;
 
@@ -28,6 +29,14 @@ pub const Config = struct {
     tls_cert: []const u8 = "",
     tls_key: []const u8 = "",
     tls_ca: []const u8 = "",
+    /// Gap #11: op classes to drop at event intake (selective filtering;
+    /// bitmask of events.opBit).  The kmod tap stays emit-all — kernel-side
+    /// per-root attribution would need the lineage walk the emit-all
+    /// decision rejected — so the filter lives here in the daemon.  Dropped
+    /// content classes are recovered by the scan floor, not in real time:
+    /// this knob is for shedding noisy classes like ATTRIB (mode/mtime
+    /// churn), not for content filtering.  OVERFLOW is never droppable.
+    events_drop: u32 = 0,
 
     /// True when TLS cert+key are configured (enables mTLS on peer conns).
     pub fn tlsEnabled(self: *const Config) bool {
@@ -97,6 +106,24 @@ pub fn load(path: [*:0]const u8) ?Config {
             },
             else => 0,
         };
+    }
+
+    if (root.lookup("events_drop")) |obj| {
+        if (obj.objectType() == .array) {
+            var it = obj.iterate();
+            while (it.next()) |item| {
+                const name = item.toString() orelse continue;
+                const op = events.opFromName(name) orelse {
+                    std.debug.print("brfsd: config {s}: unknown events_drop op '{s}'\n", .{ path, name });
+                    return null;
+                };
+                if (op == .overflow) {
+                    std.debug.print("brfsd: config {s}: events_drop cannot include 'overflow'\n", .{path});
+                    return null;
+                }
+                cfg.events_drop |= events.opBit(op);
+            }
+        }
     }
 
     if (root.lookup("peers")) |obj| {

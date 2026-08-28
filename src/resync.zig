@@ -192,6 +192,48 @@ pub fn vectorCovers(req: *const protocol.ResyncReq, ver: contentset.Version) boo
     return false;
 }
 
+/// Gap #7 ack horizon: one member's announced version vector (from its
+/// RESYNC_REQ).  Fixed-size, keyed by fnv1a64(node_id); bounds match the
+/// wire vector bounds (protocol.max_vector).
+pub const MemberVector = struct {
+    used: bool = false,
+    node_hash: u64 = 0,
+    origins: [protocol.max_vector]u64 = undefined,
+    max_seqs: [protocol.max_vector]u64 = undefined,
+    n: usize = 0,
+
+    pub fn record(self: *MemberVector, origin: u64, max_seq: u64) void {
+        for (self.origins[0..self.n], 0..) |o, i| {
+            if (o == origin) {
+                self.max_seqs[i] = @max(self.max_seqs[i], max_seq);
+                return;
+            }
+        }
+        if (self.n >= protocol.max_vector) return;
+        self.origins[self.n] = origin;
+        self.max_seqs[self.n] = max_seq;
+        self.n += 1;
+    }
+
+    /// Does this member's vector cover the version (i.e. it has SEEN the
+    /// record/tombstone)?
+    pub fn covers(self: *const MemberVector, ver: contentset.Version) bool {
+        for (self.origins[0..self.n], 0..) |o, i| {
+            if (o == ver.origin) return ver.seq <= self.max_seqs[i];
+        }
+        return false;
+    }
+
+    /// The member's max seq for an origin (0 = never seen) — the
+    /// convergence-lag metric.
+    pub fn maxSeq(self: *const MemberVector, origin: u64) u64 {
+        for (self.origins[0..self.n], 0..) |o, i| {
+            if (o == origin) return self.max_seqs[i];
+        }
+        return 0;
+    }
+};
+
 /// Receiver-side decision for one RESYNC_ENTRY.
 pub const EntryAction = enum { ignore, fetch, adopt, tombstone };
 
@@ -261,6 +303,24 @@ fn drainJournal(j: *journal.Journal) []journal.Work {
     var out: std.ArrayList(journal.Work) = .empty;
     j.collectReady(std.math.maxInt(i64) - 1, &out) catch unreachable;
     return out.toOwnedSlice(t.allocator) catch unreachable;
+}
+
+test "MemberVector record/covers (gap #7 ack horizon)" {
+    var mv = MemberVector{};
+    try t.expect(!mv.used);
+    mv.used = true;
+    mv.node_hash = 0xdead;
+    try t.expect(!mv.covers(.{ .origin = 1, .seq = 1 })); // empty covers nothing
+    mv.record(1, 10);
+    try t.expect(mv.covers(.{ .origin = 1, .seq = 10 }));
+    try t.expect(mv.covers(.{ .origin = 1, .seq = 3 })); // below max
+    try t.expect(!mv.covers(.{ .origin = 1, .seq = 11 })); // above max
+    try t.expect(!mv.covers(.{ .origin = 2, .seq = 1 })); // unknown origin
+    mv.record(1, 5); // never regresses
+    try t.expect(mv.covers(.{ .origin = 1, .seq = 10 }));
+    mv.record(2, 7);
+    try t.expect(mv.covers(.{ .origin = 2, .seq = 7 }));
+    try t.expectEqual(@as(usize, 2), mv.n);
 }
 
 test "first scan announces the seeded tree" {

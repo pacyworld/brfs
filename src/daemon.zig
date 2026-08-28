@@ -35,6 +35,7 @@ const installer = @import("installer.zig");
 const resync = @import("resync.zig");
 const ctl = @import("ctl.zig");
 const tls_mod = @import("tls.zig");
+const guard_mod = @import("guard.zig");
 
 const ContentSet = contentset.ContentSet;
 const Journal = journal.Journal;
@@ -147,6 +148,26 @@ const Incoming = struct {
     /// rename off the core loop).  Completing entries are exempt from the
     /// stall-timeout sweep — the worker owns them.
     completing: bool = false,
+    /// Gap #10 source-selection: fnv1a64(node_id) of every source already
+    /// tried for this fetch — the announce/resync source first, then NACK
+    /// fallbacks.  Bounded by max_peers (full mesh, no relaying).
+    tried: [config.max_peers]u64 = [_]u64{0} ** config.max_peers,
+    tried_n: u8 = 0,
+
+    fn markTried(self: *Incoming, node_id: []const u8) void {
+        if (self.wasTried(node_id)) return;
+        if (self.tried_n >= self.tried.len) return;
+        self.tried[self.tried_n] = std.hash.Fnv1a_64.hash(node_id);
+        self.tried_n += 1;
+    }
+
+    fn wasTried(self: *const Incoming, node_id: []const u8) bool {
+        const h = std.hash.Fnv1a_64.hash(node_id);
+        for (self.tried[0..self.tried_n]) |h0| {
+            if (h0 == h) return true;
+        }
+        return false;
+    }
 };
 
 const fetch_timeout_ms: i64 = 30_000;
@@ -274,6 +295,24 @@ pub const Daemon = struct {
     tree_fsid: u64 = 0,
     resynced: bool = false,
     need_rescan: bool = false,
+    /// Gap #17 mass-delete guard (guard.zig): local tombstone storm latch.
+    guard: guard_mod.Guard = .{},
+    /// Set by main for SIGHUP reload (gap #19); null in unit tests.
+    cfg_path: ?[*:0]const u8 = null,
+    /// Daemon-owned PSK after a SIGHUP reload (the startup PSK is borrowed
+    /// from main; reloads must not free it).
+    psk_owned: ?[]u8 = null,
+    /// Gap #16: the watched fs is not the one the content set was stamped
+    /// against (forced unmount / rebuilt fs) — scans, the root re-push,
+    /// and the watch registration are frozen until the mount is fixed and
+    /// the daemon restarted.
+    fs_frozen: bool = false,
+    /// Gap #7 ack horizon: the last version vector each member announced
+    /// (from its RESYNC_REQ), keyed by fnv1a64(node_id).  Refreshed at
+    /// every handshake (both sides RESYNC_REQ on ready) and every
+    /// operator resync, so vectors track liveness for free.
+    member_vectors: [config.max_peers]resync.MemberVector =
+        [_]resync.MemberVector{.{}} ** config.max_peers,
     last_rescan_ms: i64 = 0,
     last_checkpoint_ms: i64 = 0,
     last_gc_ms: i64 = 0,
@@ -394,15 +433,44 @@ pub const Daemon = struct {
         var mask = posix.sigemptyset();
         _ = std.c.sigaddset(&mask, 15);
         _ = std.c.sigaddset(&mask, 2);
+        _ = std.c.sigaddset(&mask, 1); // SIGHUP: config reload (gap #19)
         _ = std.c.sigprocmask(std.c.SIG.BLOCK, &mask, null);
+        // nohup(1)/daemon(8) supervisors start us with SIGHUP set to
+        // SIG_IGN, and EVFILT_SIGNAL never reports an ignored signal —
+        // reset the disposition to SIG_DFL (it stays blocked, so there is
+        // still no synchronous delivery; the knote fires).
+        const dfl = posix.Sigaction{
+            .handler = .{ .handler = posix.SIG.DFL },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(1, &dfl, null);
         self.stageChange(15, c_event.EVFILT_SIGNAL, c_event.EV_ADD, null);
         self.stageChange(2, c_event.EVFILT_SIGNAL, c_event.EV_ADD, null);
+        self.stageChange(1, c_event.EVFILT_SIGNAL, c_event.EV_ADD, null);
         self.stageChange(@intCast(self.wake_rd), c_event.EVFILT_READ, c_event.EV_ADD | c_event.EV_CLEAR, null);
 
         // Root dir index entry so events under the root resolve.
         const root_st = try installer.statPath(self.cfg.replicated_path);
         self.tree_fsid = try installer.fsidOf(self.cfg.replicated_path);
         try self.cs.indexRoot(self.tree_fsid, @intCast(root_st.ino));
+
+        // Gap #16 forced-unmount guard, startup half: the content set is
+        // married to the fsid stamped on first start.  A mismatch means
+        // the path no longer resolves to the watched filesystem (umount -f
+        // leaves the bare mountpoint on the parent fs; a rebuilt fs has a
+        // new fsid) — everything under it would LOOK deleted.  Freeze:
+        // drop the watch registration (it would flag the WRONG fs), run no
+        // scans, announce nothing local.  Recovery: fix the mount, restart
+        // (fsids are mount-stable on UFS/ZFS); wipe state_dir only when
+        // the fs was legitimately rebuilt.
+        if (self.cs.root_fsid == 0) {
+            self.cs.setRootFsid(self.tree_fsid) catch {};
+        } else if (self.cs.root_fsid != self.tree_fsid) {
+            self.fs_frozen = true;
+            events.delRoot(self.dev_fd, self.cfg.replicated_path) catch {};
+            log(.err, "watched root fsid {x} != stamped {x}: filesystem unmounted/rebuilt — replication FROZEN until restart with the correct mount", .{ self.tree_fsid, self.cs.root_fsid });
+        }
 
         // Orphaned staging files from a kill -9 (T8) are garbage.
         self.cleanStaging();
@@ -442,7 +510,7 @@ pub const Daemon = struct {
         // Startup reconciliation (gap #8): a non-primary with an empty set
         // pulls before announcing; everyone else scans now.
         self.resynced = self.cfg.primary or self.cs.map.count() > 0;
-        if (self.resynced) {
+        if (self.resynced and !self.fs_frozen) {
             const stats = try resync.scan(alloc, self.cfg.replicated_path, &self.cs, &self.jr, peer_mod.nowMs(), self.scanInflight());
             log(.info, "startup scan: seen={d} new={d} mod={d} del={d} same={d}", .{
                 stats.seen, stats.announced_new, stats.announced_modified, stats.announced_deleted, stats.unchanged,
@@ -469,8 +537,13 @@ pub const Daemon = struct {
 
             for (evlist[0..@intCast(nev)]) |*ev| {
                 if (ev.filter == c_event.EVFILT_SIGNAL) {
-                    log(.info, "signal {d}: shutting down", .{ev.ident});
-                    self.running = false;
+                    if (ev.ident == 1) {
+                        log(.info, "SIGHUP: reloading config", .{});
+                        self.reloadConfig();
+                    } else {
+                        log(.info, "signal {d}: shutting down", .{ev.ident});
+                        self.running = false;
+                    }
                 } else if (ev.filter == c_event.EVFILT_READ and ev.udata == null and @as(posix.fd_t, @intCast(ev.ident)) == self.wake_rd) {
                     self.onWakePipe();
                 } else if (ev.filter == c_event.EVFILT_READ and ev.udata == null and @as(posix.fd_t, @intCast(ev.ident)) == self.listen_fd) {
@@ -557,6 +630,14 @@ pub const Daemon = struct {
         if (op == .overflow) {
             log(.warn, "ring overflow seq={d}: scheduling tree rescan", .{bev.seq});
             self.need_rescan = true;
+            if (bev.seq > self.jr.high_seq) self.jr.high_seq = bev.seq;
+            return;
+        }
+        // Gap #11 selective filtering: configured op classes drop here,
+        // before path resolution.  high_seq still advances — the events
+        // ARE consumed (deliberately dropped) — so the ring checkpoint
+        // doesn't pin the drain window on them.
+        if ((self.cfg.events_drop & events.opBit(op)) != 0) {
             if (bev.seq > self.jr.high_seq) self.jr.high_seq = bev.seq;
             return;
         }
@@ -754,6 +835,20 @@ pub const Daemon = struct {
     fn processDelete(self: *Daemon, e: *journal.Entry) void {
         const rec = self.cs.lookup(e.path) orelse return;
         if (rec.state == .deleted) return;
+        // Gap #17 mass-delete guard (guard.zig): covers BOTH the live
+        // event feed and the rescan floor (scan deletes are journaled
+        // through this same point).  Peer tombstones never pass here.
+        // Directory deletes are weighted by live-descendant count: a dir
+        // tombstone cascades to the whole subtree on receivers.
+        const weight: u64 = if (rec.is_dir) 1 + self.cs.liveDescendants(e.path) else 1;
+        switch (self.guard.gate(peer_mod.nowMs(), weight)) {
+            .allow => {},
+            .check_live => if (!self.guard.checkLive(self.cs.liveCount())) {
+                log(.err, "MASS-DELETE GUARD TRIPPED: {d} local deletes inside {d}ms — local tombstones suppressed until 'brfsctl massdelete resume'", .{ self.guard.count, guard_mod.window_ms });
+                return;
+            },
+            .suppress => return,
+        }
         const ver = self.cs.nextVersion();
         var r = rec.*;
         r.state = .deleted;
@@ -982,6 +1077,26 @@ pub const Daemon = struct {
             .move_to => |m| self.onMoveTo(p, m),
             .nack => |m| {
                 log(.warn, "NACK from {s}: {s} v=({x},{d}) code={d}", .{ peerName(p), m.path, m.ver.origin, m.ver.seq, m.code });
+                // Only act on a NACK for the CURRENT attempt: a stale NACK
+                // from a superseded fetch must not kill a fresh one, and a
+                // completing fetch belongs to the worker.
+                const cur = self.incoming.get(m.path) orelse return;
+                if (!cur.ver.eql(m.ver) or cur.completing) return;
+                if (m.code == nack_missing) {
+                    // Gap #10 source-selection: the announce source doesn't
+                    // hold the content — fall back to another ready peer,
+                    // keeping the staged bytes (same version; the final
+                    // hash verifies the assembly).
+                    if (self.pickAlternateSource(m.path)) |alt| {
+                        const off = self.inst.fetchOffset(m.path);
+                        log(.info, "fetch {s} v=({x},{d}): source fallback {s} -> {s} at offset {d}", .{
+                            m.path, m.ver.origin, m.ver.seq, peerName(p), peerName(alt), off,
+                        });
+                        if (self.incoming.getPtr(m.path)) |mp| mp.deadline_ms = now + fetch_timeout_ms;
+                        self.requestChunk(alt, m.path, m.ver, off);
+                        return;
+                    }
+                }
                 if (m.code == nack_missing or m.code == nack_stale) {
                     self.inst.abortFetch(m.path);
                     if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
@@ -1108,7 +1223,9 @@ pub const Daemon = struct {
     }
 
     fn startFetch(self: *Daemon, p: *Peer, path: []const u8, ver: Version, size: u64, sha: [32]u8, mode: u16, mtime_sec: i64, mtime_nsec: u32) void {
-        const meta = Incoming{ .ver = ver, .size = size, .sha256 = sha, .mode = mode, .mtime_sec = mtime_sec, .mtime_nsec = mtime_nsec, .deadline_ms = peer_mod.nowMs() + fetch_timeout_ms };
+        var meta = Incoming{ .ver = ver, .size = size, .sha256 = sha, .mode = mode, .mtime_sec = mtime_sec, .mtime_nsec = mtime_nsec, .deadline_ms = peer_mod.nowMs() + fetch_timeout_ms };
+        // Gap #10: the announce/resync source is always the FIRST choice.
+        if (p.node_id) |nid| meta.markTried(nid);
         const gop = self.incoming.getOrPut(path) catch return;
         if (!gop.found_existing)
             gop.key_ptr.* = self.alloc.dupe(u8, path) catch return;
@@ -1128,6 +1245,22 @@ pub const Daemon = struct {
     /// Receiver-driven pull: exactly one chunk in flight per fetch.
     fn requestChunk(self: *Daemon, p: *Peer, path: []const u8, ver: Version, offset: u64) void {
         self.pushTo(p, .{ .fetch_req = .{ .ver = ver, .offset = offset, .len = installer.chunk_size, .path = path } });
+    }
+
+    /// Gap #10: pick a fallback source for a fetch whose current source
+    /// NACKed with nack_missing.  Any converged peer can serve (full mesh,
+    /// no relaying); the tried-list prevents loops.  null = every ready
+    /// peer already tried (caller falls back to the abort/stall path).
+    fn pickAlternateSource(self: *Daemon, path: []const u8) ?*Peer {
+        const inc = self.incoming.getPtr(path) orelse return null;
+        for (self.peers.items) |q| {
+            if (q.state != .ready) continue;
+            const nid = q.node_id orelse continue;
+            if (inc.wasTried(nid)) continue;
+            inc.markTried(nid);
+            return q;
+        }
+        return null;
     }
 
     const nack_stale: u16 = 1;
@@ -1544,12 +1677,55 @@ pub const Daemon = struct {
     // ---- resync ----
 
     fn sendResyncReq(self: *Daemon, p: *Peer) void {
-        const vec = resync.buildVector(&self.cs);
-        self.pushTo(p, .{ .resync_req = vec });
+        // Full-record pull (rig-proven 2026-08-28): a conn drop mid-
+        // announce-burst loses queued frames, and the per-origin-MAX
+        // version vector cannot express the resulting hole — vector-diff
+        // resync reported "0 entries" while the requester was missing 934
+        // records (t-ringoverflow divergence).  An empty vector asks the
+        // peer to stream ALL records; entryAction idempotently ignores
+        // what we already hold and fetches the holes.  Reconnects are
+        // rare and trees are POC-scale; Phase 3's durable journal
+        // restores efficient diffing.
+        self.pushTo(p, .{ .resync_req = .{ .vector = undefined, .count = 0 } });
+    }
+
+    /// Gap #7 ack horizon: record the member's announced vector.
+    fn noteMemberVector(self: *Daemon, node_id: []const u8, req: protocol.ResyncReq) void {
+        const h = std.hash.Fnv1a_64.hash(node_id);
+        var slot: ?*resync.MemberVector = null;
+        for (&self.member_vectors) |*mv| {
+            if (mv.used and mv.node_hash == h) {
+                slot = mv;
+                break;
+            }
+            if (!mv.used and slot == null) slot = mv;
+        }
+        const mv = slot orelse return; // table full: TTL-only GC for this member
+        mv.used = true;
+        mv.node_hash = h;
+        for (req.vector[0..req.count]) |ve| mv.record(ve.origin, ve.max_seq);
+    }
+
+    /// Gap #7 horizon predicate: true when every configured peer has
+    /// reported a vector AND every reported vector covers ver.  A member
+    /// never heard from keeps TTL as the only retention bound (a wiped
+    /// member rejoining later resurrects — accepted; that is the TTL
+    /// window's documented failure mode).
+    fn ackCovers(ctx: *const anyopaque, ver: Version) bool {
+        const self: *const Daemon = @ptrCast(@alignCast(ctx));
+        var held: u64 = 0;
+        for (&self.member_vectors) |*mv| {
+            if (!mv.used) continue;
+            held += 1;
+            if (!mv.covers(ver)) return false;
+        }
+        return held >= self.cfg.num_peers;
     }
 
     fn onResyncReq(self: *Daemon, p: *Peer, m: protocol.ResyncReq) void {
         if (p.state != .ready) return;
+        // Gap #7: the requester's vector doubles as its ack horizon proof.
+        if (p.node_id) |nid| self.noteMemberVector(nid, m);
         var count: u64 = 0;
         var it = self.cs.map.iterator();
         while (it.next()) |e| {
@@ -1614,6 +1790,7 @@ pub const Daemon = struct {
         log(.info, "RESYNC from {s} complete: {d} entries", .{ peerName(p), count });
         if (!self.resynced) {
             self.resynced = true;
+            if (self.fs_frozen) return; // gap #16: no scan against the wrong fs
             // Post-join scan: local-only files (never in the group) join
             // the mesh as fresh local content.
             const stats = resync.scan(self.alloc, self.cfg.replicated_path, &self.cs, &self.jr, peer_mod.nowMs(), self.scanInflight()) catch return;
@@ -1691,12 +1868,22 @@ pub const Daemon = struct {
 
         // Rescan floor (ring overflow / unknown-dir events).
         if (self.need_rescan and now - self.last_rescan_ms >= rescan_cooldown_ms and self.resynced) {
-            self.need_rescan = false;
-            self.last_rescan_ms = now;
-            const stats = resync.scan(self.alloc, self.cfg.replicated_path, &self.cs, &self.jr, now, self.scanInflight()) catch return;
-            log(.info, "rescan: seen={d} new={d} mod={d} del={d}", .{
-                stats.seen, stats.announced_new, stats.announced_modified, stats.announced_deleted,
-            });
+            if (!self.rootFsidOk()) {
+                // Gap #16, runtime half: a forced unmount mid-run swapped
+                // the path to the parent fs's mountpoint — the tree LOOKS
+                // empty.  Defer (keep need_rescan set) instead of
+                // tombstoning the mesh; remount restores the fsid and the
+                // next pass converges automatically.
+                log(.err, "watched root fsid changed (forced unmount?) — rescan deferred, tombstones frozen", .{});
+                self.last_rescan_ms = now;
+            } else {
+                self.need_rescan = false;
+                self.last_rescan_ms = now;
+                const stats = resync.scan(self.alloc, self.cfg.replicated_path, &self.cs, &self.jr, now, self.scanInflight()) catch return;
+                log(.info, "rescan: seen={d} new={d} mod={d} del={d}", .{
+                    stats.seen, stats.announced_new, stats.announced_modified, stats.announced_deleted,
+                });
+            }
         }
 
         // Fetch timeouts: abandoned transfers are re-driven by the next
@@ -1733,12 +1920,14 @@ pub const Daemon = struct {
             self.cs.flush() catch {};
         }
 
-        // Tombstone GC (gap #7): TTL-bound range pass.  The all-member-ack
-        // horizon half of the retention rule lands with per-member ack
-        // tracking; TTL alone is the DFSR ConflictAndDeleted window.
+        // Tombstone GC (gap #7): collect when the 7-day TTL expired OR
+        // every configured member's announced vector covers the tombstone
+        // (the all-member-ack horizon — early collection for a healthy
+        // mesh).
         if (now - self.last_gc_ms >= gc_interval_ms) {
             self.last_gc_ms = now;
-            const collected = self.cs.gcTombstones(@intCast(@divFloor(now, 1000))) catch 0;
+            const horizon = contentset.AckHorizon{ .ctx = self, .covers = ackCovers };
+            const collected = self.cs.gcTombstones(@intCast(@divFloor(now, 1000)), horizon) catch 0;
             if (collected > 0)
                 log(.info, "tombstone GC: {d} collected", .{collected});
         }
@@ -1753,9 +1942,22 @@ pub const Daemon = struct {
         // renamed out of the tree and back.
         if (now - self.last_repush_ms >= repush_interval_ms) {
             self.last_repush_ms = now;
-            events.addRoot(self.dev_fd, self.cfg.replicated_path, 0) catch |err|
-                log(.warn, "watch-root re-push failed: {s}", .{@errorName(err)});
+            // Gap #16: never re-push while the root resolves to the wrong
+            // fs (forced unmount) — that would flag the parent fs's tree.
+            if (self.rootFsidOk()) {
+                events.addRoot(self.dev_fd, self.cfg.replicated_path, 0) catch |err|
+                    log(.warn, "watch-root re-push failed: {s}", .{@errorName(err)});
+            }
         }
+    }
+
+    /// Runtime half of the gap #16 forced-unmount guard: the CURRENT fsid
+    /// of the watched root must match what we indexed at start.  UFS/ZFS
+    /// fsids are mount-stable, so a remount restores the match.
+    fn rootFsidOk(self: *Daemon) bool {
+        if (self.fs_frozen) return false;
+        const cur = installer.fsidOf(self.cfg.replicated_path) catch return false;
+        return cur == self.tree_fsid;
     }
 
     fn cleanStaging(self: *Daemon) void {
@@ -1815,8 +2017,101 @@ pub const Daemon = struct {
             .conflicts_list => self.ctlConflictsList(out),
             .conflicts_restore => |name| self.ctlConflictsRestore(out, name),
             .conflicts_prune => |filter| self.ctlConflictsPrune(out, filter),
-            .unknown => out.appendSlice(self.alloc, "ERR unknown command (status|peers|backlog|journal|resync|conflicts list|restore <name>|prune [substr])\n") catch {},
+            .metrics => self.ctlMetrics(out),
+            .massdelete => self.ctlMassdelete(out, false),
+            .massdelete_resume => self.ctlMassdelete(out, true),
+            .unknown => out.appendSlice(self.alloc, "ERR unknown command (status|peers|backlog|journal|resync|metrics|conflicts list|restore <name>|prune [substr]|massdelete [resume])\n") catch {},
         }
+    }
+
+    /// SIGHUP runtime reconfig (gap #19).  Reloadable without restart:
+    /// the PSK (re-read from psk_file; applies to NEW handshakes — the
+    /// established conns already authenticated), the peer list (NEW
+    /// addresses get outbound dials; existing conns are untouched — a
+    /// peer REMOVAL needs a restart), and rate_limit (stored for the
+    /// Phase 3 enforcement).  Identity/topology fields (node_id,
+    /// replicated_path, state_dir, listen, primary, tls_*) are NOT
+    /// reloadable: a change logs a warning and keeps the running value.
+    fn reloadConfig(self: *Daemon) void {
+        const path = self.cfg_path orelse return;
+        const fresh = config.load(path) orelse {
+            log(.err, "SIGHUP: reload of {s} failed; keeping running config", .{path});
+            return;
+        };
+        const cfg = self.cfg;
+        if (!std.mem.eql(u8, fresh.node_id, cfg.node_id))
+            log(.warn, "SIGHUP: node_id change ({s} -> {s}) requires restart; ignored", .{ cfg.node_id, fresh.node_id });
+        if (!std.mem.eql(u8, fresh.replicated_path, cfg.replicated_path))
+            log(.warn, "SIGHUP: replicated_path change ({s} -> {s}) requires restart; ignored", .{ cfg.replicated_path, fresh.replicated_path });
+        if (!std.mem.eql(u8, fresh.state_dir, cfg.state_dir))
+            log(.warn, "SIGHUP: state_dir change ({s} -> {s}) requires restart; ignored", .{ cfg.state_dir, fresh.state_dir });
+        if (!std.mem.eql(u8, fresh.listen, cfg.listen))
+            log(.warn, "SIGHUP: listen change ({s} -> {s}) requires restart; ignored", .{ cfg.listen, fresh.listen });
+        if (fresh.primary != cfg.primary)
+            log(.warn, "SIGHUP: primary change requires restart; ignored", .{});
+        if (!std.mem.eql(u8, fresh.tls_cert, cfg.tls_cert) or
+            !std.mem.eql(u8, fresh.tls_key, cfg.tls_key) or
+            !std.mem.eql(u8, fresh.tls_ca, cfg.tls_ca))
+            log(.warn, "SIGHUP: tls_* changes require restart; ignored", .{});
+        if (fresh.rate_limit != cfg.rate_limit)
+            log(.info, "SIGHUP: rate_limit now {d} bytes/sec (enforcement is Phase 3)", .{fresh.rate_limit});
+
+        // PSK re-read (even if psk_file path is unchanged — the CONTENT
+        // may have been rotated).
+        if (fresh.psk_file.len > 0) {
+            if (std.fs.cwd().readFileAlloc(self.alloc, fresh.psk_file, 4096)) |buf| {
+                defer self.alloc.free(buf);
+                const trimmed = std.mem.trim(u8, buf, " \t\r\n");
+                if (trimmed.len == 0) {
+                    log(.err, "SIGHUP: psk_file {s} is empty; keeping current PSK", .{fresh.psk_file});
+                } else if (std.mem.eql(u8, trimmed, self.psk)) {
+                    log(.info, "SIGHUP: PSK unchanged", .{});
+                } else if (self.alloc.dupe(u8, trimmed)) |owned| {
+                    if (self.psk_owned) |old| self.alloc.free(old);
+                    self.psk_owned = owned;
+                    self.psk = owned;
+                    log(.info, "SIGHUP: PSK reloaded (applies to new handshakes)", .{});
+                } else |_| {
+                    log(.err, "SIGHUP: PSK reload allocation failed; keeping current PSK", .{});
+                }
+            } else |err| {
+                log(.err, "SIGHUP: cannot read psk_file {s}: {s}; keeping current PSK", .{ fresh.psk_file, @errorName(err) });
+            }
+        }
+
+        // New peers get outbound dials; existing conns are untouched.
+        var added: u64 = 0;
+        for (fresh.peers[0..fresh.num_peers]) |peer_text| {
+            const addr = server.parseHostPort(peer_text) catch {
+                log(.warn, "SIGHUP: bad peer address {s}; skipped", .{peer_text});
+                continue;
+            };
+            var nbuf: [64]u8 = undefined;
+            const norm = std.fmt.bufPrint(&nbuf, "{f}", .{addr}) catch continue;
+            var known = false;
+            for (self.peers.items) |p| {
+                const pa = p.addr orelse continue;
+                var ebuf: [64]u8 = undefined;
+                const es = std.fmt.bufPrint(&ebuf, "{f}", .{pa}) catch continue;
+                if (std.mem.eql(u8, norm, es)) {
+                    known = true;
+                    break;
+                }
+            }
+            if (known) continue;
+            const p = self.alloc.create(Peer) catch break;
+            p.* = Peer.init(self.alloc);
+            p.outbound = true;
+            p.addr = addr;
+            p.next_retry_ms = 0; // dial on the next timer pass
+            self.peers.append(self.alloc, p) catch {
+                self.alloc.destroy(p);
+                break;
+            };
+            added += 1;
+            log(.info, "SIGHUP: new peer {s} (dialing)", .{norm});
+        }
+        log(.info, "SIGHUP: reload done ({d} new peers, {d} configured total)", .{ added, fresh.num_peers });
     }
 
     fn ctlStatus(self: *Daemon, out: *std.ArrayList(u8)) void {
@@ -1841,6 +2136,87 @@ pub const Daemon = struct {
         self.ctlPrint(out, "ring_seq: {d}\n", .{self.cs.ring_seq});
         self.ctlPrint(out, "state_at_open: {s}\n", .{if (self.cs.needs_scan) "empty/corrupt (rebuilt via scan floor)" else "loaded"});
         self.ctlPrint(out, "incoming: {d} fetches ({d} completing)\n", .{ self.incoming.count(), completing });
+        self.ctlPrint(out, "mass-delete guard: {s} ({d} deletes in window)\n", .{
+            if (self.guard.latched) "LATCHED — local tombstones suppressed" else "clear",
+            self.guard.count,
+        });
+        self.ctlPrint(out, "fs: {s}\n", .{if (self.fs_frozen) "FROZEN (fsid mismatch — see log)" else "ok"});
+    }
+
+    /// Prometheus text exposition (gauges; brfsctl prepends the kernel
+    /// counters).  brfs_member_vector_lag is the convergence health check:
+    /// per member, the total seq distance between our content set and the
+    /// member's last announced vector — 0 on every member means the mesh
+    /// is caught up.
+    fn ctlMetrics(self: *Daemon, out: *std.ArrayList(u8)) void {
+        var live: u64 = 0;
+        var tombs: u64 = 0;
+        var it = self.cs.map.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.state == .live) live += 1 else tombs += 1;
+        }
+        var completing: u64 = 0;
+        var iit = self.incoming.iterator();
+        while (iit.next()) |e| {
+            if (e.value_ptr.completing) completing += 1;
+        }
+        var peers_ready: u64 = 0;
+        for (self.peers.items) |p| {
+            if (p.state == .ready) peers_ready += 1;
+        }
+        self.comp.mutex.lock();
+        const comp_jobs = self.comp.jobs.items.len;
+        self.comp.mutex.unlock();
+
+        self.ctlPrint(out, "# TYPE brfs_records gauge\n", .{});
+        self.ctlPrint(out, "brfs_records{{node=\"{s}\",state=\"live\"}} {d}\n", .{ self.cfg.node_id, live });
+        self.ctlPrint(out, "brfs_records{{node=\"{s}\",state=\"tombstone\"}} {d}\n", .{ self.cfg.node_id, tombs });
+        self.ctlPrint(out, "# TYPE brfs_incoming_fetches gauge\n", .{});
+        self.ctlPrint(out, "brfs_incoming_fetches{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.incoming.count() });
+        self.ctlPrint(out, "brfs_incoming_completing{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, completing });
+        self.ctlPrint(out, "# TYPE brfs_journal_pending gauge\n", .{});
+        self.ctlPrint(out, "brfs_journal_pending{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.jr.pendingCount() });
+        self.ctlPrint(out, "# TYPE brfs_completion_queue gauge\n", .{});
+        self.ctlPrint(out, "brfs_completion_queue{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, comp_jobs });
+        self.ctlPrint(out, "# TYPE brfs_peers gauge\n", .{});
+        self.ctlPrint(out, "brfs_peers{{node=\"{s}\",state=\"ready\"}} {d}\n", .{ self.cfg.node_id, peers_ready });
+        self.ctlPrint(out, "brfs_peers{{node=\"{s}\",state=\"total\"}} {d}\n", .{ self.cfg.node_id, self.peers.items.len });
+        self.ctlPrint(out, "# TYPE brfs_massdelete_latched gauge\n", .{});
+        self.ctlPrint(out, "brfs_massdelete_latched{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.guard.latched) });
+        self.ctlPrint(out, "# TYPE brfs_fs_frozen gauge\n", .{});
+        self.ctlPrint(out, "brfs_fs_frozen{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.fs_frozen) });
+        self.ctlPrint(out, "# TYPE brfs_resynced gauge\n", .{});
+        self.ctlPrint(out, "brfs_resynced{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.resynced) });
+        self.ctlPrint(out, "# TYPE brfs_ring_seq gauge\n", .{});
+        self.ctlPrint(out, "brfs_ring_seq{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.cs.ring_seq });
+
+        const ours = resync.buildVector(&self.cs);
+        self.ctlPrint(out, "# TYPE brfs_member_vector_lag gauge\n", .{});
+        for (&self.member_vectors) |*mv| {
+            if (!mv.used) continue;
+            var lag: u64 = 0;
+            for (ours.vector[0..ours.count]) |ve| {
+                lag += ve.max_seq -| mv.maxSeq(ve.origin);
+            }
+            self.ctlPrint(out, "brfs_member_vector_lag{{node=\"{s}\",member=\"{x}\"}} {d}\n", .{ self.cfg.node_id, mv.node_hash, lag });
+        }
+    }
+
+    fn ctlMassdelete(self: *Daemon, out: *std.ArrayList(u8), do_resume: bool) void {
+        if (!do_resume) {
+            self.ctlPrint(out, "mass-delete guard: {s}\n", .{if (self.guard.latched) "LATCHED (local tombstones suppressed)" else "clear"});
+            self.ctlPrint(out, "window: {d} deletes / {d}ms (trips at >= {d} deletes AND > 50% of the live tree)\n", .{
+                self.guard.count, guard_mod.window_ms, guard_mod.floor,
+            });
+            return;
+        }
+        const was = self.guard.latched;
+        self.guard.release(peer_mod.nowMs());
+        // The rescan floor re-derives the suppressed deletes as honest
+        // tombstones: an intentional rm -rf still converges, one
+        // confirmation later.
+        self.need_rescan = true;
+        self.ctlPrint(out, "mass-delete guard released ({s}); rescan scheduled\n", .{if (was) "was latched" else "was not latched"});
     }
 
     fn ctlPeers(self: *Daemon, out: *std.ArrayList(u8)) void {
@@ -1972,4 +2348,33 @@ pub const Daemon = struct {
 
 fn peerName(p: *Peer) []const u8 {
     return p.node_id orelse "?";
+}
+
+// ---- tests ----
+
+test "incoming tried-list dedups and bounds source fallbacks" {
+    const t = std.testing;
+    var inc = Incoming{
+        .ver = .{},
+        .size = 0,
+        .sha256 = [_]u8{0} ** 32,
+        .mode = 0,
+        .mtime_sec = 0,
+        .mtime_nsec = 0,
+        .deadline_ms = 0,
+    };
+    try t.expect(!inc.wasTried("node-a"));
+    inc.markTried("node-a");
+    try t.expect(inc.wasTried("node-a"));
+    try t.expect(!inc.wasTried("node-b"));
+    inc.markTried("node-a"); // no duplicate growth
+    try t.expectEqual(@as(u8, 1), inc.tried_n);
+    // Bounded: never grows past max_peers.
+    var i: usize = 0;
+    while (i < config.max_peers + 4) : (i += 1) {
+        var buf: [24]u8 = undefined;
+        const nid = std.fmt.bufPrint(&buf, "n{d}", .{i}) catch unreachable;
+        inc.markTried(nid);
+    }
+    try t.expectEqual(@as(u8, config.max_peers), inc.tried_n);
 }

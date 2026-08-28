@@ -1,0 +1,126 @@
+.Dd August 28, 2026
+.Dt BRFS 4
+.Os
+.Sh NAME
+.Nm brfs
+.Nd BrFS kernel event tap (VOP_INOTIFY interposition + change-event ring)
+.Sh SYNOPSIS
+.Cd "kldload brfs"
+.Pp
+In
+.Pa loader.conf :
+.Cd brfs_load="YES"
+.Sh DESCRIPTION
+The
+.Nm
+kernel module is the only change feed of the BrFS replication system.
+It interposes the
+.Fn vop_inotify
+slot of the vnode operation vectors of watched filesystems (UFS and ZFS
+alike, at the VOP dispatch layer), keeps the
+.Dv VIRF_INOTIFY / VIRF_INOTIFY_PARENT
+gate flags set on vnodes under registered watch roots, and delivers
+fixed-size 512-byte event records
+.Pq Vt struct brfs_event
+through a fixed-size ring behind the
+.Pa /dev/brfs
+character device.
+.Pp
+Events carry an operation
+(create, modify, delete, move_from, move_to, attrib, overflow),
+a rename cookie pairing move_from with move_to, filesystem id, directory
+and subject fileids, the subject generation number, and the last path
+component.
+No path resolution happens in the kernel.
+When the ring wraps, in-band
+.Dv BRFS_OP_OVERFLOW
+markers are injected; the daemon treats them as a rescan trigger.
+.Pp
+The tap is emit-all: it performs no lineage filtering.
+Consumers discard events whose directory fileids are outside their
+registered roots.
+The interposition is a runtime assertion on
+.Fn vop_stdinotify :
+a vector whose slot has been overridden by another agent is left
+untouched, and
+.Nm
+must remain the only interposer of
+.Fn vop_inotify
+(see
+.Pa docs/design-decisions.md ,
+gap #14).
+.Ss Device
+.Pa /dev/brfs
+is created mode 0600, owned by root:wheel, and guarded single-open
+(second
+.Xr open 2
+fails
+.Er EBUSY ) .
+It is read with ordinary
+.Xr read 2
+or polled via
+.Xr kqueue 2
+.Dv EVFILT_READ .
+The following
+.Xr ioctl 2
+requests are defined in
+.In kmod/brfs.h :
+.Bl -tag -width "BRFSIOC_GETSTATS"
+.It Dv BRFSIOC_ADDROOT
+Register a watch root (path + op mask; mask is reserved and currently
+unused, pass 0).
+Idempotent; re-registering re-resolves, re-flags, and re-patches.
+.It Dv BRFSIOC_DELROOT
+Remove a watch root and strip the gate flags under it.
+.It Dv BRFSIOC_GETSTATS
+Return ring counters
+.Pq Vt struct brfs_stats .
+.It Dv BRFSIOC_FLUSH
+Drain the ring without reading.
+.El
+.Ss Jails
+Jails cannot load kernel modules;
+.Nm
+loads on the host kernel and a jailed
+.Xr brfsd 8
+consumes
+.Pa /dev/brfs
+through the jail's devfs ruleset (see
+.Pa etc/devfs.rules.sample ) .
+Registration is namespace-clean: a jail can only watch subtrees it can
+itself resolve.
+.Sh SYSCTL VARIABLES
+The following variables are available under
+.Va security.brfs :
+.Bl -tag -width "files_flagged"
+.It Va enabled
+Master gate for event emission (readable and writable).
+.It Va ring_size
+Ring capacity in events (read-only tunable, default 4096).
+.It Va log_events
+Log every emitted event to the kernel message buffer (debugging).
+.It Va event_count
+Total events pushed since load.
+.It Va ring_drops
+Events dropped on ring overflow.
+.It Va tap_seen
+vop_inotify interposer invocations.
+.It Va tap_emitted
+Mutation events emitted by the tap.
+.It Va dirs_flagged
+Directories flagged VIRF_INOTIFY.
+.It Va files_flagged
+Files flagged VIRF_INOTIFY_PARENT.
+.It Va test_event
+Write-only: push N synthetic events (delivery-path validation).
+.El
+.Sh SEE ALSO
+.Xr brfs.conf 5 ,
+.Xr brfsctl 8 ,
+.Xr brfsd 8
+.Sh HISTORY
+The
+.Nm
+module first appeared in the BrFS POC in August 2026.
+.Sh AUTHORS
+.An Daniel Morante Aq Mt daniel@morante.net

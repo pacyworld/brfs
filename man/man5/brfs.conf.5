@@ -1,0 +1,110 @@
+.Dd August 28, 2026
+.Dt BRFS.CONF 5
+.Os
+.Sh NAME
+.Nm brfs.conf
+.Nd BrFS replication daemon configuration file
+.Sh DESCRIPTION
+The
+.Nm
+file is the single source of truth for a BrFS node, in UCL syntax.
+The kernel module never reads it;
+.Xr brfsd 8
+parses it and pushes what
+.Xr brfs 4
+needs via ioctl at startup.
+.Pp
+The following keys are recognized:
+.Bl -tag -width "replicated_path"
+.It Va node_id Pq string, required
+Unique identifier of this node in the replication group.
+Used as the last-writer-wins tiebreak: conflicts resolve by
+(origin_seq, node_id).
+.It Va replicated_path Pq absolute path, required
+The replicated folder: an ordinary local tree on UFS2 or ZFS.
+No new mount point; every member holds a full local copy.
+.It Va state_dir Pq absolute path, default: Pa /var/db/brfs
+Daemon state: content set, staging area, conflict quarantine.
+The staging area MUST be on the same filesystem as
+.Va replicated_path
+(the atomic-rename requirement) and MUST NOT be inside it (a watched
+staging directory is a self-echo storm).
+A sibling directory on the same filesystem is the canonical layout.
+.It Va listen Pq string, required
+Peer listener address
+.Pq Qq host:port
+for the replication protocol.
+.It Va peers Pq string array, required, max 16
+Every other member of the group (full mesh).
+Numeric addresses only in the POC.
+.It Va psk_file Pq path
+File containing the pre-shared key for the HELLO handshake.
+The PSK still runs over TLS when TLS is enabled (defense in depth).
+.It Va primary Pq bool, default: false
+Initial-seed role: exactly one node starts with
+.Va primary
+set; it treats its local tree as authoritative.
+Every other member starts with an empty content set and pulls via RESYNC
+before announcing anything local.
+.It Va rate_limit Pq integer, default: 0
+Outbound transfer cap in bytes/sec; 0 = unlimited.
+Parsed but not yet enforced (Phase 3).
+.It Va tls_cert , tls_key , tls_ca Pq paths
+TLS/mTLS for all peer connections (TLS 1.3 minimum, KTLS offload when the
+kernel supports it).
+Validation is DANE TLSA-first with the local trust store as fallback
+(DNSSEC is out of scope).
+All of
+.Va tls_cert
+and
+.Va tls_key
+must be set to enable TLS;
+.Va tls_ca
+selects the fallback trust anchor.
+Without these, peers fall back to plain TCP + PSK (air-gapped mode).
+.It Va events_drop Pq string array, default: empty
+Event classes to drop at intake (selective filtering).
+Valid names:
+.Qq create ,
+.Qq modify ,
+.Qq delete ,
+.Qq move_from ,
+.Qq move_to ,
+.Qq attrib .
+.Qq overflow
+is never droppable.
+Dropped classes are recovered by the scan floor, NOT in real time; use
+this to shed noisy classes (attrib = mode/mtime churn), not for content
+filtering.
+Changing this key requires a restart.
+.El
+.Sh SIGNALS AND RELOAD
+Sending
+.Dv SIGHUP
+to
+.Xr brfsd 8
+re-reads this file.
+Reloadable at runtime:
+.Va psk_file
+content, additions to
+.Va peers ,
+and
+.Va rate_limit .
+All other keys require a restart; a change to one is logged as a warning
+and ignored.
+A reload that fails to parse keeps the running configuration.
+.Sh EXAMPLES
+See
+.Pa etc/brfs.conf.sample
+in the source tree (installed as
+.Pa /usr/local/etc/brfs.conf.sample ) .
+.Sh SEE ALSO
+.Xr brfs 4 ,
+.Xr brfsctl 8 ,
+.Xr brfsd 8
+.Sh HISTORY
+The
+.Nm
+format first appeared in the BrFS POC in August 2026.
+.Sh AUTHORS
+.An Daniel Morante Aq Mt daniel@morante.net

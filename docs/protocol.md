@@ -47,6 +47,15 @@ RESYNC_ENTRY carries `state` (1=live, 2=deleted) so tombstones propagate
 during catch-up. Rename cookie 0 is a valid cookie (first rename after
 boot); pair by cookie value, not by "nonzero".
 
+**RESYNC_REQ is always sent with an empty vector (full-record pull).**
+Rig-proven 2026-08-28: a conn drop mid-announce-burst loses queued frames,
+and the per-origin-MAX vector cannot express the resulting hole — a
+vector-diff answer of "0 entries" left a node missing 934 records
+permanently. An empty vector asks the peer to stream ALL records; the
+receiver's per-entry decision idempotently ignores what it already holds
+and fetches only the holes. The vector field remains on the wire (and is
+still parsed) for a future efficient-diff mode (Phase 3 durable journal).
+
 Decoding is strict: every byte of the payload must be consumed
 (TrailingGarbage), every length field must fit the frame (Truncated), and
 paths must pass the validation below before ANY filesystem use.
@@ -109,6 +118,21 @@ All paths in incoming messages are validated before ANY filesystem use:
 relative to the replicated root, no empty components, no `.`/`..`
 components, no leading `/`. Violations are dropped and the peer is
 demoted (logged; repeated violations = disconnect).
+
+## Fetch source selection (gap #10)
+
+A fetch goes to the peer whose ANNOUNCE/RESYNC_ENTRY started it (the
+presumed holder). A NACK for the *current* fetch attempt is handled by
+code: `missing` (the source does not hold the record/version) triggers a
+**source fallback** — the receiver keeps its staged bytes and resumes the
+pull at the current offset from another ready peer (full mesh: any
+converged peer can serve; tried-sources are tracked per fetch so fallback
+never loops; when every ready peer has been tried, the fetch aborts and
+the stall sweep / next ANNOUNCE / RESYNC re-drives it). `stale` (the
+record moved on at the source) aborts the fetch — the NACKer re-ANNOUNCEs
+the fresh version, which re-drives the pull. A NACK whose version does not
+match the current attempt is ignored (superseded attempts must not kill a
+fresh fetch).
 
 ## Ordering
 

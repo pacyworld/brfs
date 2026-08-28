@@ -15,6 +15,26 @@ pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa_state.allocator();
 
+    // Block process-directed signals BEFORE any thread spawns: the kernel
+    // delivers a process signal to ANY thread not masking it, and the
+    // drainer/completion threads inherit this mask — without it a HUP/TERM
+    // can land on a worker and kill the process outright (rig-proven: the
+    // SIGHUP reload was logged on the core thread in one race and the
+    // process died silently in another).  nohup/daemon(8) supervision
+    // starts us with SIGHUP=SIG_IGN, which EVFILT_SIGNAL never reports —
+    // reset the disposition to DFL; the mask keeps delivery deferred.
+    var sigmask = posix.sigemptyset();
+    _ = std.c.sigaddset(&sigmask, 15);
+    _ = std.c.sigaddset(&sigmask, 2);
+    _ = std.c.sigaddset(&sigmask, 1);
+    _ = std.c.sigprocmask(std.c.SIG.BLOCK, &sigmask, null);
+    const dfl = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(1, &dfl, null);
+
     var config_path: [*:0]const u8 = default_config_path;
 
     var args = std.process.args();
@@ -80,6 +100,7 @@ pub fn main() !void {
     _ = std.c.fcntl(pfds[1], 4, fl | @as(c_int, 0x0004));
 
     var d = try daemon.Daemon.init(alloc, &cfg, psk, dev_fd, pfds[0], pfds[1]);
+    d.cfg_path = config_path; // SIGHUP reload (gap #19)
 
     const drainer = try std.Thread.spawn(.{}, daemon.drainerEntry, .{ dev_fd, &d.evq });
     drainer.detach();
@@ -100,4 +121,5 @@ test {
     std.testing.refAllDecls(@import("ctl.zig"));
     std.testing.refAllDecls(@import("daemon.zig"));
     std.testing.refAllDecls(@import("tls.zig"));
+    std.testing.refAllDecls(@import("guard.zig"));
 }
