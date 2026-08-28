@@ -758,8 +758,13 @@ pub const Daemon = struct {
         var r = rec.*;
         r.state = .deleted;
         r.ver = ver;
+        const is_dir = r.is_dir;
+        // NOTE: rec is a pointer into the hashmap's internal storage;
+        // upsert may resize the map (even for existing keys getOrPut
+        // checks load factor first), so rec is potentially dangling after
+        // this call.  Use the stack-local copy `r` for any field access.
         self.cs.upsert(e.path, r) catch return;
-        self.broadcast(.{ .tombstone = .{ .ver = ver, .is_dir = rec.is_dir, .path = e.path } });
+        self.broadcast(.{ .tombstone = .{ .ver = ver, .is_dir = is_dir, .path = e.path } });
         log(.info, "tombstone {s} v=({x},{d})", .{ e.path, ver.origin, ver.seq });
     }
 
@@ -771,9 +776,13 @@ pub const Daemon = struct {
             return;
         };
         const ver = self.cs.nextVersion();
+        // Copy the record by value BEFORE any upsert: rec is a pointer
+        // into the hashmap's internal storage and may be invalidated by
+        // upsert (getOrPut can resize even for existing keys).
         var dst = rec.*;
         dst.ver = ver;
         dst.state = .live;
+        const is_dir = dst.is_dir;
         // Refresh identity from the destination.
         if (self.inst.absPath(r.to)) |abs| {
             defer self.alloc.free(abs);
@@ -786,15 +795,16 @@ pub const Daemon = struct {
             } else |_| {}
         } else |_| {}
         self.cs.upsert(r.to, dst) catch return;
-        var tomb = rec.*;
+        // rec is now potentially dangling — use dst (stack copy) only.
+        var tomb = dst;
         tomb.state = .deleted;
         tomb.ver = ver;
         self.cs.upsert(r.from, tomb) catch return;
 
         self.move_cookie +%= 1;
         const cookie = self.move_cookie;
-        self.broadcast(.{ .move_from = .{ .ver = ver, .is_dir = rec.is_dir, .cookie = cookie, .path = r.from } });
-        self.broadcast(.{ .move_to = .{ .ver = ver, .is_dir = rec.is_dir, .cookie = cookie, .path = r.to } });
+        self.broadcast(.{ .move_from = .{ .ver = ver, .is_dir = is_dir, .cookie = cookie, .path = r.from } });
+        self.broadcast(.{ .move_to = .{ .ver = ver, .is_dir = is_dir, .cookie = cookie, .path = r.to } });
         log(.info, "rename {s} -> {s} v=({x},{d})", .{ r.from, r.to, ver.origin, ver.seq });
 
         if (r.dirty) {
@@ -1474,6 +1484,8 @@ pub const Daemon = struct {
             return;
         };
 
+        // Copy by value BEFORE any upsert: from_rec is a pointer into the
+        // hashmap's internal storage and may be invalidated if the map grows.
         var dst = from_rec.?.*;
         dst.ver = m.ver;
         dst.state = .live;
@@ -1484,7 +1496,8 @@ pub const Daemon = struct {
             dst.mtime_nsec = @intCast(@max(st.mtim.nsec, 0));
         } else |_| {}
         self.cs.upsert(m.path, dst) catch {};
-        var tomb = from_rec.?.*;
+        // from_rec is now potentially dangling — use dst (stack copy).
+        var tomb = dst;
         tomb.state = .deleted;
         tomb.ver = m.ver;
         self.cs.upsert(mv.path, tomb) catch {};
