@@ -29,6 +29,9 @@ pub const Config = struct {
     tls_cert: []const u8 = "",
     tls_key: []const u8 = "",
     tls_ca: []const u8 = "",
+    /// KTLS offload toggle (escape hatch if kernel TLS misbehaves on a
+    /// given kernel/NIC combination).
+    tls_ktls: bool = true,
     /// Gap #11: op classes to drop at event intake (selective filtering;
     /// bitmask of events.opBit).  The kmod tap stays emit-all — kernel-side
     /// per-root attribution would need the lineage walk the emit-all
@@ -96,6 +99,7 @@ pub fn load(path: [*:0]const u8) ?Config {
     if (getString(root, "tls_cert")) |v| cfg.tls_cert = v;
     if (getString(root, "tls_key")) |v| cfg.tls_key = v;
     if (getString(root, "tls_ca")) |v| cfg.tls_ca = v;
+    if (root.lookup("tls_ktls")) |obj| cfg.tls_ktls = obj.toBool();
 
     if (root.lookup("rate_limit")) |obj| {
         cfg.rate_limit = switch (obj.objectType()) {

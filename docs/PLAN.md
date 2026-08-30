@@ -380,24 +380,44 @@ ring overflow→rescan. All repeated with mid-test daemon restarts.
 Out of POC scope: deltas, durable journal, sync mode, auth beyond PSK,
 ACL/symlink/device propagation, >3 nodes, WAN.
 
-### WAN / chaos track (added 2026-08-24, user)
+### WAN / chaos track (added 2026-08-24, user; **DONE 2026-08-29**)
 
 The deployment target is cross-region WAN: three regions (FL/NY/SD,
 10.7.7/8/6.0/24) interconnected by IPsec tunnels through OPNsense — tens of
-ms of RTT, occasional loss, tunnel MTU quirks.  Once the engine matures
-(post-Phase 2), add a degradation matrix on the rig using FreeBSD's
-netgraph — `ng_netem(4)` inserted on the guest vtnet path (or dummynet
-pipes scoped to peer-pair traffic as the firewall-touching alternative;
-console access via vmctl-brfs is the lockout fallback):
+ms of RTT, occasional loss, tunnel MTU quirks.  Rig:
+`tests/vm/t21-t24-wan.sh` (host driver) + `tests/vm/brfs-wan-ctl.sh`
+(guest helper) — dummynet pipes scoped to peer-pair traffic, one outbound
+rule per peer per node; ssh from the host never matches a rule, so no
+lockout is possible.  `ng_netem(4)` is GONE from FreeBSD 15.1 (no module,
+no source in sys/netgraph); ng_pipe(4) was validated as an L2 alternative
+and abandoned (impairs the ssh control channel, 100 Hz tick inflates
+configured delays).  ipfw must be loaded with
+`kenv net.inet.ip.fw.default_to_accept=1` FIRST — a cold `kldload ipfw`
+installs default-deny and instantly locks out ssh (brfs-a needed a bhyve
+reboot).
 
-- T21 latency: 25/50/100 ms added per link — convergence must hold,
-  fetch timeouts must not false-fire (stall detector, not deadline).
-- T22 loss: 0.5%/2% packet drop — TCP hides it, watch for pathological
-  re-fetch loops (hash-mismatch requeue is bounded; verify).
-- T23 bandwidth cap: 10/1 Mbps — wbuf saturation drops the conn and
-  resync heals; no livelock (backoff + dial suppression).
-- T24 partition: ngctl shutdown a link for N minutes of writes, heal —
-  full convergence via RESYNC (already the T6 mechanism, at WAN scale).
+- T21 latency (measured 14/33/96 ms link RTT): convergence holds
+  (12 files cross-origin in 4-5 s per tier), stall detector never
+  false-fired, no wbuf saturation.
+- T22 loss 0.5%/2% plr: convergence holds; serving count EXACTLY at
+  expectation (48 chunks for 8x1MiB + 1x16MiB to two requesters, both
+  tiers) — no re-fetch loop; zero hash mismatches (TLS+TCP integrity).
+- T23 bandwidth cap: 10 Mbps converges clean (32 MiB in 34 s, no
+  saturation); 1 Mbps with a 96 MiB burst trips the 64 MiB wbuf cap as
+  designed (8-10 "send queue saturated" drops in 150 s), progress
+  continues between drops (no livelock), and full convergence follows
+  once the cap lifts.
+- T24 partition: node C fully cut (plr 1 on both directions of both its
+  links) for ~3 min of writes at ~39 ms RTT; partition held both ways
+  (verified); heal + RESYNC converged all 42 files everywhere; zero
+  quarantines.
+
+**The track caught two real WAN-fatal TLS bugs** (invisible on LAN where
+sockets never backpressure): missing partial-write modes corrupted the
+record stream on `WANT_WRITE` retry after a wbuf realloc, and KTLS
+retained the caller's freed buffer pointer across an interrupted write
+(EFAULT, conn drop).  Both fixed; see "Nonblocking TLS writes under
+backpressure" in docs/design-decisions.md.
 
 ## Packaging (after POC)
 

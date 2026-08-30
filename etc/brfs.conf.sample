@@ -27,8 +27,21 @@ peers = [
     "10.66.0.13:4590",
 ]
 
-# Pre-shared key for the POC HELLO handshake. TLS replaces this later.
+# Pre-shared key for the POC HELLO handshake. When TLS is configured the
+# PSK still runs over the encrypted channel (defense in depth).
 psk_file = "/usr/local/etc/brfs.psk"
+
+# TLS/mTLS for all peer connections (TLS 1.3 minimum, DANE TLSA-first
+# validation with the local trust store as fallback). Without these,
+# peers fall back to plain TCP + PSK (air-gapped mode).
+# tls_cert = "/usr/local/etc/brfs/node.crt"
+# tls_key = "/usr/local/etc/brfs/node.key"
+# tls_ca = "/usr/local/etc/brfs/ca.crt"
+
+# KTLS offload (default true): kernel handles symmetric TLS crypto after
+# the handshake. Set false to force userspace crypto (debugging escape
+# hatch).
+# tls_ktls = false
 
 # Initial seed (gap #8): exactly one node starts with primary = true; it
 # treats its local tree as authoritative. Every other member starts with

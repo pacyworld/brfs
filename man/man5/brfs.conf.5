@@ -62,6 +62,11 @@ must be set to enable TLS;
 .Va tls_ca
 selects the fallback trust anchor.
 Without these, peers fall back to plain TCP + PSK (air-gapped mode).
+.It Va tls_ktls Pq boolean, default: true
+Kernel TLS offload for peer connections.
+Escape hatch to force userspace TLS crypto if kernel TLS misbehaves on a
+given kernel/NIC combination.
+Requires restart.
 .It Va events_drop Pq string array, default: empty
 Event classes to drop at intake (selective filtering).
 Valid names:

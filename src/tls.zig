@@ -31,6 +31,19 @@ const c = @cImport({
 /// read/write on the socket.  Silently ignored if unsupported.
 const SSL_OP_ENABLE_KTLS: c_ulong = 0x8;
 
+/// Non-blocking event-loop modes.  Without PARTIAL_WRITE an SSL_write
+/// that hits backpressure returns WANT_* with an internal pending state
+/// pointing at the CALLER's buffer, and the retry must pass the identical
+/// pointer — the peer wbuf is an ArrayList that reallocs on append, so a
+/// frame queued between attempts moved the pointer and corrupted the TLS
+/// record stream (bad record MAC -> mutual conn drop).  Rig-proven
+/// 2026-08-29: TLS bursts through delayed links (dummynet/ng_pipe)
+/// flapped every 30s while plain TCP was healthy.  PARTIAL_WRITE makes
+/// SSL_write consume-and-report like write(2); MOVING_WRITE_BUFFER makes
+/// retries safe after a realloc.
+const SSL_MODE_ENABLE_PARTIAL_WRITE: c_ulong = 0x1;
+const SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER: c_ulong = 0x2;
+
 /// Result of a non-blocking TLS handshake attempt.
 pub const HandshakeResult = enum {
     complete,
@@ -81,6 +94,7 @@ pub const TlsContext = struct {
         cert_path: [*:0]const u8,
         key_path: [*:0]const u8,
         ca_path: ?[*:0]const u8,
+        enable_ktls: bool,
     ) TlsError!TlsContext {
         const method = c.TLS_method() orelse return TlsError.InitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return TlsError.InitFailed;
@@ -114,9 +128,13 @@ pub const TlsContext = struct {
         // TLS 1.3 minimum (strongest available; supported by our rig)
         _ = c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_3_VERSION);
 
+        // Non-blocking partial-write modes (see constants above).
+        _ = c.SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
         // Enable KTLS — offloads symmetric crypto to kernel after handshake.
         // Silently ignored if kernel or library lacks support.
-        _ = c.SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+        if (enable_ktls)
+            _ = c.SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
 
         return TlsContext{ .ctx = ctx };
     }
@@ -184,7 +202,10 @@ pub const TlsConn = struct {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
             c.SSL_ERROR_ZERO_RETURN => TlsError.ConnectionClosed,
-            else => TlsError.ReadFailed,
+            else => {
+                logSslError("read", err);
+                return TlsError.ReadFailed;
+            },
         };
     }
 
@@ -198,7 +219,10 @@ pub const TlsConn = struct {
         return switch (err) {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
-            else => TlsError.WriteFailed,
+            else => {
+                logSslError("write", err);
+                return TlsError.WriteFailed;
+            },
         };
     }
 
@@ -240,6 +264,21 @@ pub const TlsConn = struct {
 
 fn drainErrorQueue() void {
     while (c.ERR_get_error() != 0) {}
+}
+
+/// Rig diagnostics: surface the OpenSSL error behind a failed SSL_read/
+/// SSL_write (stderr -> daemon log).  Without this, "read failed"/
+/// "write failed" drops are opaque.
+fn logSslError(comptime op: []const u8, ssl_err: c_int) void {
+    var ebuf: [256]u8 = undefined;
+    const code = c.ERR_get_error();
+    if (code != 0) {
+        c.ERR_error_string_n(code, &ebuf, ebuf.len);
+        std.debug.print("brfsd[tls] {s} failed: ssl_err={d} {s}\n", .{ op, ssl_err, std.mem.sliceTo(&ebuf, 0) });
+    } else {
+        std.debug.print("brfsd[tls] {s} failed: ssl_err={d} (no ssl error queued)\n", .{ op, ssl_err });
+    }
+    drainErrorQueue();
 }
 
 // ============================================================================
@@ -364,6 +403,6 @@ test "validateDane: no match returns failed" {
 }
 
 test "TlsContext: init fails with bad cert path" {
-    const result = TlsContext.init("/nonexistent/cert.pem", "/nonexistent/key.pem", null);
+    const result = TlsContext.init("/nonexistent/cert.pem", "/nonexistent/key.pem", null, true);
     try t.expectError(TlsError.CertLoadFailed, result);
 }

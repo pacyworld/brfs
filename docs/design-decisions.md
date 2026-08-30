@@ -133,3 +133,35 @@ gap #17 mass-delete guard covers). Defense (rig-proven by
 `etc/devfs.rules.sample`. Registration is namespace-clean (the ioctl path
 resolves in the caller's namespace and the kmod filters by fileid
 lineage), so a jail can only watch subtrees it can itself resolve.
+
+## Nonblocking TLS writes under backpressure (WAN rig finding, 2026-08-29)
+
+The WAN/chaos track (T21) exposed two latent bugs in the TLS write path
+that only fire when a peer socket applies backpressure — invisible on
+LAN, fatal on WAN-class links:
+
+1. **Missing partial-write modes (userspace TLS).** `SSL_write` on a
+   nonblocking socket that returns `WANT_WRITE` mid-buffer keeps internal
+   retry state pointing at the *caller's* buffer; the retry contract is
+   "identical arguments" unless the application opts out.  The peer wbuf
+   is a growable ArrayList — a `pushTo` append between attempts reallocs
+   it, the retry passed a moved pointer, and the TLS record stream
+   corrupted (bad record MAC → mutual conn drop every ~30 s).  Fix:
+   `SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER`
+   on the context, making `SSL_write` consume-and-report like write(2).
+2. **KTLS retained-pointer EFAULT.** With KTLS active, the kernel keeps
+   the caller's buffer pointer across a `WANT_WRITE` interruption and
+   reads from it on retry — a wbuf realloc between attempts unmapped the
+   old huge pages and the kernel write faulted (`SSL_ERROR_SYSCALL` /
+   EFAULT).  Fix: TLS writes go through a per-peer 64 KiB bounce buffer
+   that is allocated once and never moves (`peer.zig` writeReady), so
+   every retry presents an identical, always-valid pointer+len.  The
+   memcpy cost is small next to the crypto the kernel performs.
+
+Also shipped: `tls_ktls = false` config escape hatch (forces userspace
+TLS crypto), and OpenSSL error detail is now logged on TLS read/write
+failures (the drops above were opaque "write failed" without it).
+
+Rig proof matrix (12-file 1 MiB burst under ~60 ms dummynet/ng_pipe
+delay): pre-fix plain TCP clean, TLS (either kind) flap-loop; post-fix
+all transports clean, zero stalls.  LAN regression battery unchanged.

@@ -126,6 +126,16 @@ pub const Journal = struct {
         return self.entries.count();
     }
 
+    /// True when a local change for path is coalesced but not yet
+    /// committed (debounce window).  onTombstone uses this to preserve
+    /// in-flight local edits that an incoming winning tombstone would
+    /// otherwise delete silently (T19 race, rig-proven 2026-08-30: the
+    /// ~250ms debounce decided whether the loser was quarantined or
+    /// dropped).
+    pub fn hasPending(self: *const Journal, path: []const u8) bool {
+        return self.entries.getPtr(path) != null;
+    }
+
     /// Feed one resolved kernel event.
     pub fn add(self: *Journal, ev: ResolvedEvent, now_ms: i64) !void {
         if (ev.seq > self.high_seq) self.high_seq = ev.seq;
@@ -372,6 +382,18 @@ fn drain(j: *Journal, now: i64) []Work {
 fn freeAll(j: *Journal, works: []Work) void {
     for (works) |*w| j.freeWork(w);
     t.allocator.free(works);
+}
+
+test "hasPending reflects the debounce window" {
+    var j = Journal.init(t.allocator, 200);
+    defer j.deinit();
+    const now: i64 = 1_000_000;
+    try j.add(mkEv("f.txt", .modify, 1), now);
+    try t.expect(j.hasPending("f.txt"));
+    try t.expect(!j.hasPending("other.txt"));
+    const works = drain(&j, now + 200);
+    defer freeAll(&j, works);
+    try t.expect(!j.hasPending("f.txt"));
 }
 
 test "coalesce: N rapid writes become one upsert" {

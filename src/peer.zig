@@ -26,6 +26,10 @@ pub const rbuf_cap: usize = protocol.max_frame + 4 + 4096;
 pub const backoff_initial_ms: i64 = 1_000;
 pub const backoff_max_ms: i64 = 30_000;
 
+/// TLS write bounce-buffer size (writeReady).  64KB matches the read-side
+/// drain buffer; large enough to keep syscall count low on 1MiB frames.
+pub const tls_scratch_size: usize = 64 * 1024;
+
 pub const State = enum {
     connecting, // outbound, non-blocking connect in flight
     tls_handshake, // TCP connected; TLS handshake in progress
@@ -66,6 +70,9 @@ pub const Peer = struct {
     moves: std.AutoHashMap(u32, RemoteMove), // cookie -> pending MOVE_FROM
     /// TLS connection state (null when TLS not configured or not yet started).
     tls_conn: ?tls.TlsConn = null,
+    /// Stable bounce buffer for TLS writes (see writeReady).  Empty until
+    /// first use; allocated once, never reallocated.
+    tls_scratch: []u8 = &.{},
 
     pub fn init(alloc: Allocator) Peer {
         return .{ .alloc = alloc, .moves = std.AutoHashMap(u32, RemoteMove).init(alloc) };
@@ -81,6 +88,7 @@ pub const Peer = struct {
         if (self.node_id) |n| self.alloc.free(n);
         if (self.known_id) |n| self.alloc.free(n);
         if (self.tls_conn) |*tc| tc.deinit();
+        if (self.tls_scratch.len > 0) self.alloc.free(self.tls_scratch);
     }
 
     pub fn noteRemoteMove(self: *Peer, cookie: u32, path: []const u8, ver: contentset.Version, is_dir: bool, now_ms: i64) !void {
@@ -239,10 +247,24 @@ pub const Peer = struct {
 
     /// Drain the outbound buffer (called on EVFILT_WRITE).
     /// When TLS is active, uses SSL_write (KTLS makes this a kernel op).
+    ///
+    /// TLS writes go through a per-peer scratch buffer that is allocated
+    /// once and never moves: after a WANT_WRITE mid-burst, OpenSSL's KTLS
+    /// path retains the caller's buffer pointer internally, so a retry
+    /// after a wbuf realloc (append -> grow -> huge munmap) made the
+    /// kernel read unmapped pages — write failed with EFAULT, conn dropped
+    /// (rig-proven 2026-08-29, only under link delay/backpressure; LAN
+    /// never backpressured so the retained pointer never went stale).
+    /// Retrying with an IDENTICAL pointer+len is the strict pre-3.2
+    /// SSL_write contract and satisfies KTLS unconditionally.
     pub fn writeReady(self: *Peer) !void {
         while (self.wbuf.items.len > 0) {
             if (self.tls_conn) |*tc| {
-                const result = tc.write(self.wbuf.items) catch
+                if (self.tls_scratch.len == 0)
+                    self.tls_scratch = try self.alloc.alloc(u8, tls_scratch_size);
+                const n_req = @min(self.wbuf.items.len, self.tls_scratch.len);
+                @memcpy(self.tls_scratch[0..n_req], self.wbuf.items[0..n_req]);
+                const result = tc.write(self.tls_scratch[0..n_req]) catch
                     return error.PeerGone;
                 switch (result) {
                     .ok => |n| {

@@ -338,11 +338,12 @@ pub const Daemon = struct {
                 @ptrCast(cfg.tls_cert.ptr),
                 @ptrCast(cfg.tls_key.ptr),
                 ca,
+                cfg.tls_ktls,
             ) catch |err| {
                 log(.err, "TLS init failed: {s}", .{@errorName(err)});
                 return error.TlsInitFailed;
             };
-            log(.info, "TLS enabled (KTLS offload if kernel supports it)", .{});
+            log(.info, "TLS enabled (KTLS {s})", .{if (cfg.tls_ktls) "offload if kernel supports it" else "disabled by tls_ktls=false"});
         }
 
         // Completion-worker kick pipe (both ends non-blocking; the worker
@@ -1529,6 +1530,15 @@ pub const Daemon = struct {
                 },
             }
         }
+        // T19 race: a same-origin tombstone applies cleanly per the stored
+        // record, but a local edit can still sit in the journal's debounce
+        // window (never committed a version).  Without this the tombstone
+        // deletes the edited file silently; with it, the in-flight edit is
+        // quarantined before the delete (rig-proven 2026-08-30).  Rare
+        // false positive (attrib-only touch quarantines identical content)
+        // is acceptable — conflicts/ is operator-prunable.
+        if (!quarantine_loser and !m.is_dir and self.jr.hasPending(m.path))
+            quarantine_loser = true;
         // Echo suppression BEFORE the fs mutations: the deletes we perform
         // (and a quarantine move) must not re-enter the journal as local
         // changes.  A dir tombstone removes the subtree: mark every live
@@ -2051,7 +2061,8 @@ pub const Daemon = struct {
             log(.warn, "SIGHUP: primary change requires restart; ignored", .{});
         if (!std.mem.eql(u8, fresh.tls_cert, cfg.tls_cert) or
             !std.mem.eql(u8, fresh.tls_key, cfg.tls_key) or
-            !std.mem.eql(u8, fresh.tls_ca, cfg.tls_ca))
+            !std.mem.eql(u8, fresh.tls_ca, cfg.tls_ca) or
+            fresh.tls_ktls != cfg.tls_ktls)
             log(.warn, "SIGHUP: tls_* changes require restart; ignored", .{});
         if (fresh.rate_limit != cfg.rate_limit)
             log(.info, "SIGHUP: rate_limit now {d} bytes/sec (enforcement is Phase 3)", .{fresh.rate_limit});
@@ -2315,9 +2326,7 @@ pub const Daemon = struct {
             defer self.alloc.free(abs);
             std.fs.cwd().makePath(abs) catch {};
         }
-        const src_z = std.posix.toPosixPath(src) catch return;
-        const dst_z = std.posix.toPosixPath(dst) catch return;
-        posix.rename(&src_z, &dst_z) catch |err| {
+        posix.rename(src, dst) catch |err| {
             self.ctlPrint(out, "ERR restore failed: {s}\n", .{@errorName(err)});
             return;
         };
