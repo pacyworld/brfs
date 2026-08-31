@@ -10,8 +10,9 @@
 # Impairment mechanism: dummynet pipes scoped to peer-pair traffic — one
 # OUTBOUND rule per peer per node matching all IP between the pair; ssh
 # from the host (10.66.0.1) never matches, so impairment cannot lock out
-# the control channel.  (PLAN.md's sanctioned fallback: ng_netem is GONE
-# from FreeBSD 15.1.  dummynet delay/plr/bw are all TLS+KTLS-clean once
+# the control channel.  (PLAN.md's original ng_netem reference was
+# mistaken — that node never existed in FreeBSD; the netgraph link
+# emulator is ng_pipe(4).  dummynet delay/plr/bw are all TLS+KTLS-clean once
 # brfsd's nonblocking SSL_write handling was fixed — before that fix,
 # delayed links killed TLS bulk transfers.  ng_pipe was validated as an
 # L2 alternative and abandoned: it impairs ssh and its 100Hz tick

@@ -4,7 +4,8 @@
 # through ssh + doas.
 #
 # Mechanism: dummynet pipes scoped to peer-pair traffic (PLAN.md's
-# sanctioned fallback; ng_netem.ko is absent on the 15.1-RELEASE guests).
+# sanctioned fallback; there is no ng_netem on FreeBSD — never was — so
+# the guest vtnet-path option would have been ng_pipe(4)).
 # One OUTBOUND pipe per peer, matching all IP traffic between this node
 # and the peer's IP.  ssh (host 10.66.0.1 -> guest) never matches a rule,
 # so impairment can never lock out the control channel.
@@ -22,8 +23,9 @@
 #                                 configured but unreferenced = inert)
 #   show                          ipfw rules + pipe configs (debug)
 #
-# Mechanism notes (rig-proven 2026-08-29): ng_netem is GONE from FreeBSD
-# 15.1 (no module, no source).  dummynet delay/plr/bw all work correctly
+# Mechanism notes (rig-proven 2026-08-29): FreeBSD has no ng_netem (that
+# name is Linux's tc qdisc; it never existed in base — the netgraph link
+# emulator is ng_pipe(4)).  dummynet delay/plr/bw all work correctly
 # with TLS+KTLS traffic once brfsd's nonblocking SSL_write handling was
 # fixed (partial-write modes + stable bounce buffer); before that fix,
 # ANY delayed link killed TLS bulk transfers.  ng_pipe (L2 inline on

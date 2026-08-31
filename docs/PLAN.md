@@ -388,8 +388,10 @@ ms of RTT, occasional loss, tunnel MTU quirks.  Rig:
 `tests/vm/t21-t24-wan.sh` (host driver) + `tests/vm/brfs-wan-ctl.sh`
 (guest helper) — dummynet pipes scoped to peer-pair traffic, one outbound
 rule per peer per node; ssh from the host never matches a rule, so no
-lockout is possible.  `ng_netem(4)` is GONE from FreeBSD 15.1 (no module,
-no source in sys/netgraph); ng_pipe(4) was validated as an L2 alternative
+lockout is possible.  Correction: this section's original reference to
+`ng_netem(4)` was mistaken — no such node ever existed in FreeBSD base
+("netem" is the Linux tc qdisc); the in-tree netgraph link emulator is
+ng_pipe(4).  ng_pipe was validated as an L2 alternative
 and abandoned (impairs the ssh control channel, 100 Hz tick inflates
 configured delays).  ipfw must be loaded with
 `kenv net.inet.ip.fw.default_to_accept=1` FIRST — a cold `kldload ipfw`
