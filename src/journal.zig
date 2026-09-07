@@ -60,15 +60,18 @@ pub const Rename = struct {
 /// that never re-hashes a big file on the core loop.  fileid-marked
 /// install echoes are NOT consumed by swallowing: an install emits two
 /// events (MOVE_TO + ATTRIB) and both must swallow — the daemon's
-/// completion callback clears the marker.  move_from: the path must be
-/// ABSENT (our own rename's FROM half) to be swallowed.  Mismatch on
-/// either = genuine local change.
+/// completion callback clears the marker.  Exception: auto_clear echoes
+/// (rename-applied moves) ARE consumed on first swallow — a rename
+/// emits only MOVE_TO on the destination (no ATTRIB).  move_from: the
+/// path must be ABSENT (our own rename's FROM half) to be swallowed.
+/// Mismatch on either = genuine local change.
 pub const Echo = struct {
     kind: EchoKind,
     sha256: [32]u8,
     size: u64,
     fileid: u64 = 0,
     gen: u64 = 0,
+    auto_clear: bool = false,
 
     pub const EchoKind = enum { install, move_from };
 };
@@ -337,6 +340,17 @@ pub const Journal = struct {
         gop.value_ptr.* = .{ .kind = .install, .sha256 = sha256, .size = size, .fileid = fileid, .gen = gen };
     }
 
+    /// Rename echo: identity-marked but consumed on first swallow.  A
+    /// daemon-applied rename emits only MOVE_TO on the destination (no
+    /// ATTRIB), so the marker need not persist.  O(1) fileid/gen compare
+    /// avoids hashing a big renamed file on the core loop.
+    pub fn noteEchoRename(self: *Journal, path: []const u8, size: u64, fileid: u64, gen: u64) !void {
+        const gop = try self.echoes.getOrPut(path);
+        if (!gop.found_existing)
+            gop.key_ptr.* = try self.alloc.dupe(u8, path);
+        gop.value_ptr.* = .{ .kind = .install, .sha256 = [_]u8{0} ** 32, .size = size, .fileid = fileid, .gen = gen, .auto_clear = true };
+    }
+
     /// Inspect (without consuming) a pending echo marker.
     pub fn peekEcho(self: *Journal, path: []const u8) ?Echo {
         return self.echoes.get(path);
@@ -545,6 +559,22 @@ test "identity echo marker carries the staged fileid/gen" {
     try t.expectEqual(@as(u64, 0), j.peekEcho("old.txt").?.fileid);
     j.clearEcho("big.bin");
     try t.expect(j.peekEcho("big.bin") == null);
+}
+
+test "rename echo: identity-marked with auto_clear" {
+    var j = Journal.init(t.allocator, 100);
+    defer j.deinit();
+    try j.noteEchoRename("moved.bin", 1 << 20, 9999, 42);
+    const e = j.peekEcho("moved.bin").?;
+    try t.expectEqual(Echo.EchoKind.install, e.kind);
+    try t.expectEqual(@as(u64, 9999), e.fileid);
+    try t.expectEqual(@as(u64, 42), e.gen);
+    try t.expect(e.auto_clear);
+    // Plain identity echo (noteEchoFile) does NOT auto_clear.
+    try j.noteEchoFile("installed.bin", [_]u8{0} ** 32, 500, 1234, 10);
+    try t.expect(!j.peekEcho("installed.bin").?.auto_clear);
+    j.clearEcho("moved.bin");
+    j.clearEcho("installed.bin");
 }
 
 test "high_seq tracks the maximum seen" {

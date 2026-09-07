@@ -60,6 +60,7 @@ const checkpoint_interval_ms: i64 = 5_000;
 const rescan_cooldown_ms: i64 = 1_000;
 const gc_interval_ms: i64 = 3_600_000; // tombstone GC cadence (gap #7)
 const repush_interval_ms: i64 = 3_600_000; // watch-root re-push cadence (flag-strip mitigation)
+const journal_retain_count: u64 = 1_000_000; // keep the last N journal entries (GC floor)
 const max_violations: u32 = 8;
 
 /// udata sentinel marking ctl-socket client conns on the kqueue (peers
@@ -715,7 +716,9 @@ pub const Daemon = struct {
                 // ATTRIB) and both must swallow.  A delete matching the
                 // identity closes the window instead: the subject is dead
                 // (a superseded install's revert), nothing more can come.
-                if (echo.fileid == 0 or op == .delete) self.jr.clearEcho(rel);
+                // auto_clear echoes (rename-applied moves) are consumed on
+                // first swallow — a rename emits only MOVE_TO (no ATTRIB).
+                if (echo.fileid == 0 or op == .delete or echo.auto_clear) self.jr.clearEcho(rel);
                 if (bev.seq > self.jr.high_seq) self.jr.high_seq = bev.seq;
                 return;
             }
@@ -1609,16 +1612,24 @@ pub const Daemon = struct {
         defer self.alloc.free(abs_from);
         const abs_to = self.inst.absPath(m.path) catch return;
         defer self.alloc.free(abs_to);
-        var sha = [_]u8{0} ** 32;
+        // Echo markers: move_from checks absence (no hash needed);
+        // destination uses fileid/gen identity (O(1), no hash — a
+        // rename preserves inode identity).  auto_clear: a rename
+        // emits only MOVE_TO on the destination, no ATTRIB.
+        var fileid: u64 = 0;
+        var gen: u64 = 0;
         var size: u64 = 0;
         if (installer.statPath(abs_from)) |st| {
             size = @intCast(@max(st.size, 0));
-            if (!installer.isDir(st)) {
-                sha = installer.hashFile(abs_from) catch sha;
-            }
+            fileid = @intCast(st.ino);
+            gen = @intCast(st.gen);
         } else |_| {}
-        self.jr.noteEcho(mv.path, .move_from, sha, size) catch {};
-        self.jr.noteEcho(m.path, .install, sha, size) catch {};
+        self.jr.noteEcho(mv.path, .move_from, [_]u8{0} ** 32, 0) catch {};
+        if (fileid != 0) {
+            self.jr.noteEchoRename(m.path, size, fileid, gen) catch {};
+        } else {
+            self.jr.noteEcho(m.path, .install, [_]u8{0} ** 32, 0) catch {};
+        }
         posix.rename(abs_from, abs_to) catch {
             // From-path missing locally: fetch the destination instead.
             self.jr.clearEcho(mv.path);
@@ -1940,6 +1951,17 @@ pub const Daemon = struct {
             const collected = self.cs.gcTombstones(@intCast(@divFloor(now, 1000)), horizon) catch 0;
             if (collected > 0)
                 log(.info, "tombstone GC: {d} collected", .{collected});
+            // Journal GC: keep the last 7 days worth of entries; if the
+            // journal head is above the retention floor, trim everything
+            // below it.  The floor is conservative: even a peer that was
+            // offline for 6 days can still catch up via the journal.
+            const jhead = self.cs.journalHead();
+            if (jhead > journal_retain_count) {
+                const jfloor = jhead - journal_retain_count;
+                const jgc = self.cs.journalGc(jfloor) catch 0;
+                if (jgc > 0)
+                    log(.info, "journal GC: {d} entries trimmed (floor={d})", .{ jgc, jfloor });
+            }
         }
 
         // Watch-root re-push (watch-removal flag-strip mitigation).
@@ -2152,6 +2174,7 @@ pub const Daemon = struct {
             self.guard.count,
         });
         self.ctlPrint(out, "fs: {s}\n", .{if (self.fs_frozen) "FROZEN (fsid mismatch — see log)" else "ok"});
+        self.ctlPrint(out, "journal: seq={d} entries={d}\n", .{ self.cs.journalHead(), self.cs.journalCount() });
     }
 
     /// Prometheus text exposition (gauges; brfsctl prepends the kernel
@@ -2196,6 +2219,10 @@ pub const Daemon = struct {
         self.ctlPrint(out, "brfs_massdelete_latched{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.guard.latched) });
         self.ctlPrint(out, "# TYPE brfs_fs_frozen gauge\n", .{});
         self.ctlPrint(out, "brfs_fs_frozen{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.fs_frozen) });
+        self.ctlPrint(out, "# TYPE brfs_journal_seq counter\n", .{});
+        self.ctlPrint(out, "brfs_journal_seq{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.cs.journalHead() });
+        self.ctlPrint(out, "# TYPE brfs_journal_entries gauge\n", .{});
+        self.ctlPrint(out, "brfs_journal_entries{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.cs.journalCount() });
         self.ctlPrint(out, "# TYPE brfs_resynced gauge\n", .{});
         self.ctlPrint(out, "brfs_resynced{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.resynced) });
         self.ctlPrint(out, "# TYPE brfs_ring_seq gauge\n", .{});

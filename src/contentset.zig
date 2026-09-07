@@ -122,9 +122,11 @@ const map_size: usize = 1 << 30;
 const db_dir = "csdb";
 const dbi_records_name = "records";
 const dbi_meta_name = "meta";
+const dbi_journal_name = "journal";
 const meta_local_next_seq = "local_next_seq";
 const meta_ring_seq = "ring_seq";
 const meta_root_fsid = "root_fsid";
+const meta_journal_seq = "journal_seq";
 /// Seq reservation window: how far flush()/reserveSeqs() keep the
 /// persisted ceiling ahead of the next issuable seq.  Bursts larger than
 /// this between commits take the forced-reserve path in nextVersion().
@@ -187,6 +189,7 @@ pub const ContentSet = struct {
     env: ?*c.MDB_env,
     dbi_records: c.MDB_dbi,
     dbi_meta: c.MDB_dbi,
+    dbi_journal: c.MDB_dbi,
     /// Pending write txn, begun lazily by the first mutation after the
     /// last commit; flush()/checkpoint() commit it (one atomic batch).
     wtxn: ?*c.MDB_txn = null,
@@ -208,6 +211,12 @@ pub const ContentSet = struct {
     /// freezes scans/local announces rather than tombstoning a "vanished"
     /// tree mesh-wide.  0 = legacy db, stamp on next start.
     root_fsid: u64 = 0,
+    /// Durable journal: monotonically increasing seq for every content-set
+    /// mutation.  Each upsert appends (journal_seq, path, record) to the
+    /// journal DBI.  Peers can tail from a known seq for efficient RESYNC
+    /// diffing (Phase 3b watermarks).  The seq is persisted in meta and
+    /// committed atomically with the content set.
+    journal_seq: u64 = 0,
     needs_scan: bool = false,
 
     /// Open (creating if needed) state_dir/csdb and load every record.
@@ -225,6 +234,7 @@ pub const ContentSet = struct {
             .env = null,
             .dbi_records = 0,
             .dbi_meta = 0,
+            .dbi_journal = 0,
             .local_origin = nodeOrigin(node_id),
         };
         errdefer {
@@ -339,6 +349,8 @@ pub const ContentSet = struct {
         errdefer c.mdb_txn_abort(txn);
         try mdbCheck(c.mdb_dbi_open(txn, dbi_records_name, c.MDB_CREATE, &self.dbi_records));
         try mdbCheck(c.mdb_dbi_open(txn, dbi_meta_name, c.MDB_CREATE, &self.dbi_meta));
+        // Journal DBI: u64 big-endian seq keys sort correctly via memcmp.
+        try mdbCheck(c.mdb_dbi_open(txn, dbi_journal_name, c.MDB_CREATE, &self.dbi_journal));
         try mdbCheck(c.mdb_txn_commit(txn));
     }
 
@@ -357,6 +369,7 @@ pub const ContentSet = struct {
         }
         if (self.getMeta(txn, meta_ring_seq)) |v| self.ring_seq = v;
         if (self.getMeta(txn, meta_root_fsid)) |v| self.root_fsid = v;
+        if (self.getMeta(txn, meta_journal_seq)) |v| self.journal_seq = v;
 
         var cur: ?*c.MDB_cursor = null;
         try mdbCheck(c.mdb_cursor_open(txn, self.dbi_records, &cur));
@@ -506,6 +519,12 @@ pub const ContentSet = struct {
             self.abortTxn();
             return e;
         };
+        // Durable journal: append this mutation with the next journal seq.
+        // The journal entry is (path ++ record) keyed by seq.  The path
+        // comes first so tailing iterators can decode it without external
+        // lookup.  Journal writes are best-effort: a failure leaves the
+        // content set correct (the scan floor is the universal fallback).
+        self.appendJournal(path, body) catch {};
 
         const gop = try self.map.getOrPut(path);
         if (!gop.found_existing) {
@@ -566,6 +585,10 @@ pub const ContentSet = struct {
             self.abortTxn();
             return e;
         };
+        self.putMeta(meta_journal_seq, self.journal_seq) catch |e| {
+            self.abortTxn();
+            return e;
+        };
         const txn = self.wtxn.?;
         self.wtxn = null; // commit consumes the handle either way
         mdbCheck(c.mdb_txn_commit(txn)) catch |e| {
@@ -582,6 +605,118 @@ pub const ContentSet = struct {
     /// swap; start).
     pub fn snapshot(self: *ContentSet) !void {
         try self.flush();
+    }
+
+    // ---- durable journal ----
+
+    /// Append a journal entry under the next journal seq.  Called from
+    /// upsert inside the pending write txn.
+    fn appendJournal(self: *ContentSet, path: []const u8, rec_body: []const u8) !void {
+        self.journal_seq += 1;
+        var seq_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seq_buf, self.journal_seq, .big);
+        var jk = mval(&seq_buf);
+        // Value: u16 path_len + path + record body (value_len bytes).
+        var jvbuf: [2 + max_path_len + value_len]u8 = undefined;
+        if (path.len > max_path_len) return error.NameTooLong;
+        std.mem.writeInt(u16, jvbuf[0..2], @intCast(path.len), .big);
+        @memcpy(jvbuf[2 .. 2 + path.len], path);
+        @memcpy(jvbuf[2 + path.len .. 2 + path.len + rec_body.len], rec_body);
+        var jv = mval(jvbuf[0 .. 2 + path.len + rec_body.len]);
+        try mdbCheck(c.mdb_put(self.wtxn, self.dbi_journal, &jk, &jv, 0));
+    }
+
+    /// Decoded journal entry for callers.
+    pub const JournalEntry = struct {
+        seq: u64,
+        path: []const u8,
+        rec: Record,
+    };
+
+    /// Current journal head seq (the highest seq written).
+    pub fn journalHead(self: *const ContentSet) u64 {
+        return self.journal_seq;
+    }
+
+    /// Count of journal entries (read-only snapshot).
+    pub fn journalCount(self: *ContentSet) u64 {
+        if (self.env == null) return 0;
+        var txn: ?*c.MDB_txn = null;
+        if (c.mdb_txn_begin(self.env, null, c.MDB_RDONLY, &txn) != 0) return 0;
+        defer c.mdb_txn_abort(txn);
+        var stat: c.MDB_stat = undefined;
+        if (c.mdb_stat(txn, self.dbi_journal, &stat) != 0) return 0;
+        return stat.ms_entries;
+    }
+
+    /// Iterate journal entries from min_seq (inclusive).  The callback
+    /// receives decoded (seq, path, record) entries in ascending seq order.
+    /// Returns the number of entries visited.
+    pub fn journalTail(
+        self: *ContentSet,
+        min_seq: u64,
+        ctx: anytype,
+        cb: fn (@TypeOf(ctx), JournalEntry) void,
+    ) u64 {
+        if (self.env == null) return 0;
+        var txn: ?*c.MDB_txn = null;
+        if (c.mdb_txn_begin(self.env, null, c.MDB_RDONLY, &txn) != 0) return 0;
+        defer c.mdb_txn_abort(txn);
+        var cur: ?*c.MDB_cursor = null;
+        if (c.mdb_cursor_open(txn, self.dbi_journal, &cur) != 0) return 0;
+        defer c.mdb_cursor_close(cur);
+
+        // Position at min_seq via MDB_SET_RANGE (first key >= min_seq).
+        var seek_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seek_buf, min_seq, .big);
+        var k = mval(&seek_buf);
+        var v: c.MDB_val = undefined;
+        var op: c_uint = c.MDB_SET_RANGE;
+        var count: u64 = 0;
+        while (true) {
+            const rc = c.mdb_cursor_get(cur, &k, &v, op);
+            if (rc == c.MDB_NOTFOUND) break;
+            if (rc != 0) break;
+            op = c.MDB_NEXT;
+            const kslice = mvalSlice(&k);
+            if (kslice.len != 8) break;
+            const seq = std.mem.readInt(u64, kslice[0..8], .big);
+            const vslice = mvalSlice(&v);
+            if (vslice.len < 2 + value_len) continue; // corrupt entry
+            const plen = std.mem.readInt(u16, vslice[0..2], .big);
+            if (vslice.len < 2 + plen + value_len) continue;
+            const path = vslice[2 .. 2 + plen];
+            const rec = decodeRecord(vslice[2 + plen .. 2 + plen + value_len]) catch continue;
+            cb(ctx, .{ .seq = seq, .path = path, .rec = rec });
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Delete journal entries with seq < min_seq.  Returns the number
+    /// of entries removed.
+    pub fn journalGc(self: *ContentSet, min_seq: u64) !u64 {
+        try self.ensureTxn();
+        var cur: ?*c.MDB_cursor = null;
+        try mdbCheck(c.mdb_cursor_open(self.wtxn, self.dbi_journal, &cur));
+        defer c.mdb_cursor_close(cur);
+
+        var k: c.MDB_val = undefined;
+        var v: c.MDB_val = undefined;
+        var count: u64 = 0;
+        while (true) {
+            const rc = c.mdb_cursor_get(cur, &k, &v, c.MDB_FIRST);
+            if (rc == c.MDB_NOTFOUND) break;
+            try mdbCheck(rc);
+            const kslice = mvalSlice(&k);
+            if (kslice.len != 8) break;
+            const seq = std.mem.readInt(u64, kslice[0..8], .big);
+            if (seq >= min_seq) break;
+            try mdbCheck(c.mdb_cursor_del(cur, 0));
+            count += 1;
+        }
+        if (count > 0) try self.flush();
+        return count;
     }
 
     /// Gap #7: drop tombstones past the retention rule.  Live records are
@@ -1156,4 +1291,92 @@ test "validRelPath" {
     try std.testing.expect(!validRelPath("a/./b"));
     try std.testing.expect(!validRelPath("a/../b"));
     try std.testing.expect(!validRelPath(".."));
+}
+
+test "durable journal: upsert appends, tail reads, GC trims" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var cs = try ContentSet.open(alloc, dir, "jtest");
+    defer cs.close();
+    try std.testing.expectEqual(@as(u64, 0), cs.journal_seq);
+    try std.testing.expectEqual(@as(u64, 0), cs.journalCount());
+
+    // Three upserts produce three journal entries.
+    try cs.upsert("a.txt", .{ .ver = .{ .origin = 0xaa, .seq = 1 }, .size = 10, .sha256 = [_]u8{1} ** 32 });
+    try cs.upsert("b.txt", .{ .ver = .{ .origin = 0xaa, .seq = 2 }, .size = 20, .sha256 = [_]u8{2} ** 32 });
+    try cs.upsert("c.txt", .{ .ver = .{ .origin = 0xbb, .seq = 1 }, .size = 30, .state = .deleted, .sha256 = [_]u8{3} ** 32 });
+    try cs.flush();
+    try std.testing.expectEqual(@as(u64, 3), cs.journal_seq);
+    try std.testing.expectEqual(@as(u64, 3), cs.journalCount());
+
+    // Tail from seq 1 returns all three.
+    const Collector = struct {
+        items: [8]ContentSet.JournalEntry = undefined,
+        n: usize = 0,
+        fn collect(self: *@This(), e: ContentSet.JournalEntry) void {
+            if (self.n < 8) {
+                self.items[self.n] = e;
+                self.n += 1;
+            }
+        }
+    };
+    var col = Collector{};
+    const visited = cs.journalTail(1, &col, Collector.collect);
+    try std.testing.expectEqual(@as(u64, 3), visited);
+    try std.testing.expectEqual(@as(usize, 3), col.n);
+    try std.testing.expectEqual(@as(u64, 1), col.items[0].seq);
+    try std.testing.expectEqualStrings("a.txt", col.items[0].path);
+    try std.testing.expectEqual(@as(u64, 10), col.items[0].rec.size);
+    try std.testing.expectEqual(@as(u64, 2), col.items[1].seq);
+    try std.testing.expectEqualStrings("b.txt", col.items[1].path);
+    try std.testing.expectEqual(@as(u64, 3), col.items[2].seq);
+    try std.testing.expectEqual(State.deleted, col.items[2].rec.state);
+
+    // Tail from seq 2 skips the first.
+    var col2 = Collector{};
+    _ = cs.journalTail(2, &col2, Collector.collect);
+    try std.testing.expectEqual(@as(usize, 2), col2.n);
+    try std.testing.expectEqual(@as(u64, 2), col2.items[0].seq);
+
+    // GC entries below seq 3 removes the first two.
+    const gc_count = try cs.journalGc(3);
+    try std.testing.expectEqual(@as(u64, 2), gc_count);
+    try std.testing.expectEqual(@as(u64, 1), cs.journalCount());
+
+    // Tail from 1 now only returns the surviving entry.
+    var col3 = Collector{};
+    _ = cs.journalTail(1, &col3, Collector.collect);
+    try std.testing.expectEqual(@as(usize, 1), col3.n);
+    try std.testing.expectEqual(@as(u64, 3), col3.items[0].seq);
+}
+
+test "durable journal: seq survives close + reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    {
+        var cs = try ContentSet.open(alloc, dir, "jtest2");
+        try cs.upsert("x.txt", .{ .ver = .{ .origin = 0xcc, .seq = 1 }, .size = 5, .sha256 = [_]u8{9} ** 32 });
+        try cs.flush();
+        try std.testing.expectEqual(@as(u64, 1), cs.journal_seq);
+        cs.close();
+    }
+    // Reopen: journal_seq must resume from the persisted value.
+    {
+        var cs = try ContentSet.open(alloc, dir, "jtest2");
+        defer cs.close();
+        try std.testing.expectEqual(@as(u64, 1), cs.journal_seq);
+        // New upsert gets seq 2, not 1.
+        try cs.upsert("y.txt", .{ .ver = .{ .origin = 0xcc, .seq = 2 }, .size = 6, .sha256 = [_]u8{8} ** 32 });
+        try cs.flush();
+        try std.testing.expectEqual(@as(u64, 2), cs.journal_seq);
+        try std.testing.expectEqual(@as(u64, 2), cs.journalCount());
+    }
 }
