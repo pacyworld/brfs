@@ -1,11 +1,9 @@
 # BrFS (BSD Replicated File System) — DFSR-style Replicated Folder Engine for FreeBSD
 
-Status: IMPLEMENTATION (v0.8, 2026-08-25) — Phase 0 + Phase 1 complete
-(POC end-to-end: T1-T8 + T10 green on the 3-VM rig, commit fb4b1b5);
-Phase 2 underway: LMDB content-set swap landed (gaps #7/#9/#12 closed),
-daemon hardening landed (async install completion + brfsctl socket),
-kernel hardening part 1 landed (epoch unload drain, move-out unflag,
-hourly ADDROOT re-push)
+Status: IMPLEMENTATION (v0.9, 2026-09-07) — Phase 0 + Phase 1 + Phase 2
+complete; Phase 3 underway: durable per-volume journal landed (LMDB-backed
+append-only change log, hourly GC, brfsctl/metrics integration);
+onMoveTo hash-off-core-loop fix landed; t-rmdir-root rig test added
 Name: FINAL — **BrFS** ("Brrr... it's cold"). Daemon: `brfsd`, kmod: `brfs.ko`, utility: `brfsctl`.
 Owner: Daniel
 Target: FreeBSD 15.0+ (VFS event notification points / inotify landed 15.0-RELEASE)
@@ -297,11 +295,28 @@ pairs. All ops idempotent. See docs/protocol.md.
   OpenSSL/LibreSSL memory-BIO pairs into the existing kqueue core (no
   blocking I/O threads); PSK mode kept as a config fallback for air-gapped
   rigs.  Also: WAN/chaos test track (see test matrix).
-- Phase 3 (deferred): durable per-volume journal (biggest DFSR-parity item),
-  RDC deltas (>64KB, cross-file seeds), rate limiting/credits + fetch
-  pipelining windows (receiver-driven pull is RTT-serialized: ~1 MiB per
-  RTT per file — ~20 MB/s ceiling at a 50 ms cross-region RTT, fine for
-  POC), node add/remove, >3 nodes, resync skip-on-(size,sha),
+- Phase 3 (underway):
+  **Durable per-volume journal DONE 2026-09-07** (0473a03): LMDB-backed
+  append-only change log in the same env as the content set.  Every
+  content-set upsert atomically appends a journal entry keyed by a
+  monotonically increasing u64 seq.  journalTail(min_seq) iterates from
+  a given seq; journalGc(min_seq) trims old entries.  Daemon integration:
+  hourly GC alongside tombstone GC (retain last 1M entries); brfsctl
+  status shows seq+entries; Prometheus metrics brfs_journal_seq and
+  brfs_journal_entries.  Foundation for Phase 3b watermark-based RESYNC
+  diffing — the wire protocol's vector field is preserved; watermark
+  negotiation needs a new RESYNC_REQ field or opcode (Phase 3b).
+  **onMoveTo hash off core loop DONE 2026-09-07** (same commit):
+  the big-file-rename case called hashFile synchronously; now uses
+  fileid/gen identity via noteEchoRename with auto_clear echo semantics.
+  **t-rmdir-root.sh DONE 2026-09-07**: dedicated rig test for the P0.2
+  root-dir rmdir/revoke analytical answer (daemon survives, freezes,
+  recovers after root recreation).
+  Remaining Phase 3 items: RDC deltas (>64KB, cross-file seeds), rate
+  limiting/credits + fetch pipelining windows (receiver-driven pull is
+  RTT-serialized: ~1 MiB per RTT per file — ~20 MB/s ceiling at 50 ms
+  cross-region RTT), node add/remove, >3 nodes, resync
+  skip-on-(size,sha), watermark-based RESYNC diffing (Phase 3b),
   upstreamable registration API if patch fallback used.
 - **Code-review backlog landings 2026-08-28** (gaps #7/#10/#11/#14/#15/
   #16/#17/#18/#19 + man pages + CI + metrics):
