@@ -346,12 +346,16 @@ pub const ContentSet = struct {
 
         var txn: ?*c.MDB_txn = null;
         try mdbCheck(c.mdb_txn_begin(self.env, null, 0, &txn));
-        errdefer c.mdb_txn_abort(txn);
+        errdefer if (txn != null) c.mdb_txn_abort(txn);
         try mdbCheck(c.mdb_dbi_open(txn, dbi_records_name, c.MDB_CREATE, &self.dbi_records));
         try mdbCheck(c.mdb_dbi_open(txn, dbi_meta_name, c.MDB_CREATE, &self.dbi_meta));
         // Journal DBI: u64 big-endian seq keys sort correctly via memcmp.
         try mdbCheck(c.mdb_dbi_open(txn, dbi_journal_name, c.MDB_CREATE, &self.dbi_journal));
-        try mdbCheck(c.mdb_txn_commit(txn));
+        // Commit consumes the handle on either outcome — it must not be
+        // aborted by the errdefer afterwards.
+        const crc = c.mdb_txn_commit(txn);
+        txn = null;
+        try mdbCheck(crc);
     }
 
     fn loadAll(self: *ContentSet) !void {
@@ -699,22 +703,32 @@ pub const ContentSet = struct {
         try self.ensureTxn();
         var cur: ?*c.MDB_cursor = null;
         try mdbCheck(c.mdb_cursor_open(self.wtxn, self.dbi_journal, &cur));
-        defer c.mdb_cursor_close(cur);
 
         var k: c.MDB_val = undefined;
         var v: c.MDB_val = undefined;
         var count: u64 = 0;
+        var rc: c_int = 0;
         while (true) {
-            const rc = c.mdb_cursor_get(cur, &k, &v, c.MDB_FIRST);
-            if (rc == c.MDB_NOTFOUND) break;
-            try mdbCheck(rc);
+            rc = c.mdb_cursor_get(cur, &k, &v, c.MDB_FIRST);
+            if (rc == c.MDB_NOTFOUND) {
+                rc = 0;
+                break;
+            }
+            if (rc != 0) break;
             const kslice = mvalSlice(&k);
             if (kslice.len != 8) break;
             const seq = std.mem.readInt(u64, kslice[0..8], .big);
             if (seq >= min_seq) break;
-            try mdbCheck(c.mdb_cursor_del(cur, 0));
+            rc = c.mdb_cursor_del(cur, 0);
+            if (rc != 0) break;
             count += 1;
+            rc = 0;
         }
+        // The cursor dies BEFORE flush(): commit frees the txn handle, so a
+        // deferred close would dereference freed LMDB state (latent heap
+        // corruption; jemalloc junk-fill trips UBSan in mdb_cursor_close).
+        c.mdb_cursor_close(cur);
+        try mdbCheck(rc);
         if (count > 0) try self.flush();
         return count;
     }

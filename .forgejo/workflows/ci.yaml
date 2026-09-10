@@ -13,9 +13,12 @@ jobs:
         uses: actions/checkout@v4
 
       # Zig unit tests (contentset/journal/protocol/installer/resync/ctl/
-      # guard/TLS) — the full host-side suite.
+      # guard/TLS) — the full host-side suite.  MALLOC_CONF=junk:true fills
+      # freed heap with 0x5a so latent use-after-free in the C glue (LMDB
+      # txn/cursor lifetime) aborts UBSan instead of surfacing as a corrupt
+      # atexit crash long after the offending test.
       - name: Unit tests
-        run: zig build test
+        run: MALLOC_CONF=junk:true zig build test
 
       # Exe targets: zig build test does NOT fully analyze brfsd/brfsctl
       # (rig-proven harness lesson), so build them explicitly.
