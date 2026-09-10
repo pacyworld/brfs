@@ -27,9 +27,16 @@ jobs:
 
       # Compile check of the kernel module against this host's /usr/src.
       # (A kmod built for a different point release is never shipped; the
-      # rig VMs rebuild in-guest.)
+      # rig VMs rebuild in-guest.)  Runners without a kernel source tree
+      # skip with a notice instead of failing: make cannot run without
+      # SYSDIR and the check still guards hosts that carry /usr/src.
       - name: kmod compile check
-        run: make -C kmod
+        run: |
+          if [ -d /usr/src/sys ]; then
+            make -C kmod
+          else
+            echo "::notice::no /usr/src on this runner; kmod compile check skipped (rig VMs rebuild in-guest)"
+          fi
 
       - name: Man page lint
         run: |
