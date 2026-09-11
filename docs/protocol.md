@@ -34,27 +34,66 @@ FETCH_DATA   ver | offset u64 | path | data (u32 len + bytes)
 FETCH_ACK    ver | path | sha256 [32]
 TOMBSTONE    ver | flags u16 | path
 RESYNC_REQ   count u32 | count * (origin u64 | max_seq u64)   (version vector)
+             | journal_wm u64  (Phase 3b: requester's contiguous applied
+                               journal seq for this sender; 0 = full pull)
 RESYNC_ENTRY ver | flags u16 | state u8 | mode u16 | size u64 |
-             mtime_sec i64 | mtime_nsec u32 | path | sha256 [32]
+             mtime_sec i64 | mtime_nsec u32 | path | sha256 [32] |
+             jseq u64   (sender's journal seq when journal-sourced, else 0)
 MOVE_FROM    ver | flags u16 | cookie u32 | path
 MOVE_TO      ver | flags u16 | cookie u32 | path
 NACK         ver | code u16 | path
-RESYNC_DONE  count u64   (terminates a RESYNC stream; receiver then runs
-                          its post-join local scan)
+RESYNC_DONE  count u64 | journal_head u64
+                          (terminates a RESYNC stream; receiver runs its
+                          post-join scan; journal_head settles the
+                          requester's new watermark for this sender, and is
+                          0 only when the sender has no journal at all)
 ```
 
 RESYNC_ENTRY carries `state` (1=live, 2=deleted) so tombstones propagate
 during catch-up. Rename cookie 0 is a valid cookie (first rename after
 boot); pair by cookie value, not by "nonzero".
 
-**RESYNC_REQ is always sent with an empty vector (full-record pull).**
-Rig-proven 2026-08-28: a conn drop mid-announce-burst loses queued frames,
-and the per-origin-MAX vector cannot express the resulting hole — a
-vector-diff answer of "0 entries" left a node missing 934 records
-permanently. An empty vector asks the peer to stream ALL records; the
-receiver's per-entry decision idempotently ignores what it already holds
-and fetches only the holes. The vector field remains on the wire (and is
-still parsed) for a future efficient-diff mode (Phase 3 durable journal).
+**RESYNC_REQ still sends an empty vector.** The vector's pull role is
+replaced by the journal watermark (below); filling it would also feed the
+tombstone-GC ack horizon, where a coarse per-origin max over-covers
+records a mid-burst conn drop never delivered — the same unsoundness that
+made vector-diff resync lose 934 records (rig-proven 2026-08-28). The
+ack horizon stays TTL-only until per-peer journal watermarks replace it.
+
+## Watermark-diff RESYNC (Phase 3b, protocol v2)
+
+Each node keeps, per mesh peer, the **highest contiguous journal seq it
+received-and-applied from that peer** (persisted in the LMDB meta DBI as
+`wm_<peer-origin>` keys; durable across restarts).  On RESYNC_REQ the
+requester advertises that value as `journal_wm`:
+
+- **`journal_wm == 0`** (first contact, wiped state): full-record pull —
+  the sender streams every record (idempotent apply fetches the holes).
+- **Watermark usable** (`0 < wm <= sender head`, sender's oldest retained
+  journal seq `<= wm+1`): the sender streams `journalTail(wm+1)` in seq
+  order as RESYNC_ENTRYs with `jseq` set, in chunks (a fresh LMDB read txn
+  per chunk — a long stream never pins the freelist), then RESYNC_DONE
+  with its head at stream start.
+- **Watermark unusable** (sender's journal GC'd past it, rebuilt journal,
+  or `wm` ahead of the head): silent full-pull fallback.  The RESYNC_DONE
+  still carries `journal_head`, so the requester's very next RESYNC can
+  journal-diff.
+
+Contiguity is the soundness argument and it is why this mode cannot
+repeat the vector catastrophe: journal seqs are per-sender monotonic and
+the stream is applied in wire order, so the requester's persisted
+watermark NEVER wraps around unapplied entries.  A conn drop mid-stream
+truncates, the in-flight high-water dies with the conn, and the next
+RESYNC_REQ resumes from the last persisted (or DONE-settled) watermark —
+replayed prefix entries are idempotently ignored.  Watermarks persist
+lazily (every 4096 applied entries during a stream, always at DONE),
+folded into the regular checkpoint batch: a crash replays at most one
+4096-entry prefix at the next connect.
+
+Per-path semantics inside a diff stream are identical to a full pull
+(`entryAction`: fetch/adopt/tombstone/ignore by `relate()` on versions);
+announce traffic interleaved with a stream is reconciled by the same rule.
+A journal-diff stream of 0 entries is legal and converges immediately.
 
 Decoding is strict: every byte of the payload must be consumed
 (TrailingGarbage), every length field must fit the frame (Truncated), and

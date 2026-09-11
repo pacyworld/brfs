@@ -12,13 +12,18 @@
 //!   FETCH_ACK    origin u64 | seq u64 | path | sha256 [32]
 //!   TOMBSTONE    origin u64 | seq u64 | flags u16 | path
 //!   RESYNC_REQ   count u32 | count * (origin u64 | max_seq u64)     (version vector)
+//!                | journal_wm u64  (Phase 3b: requester's contiguous applied
+//!                journal seq for THIS sender; 0 = full pull)
 //!   RESYNC_ENTRY origin u64 | seq u64 | flags u16 | state u8 | mode u16 | size u64 |
-//!                mtime_sec i64 | mtime_nsec u32 | path | sha256 [32]
+//!                mtime_sec i64 | mtime_nsec u32 | path | sha256 [32] | jseq u64
+//!                (jseq = sender journal seq when journal-sourced, else 0)
 //!   MOVE_FROM    origin u64 | seq u64 | flags u16 | cookie u32 | path
 //!   MOVE_TO      same as MOVE_FROM
 //!   NACK         origin u64 | seq u64 | code u16 | path
-//!   RESYNC_DONE  count u64  (terminates a RESYNC stream; receiver runs its
-//!                            post-join local scan)
+//!   RESYNC_DONE  count u64 | journal_head u64  (terminates a RESYNC stream;
+//!                 receiver runs its post-join scan; journal_head = sender's
+//!                 journal head at stream start, 0 when stream not journaled —
+//!                 the requester's authoritative new watermark)
 //!
 //! flags bit0 = ISDIR.  All ops are idempotent; every incoming path is
 //! validated (contentset.validRelPath) before the caller may touch the
@@ -30,7 +35,9 @@ const Allocator = std.mem.Allocator;
 const contentset = @import("contentset.zig");
 
 pub const max_frame: u32 = 16 * 1024 * 1024;
-pub const protocol_version: u16 = 1;
+/// v2 (Phase 3b): RESYNC_REQ.journal_wm, RESYNC_ENTRY.jseq,
+/// RESYNC_DONE.journal_head.  Refused by v1 peers at HELLO.
+pub const protocol_version: u16 = 2;
 pub const nonce_len = 16;
 pub const max_vector = 64; // version-vector entries (mesh is <= 16 nodes)
 
@@ -108,6 +115,13 @@ pub const VectorEntry = struct { origin: u64, max_seq: u64 };
 pub const ResyncReq = struct {
     vector: [max_vector]VectorEntry,
     count: u16,
+    /// Requester's highest CONTIGUOUS journal seq received-and-applied
+    /// from this sender (per-sender state; 0 = no watermark -> the sender
+    /// streams full records).  Journal seqs are per-sender monotonic and
+    /// streamed in order over an ordered channel, so a watermark never
+    /// expresses a hole — the failure the per-origin-MAX vector had
+    /// (D15/ring-overflow lesson) does not apply.
+    journal_wm: u64 = 0,
 };
 
 pub const ResyncEntry = struct {
@@ -120,6 +134,17 @@ pub const ResyncEntry = struct {
     mtime_nsec: u32,
     path: []const u8,
     sha256: [32]u8,
+    /// Sender's journal seq this entry carries (0 = full-pull row).
+    jseq: u64 = 0,
+};
+
+/// Terminates a RESYNC stream.
+pub const ResyncDone = struct {
+    count: u64,
+    /// Sender's journal head at stream start; the requester records it as
+    /// its new watermark for this sender.  0 when the sender streamed no
+    /// journal (frozen, rebuilt, or empty).
+    journal_head: u64 = 0,
 };
 
 pub const Move = struct {
@@ -147,9 +172,9 @@ pub const Message = union(enum) {
     move_from: Move,
     move_to: Move,
     nack: Nack,
-    /// Terminates a RESYNC stream: count = entries sent.  The receiver
-    /// runs its post-join local scan when this arrives.
-    resync_done: u64,
+    /// Terminates a RESYNC stream.  The receiver records journal_head as
+    /// its new watermark (when > 0) and runs its post-join local scan.
+    resync_done: ResyncDone,
 };
 
 pub const DecodeError = error{ Truncated, FrameTooLarge, BadOp, BadPath, TrailingGarbage, VectorTooLarge };
@@ -226,6 +251,7 @@ pub fn encode(alloc: Allocator, msg: Message) ![]u8 {
                 try appendInt(w, alloc, u64, ve.origin);
                 try appendInt(w, alloc, u64, ve.max_seq);
             }
+            try appendInt(w, alloc, u64, m.journal_wm);
         },
         .resync_entry => |m| {
             try appendInt(w, alloc, u16, @intFromEnum(Op.resync_entry));
@@ -238,6 +264,7 @@ pub fn encode(alloc: Allocator, msg: Message) ![]u8 {
             try appendInt(w, alloc, u32, m.mtime_nsec);
             try appendStr(w, alloc, m.path);
             try w.appendSlice(alloc, &m.sha256);
+            try appendInt(w, alloc, u64, m.jseq);
         },
         .move_from, .move_to => |m| {
             const op: Op = if (msg == .move_from) .move_from else .move_to;
@@ -253,9 +280,10 @@ pub fn encode(alloc: Allocator, msg: Message) ![]u8 {
             try appendInt(w, alloc, u16, m.code);
             try appendStr(w, alloc, m.path);
         },
-        .resync_done => |count| {
+        .resync_done => |m| {
             try appendInt(w, alloc, u16, @intFromEnum(Op.resync_done));
-            try appendInt(w, alloc, u64, count);
+            try appendInt(w, alloc, u64, m.count);
+            try appendInt(w, alloc, u64, m.journal_head);
         },
     }
 
@@ -337,6 +365,7 @@ pub fn decode(payload: []const u8) DecodeError!Message {
             for (0..count) |i| {
                 rr.vector[i] = .{ .origin = try r.u64v(), .max_seq = try r.u64v() };
             }
+            rr.journal_wm = try r.u64v();
             break :blk .{ .resync_req = rr };
         },
         .resync_entry => blk: {
@@ -350,6 +379,7 @@ pub fn decode(payload: []const u8) DecodeError!Message {
             const path = try r.path();
             var sha: [32]u8 = undefined;
             try r.bytesInto(&sha);
+            const jseq = try r.u64v();
             break :blk .{ .resync_entry = .{
                 .ver = ver,
                 .is_dir = (flags & flag_isdir) != 0,
@@ -360,6 +390,7 @@ pub fn decode(payload: []const u8) DecodeError!Message {
                 .mtime_nsec = mtime_nsec,
                 .path = path,
                 .sha256 = sha,
+                .jseq = jseq,
             } };
         },
         .move_from, .move_to => blk: {
@@ -376,7 +407,7 @@ pub fn decode(payload: []const u8) DecodeError!Message {
             const path = try r.path();
             break :blk .{ .nack = .{ .ver = ver, .code = code, .path = path } };
         },
-        .resync_done => .{ .resync_done = try r.u64v() },
+        .resync_done => .{ .resync_done = .{ .count = try r.u64v(), .journal_head = try r.u64v() } },
         _ => return error.BadOp,
     };
     if (r.pos != payload.len) return error.TrailingGarbage;
@@ -538,7 +569,7 @@ test "roundtrip every opcode" {
         try t.expect(rt.msg.tombstone.is_dir);
     }
     {
-        var rr = ResyncReq{ .vector = undefined, .count = 2 };
+        var rr = ResyncReq{ .vector = undefined, .count = 2, .journal_wm = 4242 };
         rr.vector[0] = .{ .origin = 111, .max_seq = 55 };
         rr.vector[1] = .{ .origin = 222, .max_seq = 66 };
         const rt = try roundtrip(.{ .resync_req = rr });
@@ -546,6 +577,7 @@ test "roundtrip every opcode" {
         try t.expectEqual(@as(u16, 2), rt.msg.resync_req.count);
         try t.expectEqual(@as(u64, 222), rt.msg.resync_req.vector[1].origin);
         try t.expectEqual(@as(u64, 66), rt.msg.resync_req.vector[1].max_seq);
+        try t.expectEqual(@as(u64, 4242), rt.msg.resync_req.journal_wm);
     }
     {
         const rt = try roundtrip(.{ .resync_entry = .{
@@ -558,9 +590,17 @@ test "roundtrip every opcode" {
             .mtime_nsec = 3,
             .path = "t",
             .sha256 = shaOf("t"),
+            .jseq = 9001,
         } });
         defer t.allocator.free(rt.frame);
         try t.expectEqual(contentset.State.deleted, rt.msg.resync_entry.state);
+        try t.expectEqual(@as(u64, 9001), rt.msg.resync_entry.jseq);
+    }
+    {
+        const rt = try roundtrip(.{ .resync_done = .{ .count = 17, .journal_head = 4242 } });
+        defer t.allocator.free(rt.frame);
+        try t.expectEqual(@as(u64, 17), rt.msg.resync_done.count);
+        try t.expectEqual(@as(u64, 4242), rt.msg.resync_done.journal_head);
     }
     {
         const rt = try roundtrip(.{ .move_from = .{ .ver = .{ .origin = 9, .seq = 10 }, .is_dir = false, .cookie = 0, .path = "old" } });

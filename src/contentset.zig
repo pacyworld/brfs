@@ -227,6 +227,13 @@ pub const ContentSet = struct {
     /// the only recovery is a process restart (the dead mappings can never
     /// be re-attached to a remounted fs).
     frozen: bool = false,
+    /// Phase 3b: per-PEER journal watermarks — the highest contiguous
+    /// journal seq we have received-and-applied from each serving member
+    /// (keyed by the SENDER's origin = fnv1a64(node_id)).  Persisted in
+    /// the meta DBI as wm_<origin-hex> keys; a crash replays at most the
+    /// last un-persisted tail, which idempotent apply absorbs.  A local
+    /// journal rebuild does NOT clear these: they index PEER journals.
+    wms: std.AutoHashMap(u64, u64),
 
     /// Open (creating if needed) state_dir/csdb and load every record.
     /// node_id derives the local origin for version stamping.  A corrupt
@@ -245,6 +252,7 @@ pub const ContentSet = struct {
             .dbi_meta = 0,
             .dbi_journal = 0,
             .local_origin = nodeOrigin(node_id),
+            .wms = std.AutoHashMap(u64, u64).init(alloc),
         };
         errdefer {
             self.closeEnv();
@@ -326,6 +334,7 @@ pub const ContentSet = struct {
         while (iit.next()) |e|
             self.alloc.free(e.value_ptr.path);
         self.id_index.deinit();
+        self.wms.deinit();
     }
 
     fn openEnv(self: *ContentSet) !void {
@@ -383,6 +392,25 @@ pub const ContentSet = struct {
         if (self.getMeta(txn, meta_ring_seq)) |v| self.ring_seq = v;
         if (self.getMeta(txn, meta_root_fsid)) |v| self.root_fsid = v;
         if (self.getMeta(txn, meta_journal_seq)) |v| self.journal_seq = v;
+
+        // Phase 3b peer watermarks (wm_<origin hex16> keys; survive local
+        // journal rebuilds — they index PEER journals).
+        var mcur: ?*c.MDB_cursor = null;
+        try mdbCheck(c.mdb_cursor_open(txn, self.dbi_meta, &mcur));
+        defer c.mdb_cursor_close(mcur);
+        var mk: c.MDB_val = undefined;
+        var mv: c.MDB_val = undefined;
+        while (true) {
+            const mrc = c.mdb_cursor_get(mcur, &mk, &mv, c.MDB_NEXT);
+            if (mrc == c.MDB_NOTFOUND) break;
+            try mdbCheck(mrc);
+            const ks = mvalSlice(&mk);
+            if (ks.len != 3 + 16 or !std.mem.startsWith(u8, ks, "wm_")) continue;
+            const org = std.fmt.parseInt(u64, ks[3..], 16) catch continue;
+            if (mv.mv_size != 8) continue;
+            const p: [*]const u8 = @ptrCast(mv.mv_data);
+            self.wms.put(org, std.mem.readInt(u64, p[0..8], .big)) catch {};
+        }
 
         var cur: ?*c.MDB_cursor = null;
         try mdbCheck(c.mdb_cursor_open(txn, self.dbi_records, &cur));
@@ -665,14 +693,18 @@ pub const ContentSet = struct {
         return stat.ms_entries;
     }
 
-    /// Iterate journal entries from min_seq (inclusive).  The callback
-    /// receives decoded (seq, path, record) entries in ascending seq order.
+    /// Iterate journal entries from min_seq (inclusive), ascending.  The
+    /// callback receives decoded (seq, path, record) entries and stops the
+    /// walk by returning false.  limit bounds one call (0 = unbounded);
+    /// chunked callers re-enter with last_seq+1 — each chunk is one short
+    /// read txn so a long stream never pins the freelist.
     /// Returns the number of entries visited.
     pub fn journalTail(
         self: *ContentSet,
         min_seq: u64,
+        limit: u64,
         ctx: anytype,
-        cb: fn (@TypeOf(ctx), JournalEntry) void,
+        cb: fn (@TypeOf(ctx), JournalEntry) bool,
     ) u64 {
         if (self.frozen or self.env == null) return 0;
         var txn: ?*c.MDB_txn = null;
@@ -690,6 +722,7 @@ pub const ContentSet = struct {
         var op: c_uint = c.MDB_SET_RANGE;
         var count: u64 = 0;
         while (true) {
+            if (limit != 0 and count >= limit) break;
             const rc = c.mdb_cursor_get(cur, &k, &v, op);
             if (rc == c.MDB_NOTFOUND) break;
             if (rc != 0) break;
@@ -703,10 +736,57 @@ pub const ContentSet = struct {
             if (vslice.len < 2 + plen + value_len) continue;
             const path = vslice[2 .. 2 + plen];
             const rec = decodeRecord(vslice[2 + plen .. 2 + plen + value_len]) catch continue;
-            cb(ctx, .{ .seq = seq, .path = path, .rec = rec });
             count += 1;
+            if (!cb(ctx, .{ .seq = seq, .path = path, .rec = rec })) break;
         }
         return count;
+    }
+
+    /// Oldest retained journal seq (0 = empty journal).  GC's trailing
+    /// edge: a diff from before it is undeliverable (full-pull fallback).
+    pub fn journalFirst(self: *ContentSet) u64 {
+        if (self.frozen or self.env == null) return 0;
+        var txn: ?*c.MDB_txn = null;
+        if (c.mdb_txn_begin(self.env, null, c.MDB_RDONLY, &txn) != 0) return 0;
+        defer c.mdb_txn_abort(txn);
+        var cur: ?*c.MDB_cursor = null;
+        if (c.mdb_cursor_open(txn, self.dbi_journal, &cur) != 0) return 0;
+        defer c.mdb_cursor_close(cur);
+        var k: c.MDB_val = undefined;
+        var v: c.MDB_val = undefined;
+        if (c.mdb_cursor_get(cur, &k, &v, c.MDB_FIRST) != 0) return 0;
+        const ks = mvalSlice(&k);
+        if (ks.len != 8) return 0;
+        return std.mem.readInt(u64, ks[0..8], .big);
+    }
+
+    /// Can this journal serve a contiguous diff starting at wm+1?
+    /// Requires a nonzero in-range watermark with GC not past it; overlap
+    /// (first < wm+1) simply replays into idempotent applies.
+    pub fn journalDiffable(self: *ContentSet, wm: u64) bool {
+        if (wm == 0) return false;
+        if (wm > self.journal_seq) return false; // peer ahead: rebuilt journal
+        const first = self.journalFirst();
+        if (first == 0) return false; // empty
+        return first <= wm + 1;
+    }
+
+    /// The requester's contiguous applied watermark for a serving member.
+    pub fn journalWm(self: *const ContentSet, peer_origin: u64) u64 {
+        return self.wms.get(peer_origin) orelse 0;
+    }
+
+    /// Record (and durably persist with the next flush) a peer watermark.
+    /// Monotonic per peer; never regresses.
+    pub fn setJournalWm(self: *ContentSet, peer_origin: u64, seq: u64) !void {
+        if (self.wms.get(peer_origin)) |cur| {
+            if (seq <= cur) return;
+        }
+        try self.ensureTxn();
+        var keybuf: [3 + 16]u8 = undefined;
+        const key = std.fmt.bufPrint(&keybuf, "wm_{x:0>16}", .{peer_origin}) catch unreachable;
+        try self.putMeta(key, seq);
+        self.wms.put(peer_origin, seq) catch {};
     }
 
     /// Delete journal entries with seq < min_seq.  Returns the number
@@ -1348,15 +1428,16 @@ test "durable journal: upsert appends, tail reads, GC trims" {
     const Collector = struct {
         items: [8]ContentSet.JournalEntry = undefined,
         n: usize = 0,
-        fn collect(self: *@This(), e: ContentSet.JournalEntry) void {
+        fn collect(self: *@This(), e: ContentSet.JournalEntry) bool {
             if (self.n < 8) {
                 self.items[self.n] = e;
                 self.n += 1;
             }
+            return true;
         }
     };
     var col = Collector{};
-    const visited = cs.journalTail(1, &col, Collector.collect);
+    const visited = cs.journalTail(1, 0, &col, Collector.collect);
     try std.testing.expectEqual(@as(u64, 3), visited);
     try std.testing.expectEqual(@as(usize, 3), col.n);
     try std.testing.expectEqual(@as(u64, 1), col.items[0].seq);
@@ -1369,7 +1450,7 @@ test "durable journal: upsert appends, tail reads, GC trims" {
 
     // Tail from seq 2 skips the first.
     var col2 = Collector{};
-    _ = cs.journalTail(2, &col2, Collector.collect);
+    _ = cs.journalTail(2, 0, &col2, Collector.collect);
     try std.testing.expectEqual(@as(usize, 2), col2.n);
     try std.testing.expectEqual(@as(u64, 2), col2.items[0].seq);
 
@@ -1380,9 +1461,93 @@ test "durable journal: upsert appends, tail reads, GC trims" {
 
     // Tail from 1 now only returns the surviving entry.
     var col3 = Collector{};
-    _ = cs.journalTail(1, &col3, Collector.collect);
+    _ = cs.journalTail(1, 0, &col3, Collector.collect);
     try std.testing.expectEqual(@as(usize, 1), col3.n);
     try std.testing.expectEqual(@as(u64, 3), col3.items[0].seq);
+}
+
+test "durable journal: chunked tail, early stop, first/diffable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var cs = try ContentSet.open(alloc, dir, "jchunk");
+    defer cs.close();
+    var i: u64 = 0;
+    while (i < 10) : (i += 1) {
+        const p = try std.fmt.allocPrint(alloc, "f{d}", .{i});
+        defer alloc.free(p);
+        try cs.upsert(p, .{ .ver = .{ .origin = 1, .seq = i + 1 }, .size = i });
+    }
+    try cs.flush();
+
+    // Chunked walking with limit: 4 + 4 + 2.
+    const Walker = struct {
+        last: u64 = 0,
+        fn cb(self: *@This(), e: ContentSet.JournalEntry) bool {
+            self.last = e.seq;
+            return true;
+        }
+    };
+    var w = Walker{};
+    try std.testing.expectEqual(@as(u64, 4), cs.journalTail(1, 4, &w, Walker.cb));
+    try std.testing.expectEqual(@as(u64, 4), w.last);
+    try std.testing.expectEqual(@as(u64, 4), cs.journalTail(w.last + 1, 4, &w, Walker.cb));
+    try std.testing.expectEqual(@as(u64, 8), w.last);
+    try std.testing.expectEqual(@as(u64, 2), cs.journalTail(w.last + 1, 4, &w, Walker.cb));
+    try std.testing.expectEqual(@as(u64, 10), w.last);
+
+    // Early stop: callback false halts after the first entry.
+    const Stopper = struct {
+        n: u64 = 0,
+        fn cb(self: *@This(), _: ContentSet.JournalEntry) bool {
+            self.n += 1;
+            return false;
+        }
+    };
+    var st = Stopper{};
+    try std.testing.expectEqual(@as(u64, 1), cs.journalTail(1, 0, &st, Stopper.cb));
+    try std.testing.expectEqual(@as(u64, 1), st.n);
+
+    // First/diffable.
+    try std.testing.expectEqual(@as(u64, 1), cs.journalFirst());
+    try std.testing.expect(!cs.journalDiffable(0)); // watermark 0 = full pull
+    try std.testing.expect(!cs.journalDiffable(11)); // past head
+    try std.testing.expect(cs.journalDiffable(1));
+    try std.testing.expect(cs.journalDiffable(4));
+
+    // GC away 1..8 (retain from 9): a watermark below the floor is not
+    // diffable; one at the floor is.
+    _ = try cs.journalGc(9);
+    try std.testing.expectEqual(@as(u64, 9), cs.journalFirst());
+    try std.testing.expect(!cs.journalDiffable(7)); // 7+1 < first: gap
+    try std.testing.expect(cs.journalDiffable(8)); // exactly the floor
+    try std.testing.expect(cs.journalDiffable(9)); // overlap replays
+}
+
+test "peer watermarks persist across close/reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var cs = try ContentSet.open(alloc, dir, "wmtest");
+    try std.testing.expectEqual(@as(u64, 0), cs.journalWm(0xdeadbeef));
+    try cs.setJournalWm(0xdeadbeef, 64);
+    try cs.setJournalWm(0xcafe, 7);
+    // Monotonic: never regresses.
+    try cs.setJournalWm(0xdeadbeef, 63);
+    try std.testing.expectEqual(@as(u64, 64), cs.journalWm(0xdeadbeef));
+    cs.close();
+
+    var cs2 = try ContentSet.open(alloc, dir, "wmtest");
+    defer cs2.close();
+    try std.testing.expectEqual(@as(u64, 64), cs2.journalWm(0xdeadbeef));
+    try std.testing.expectEqual(@as(u64, 7), cs2.journalWm(0xcafe));
+    try std.testing.expectEqual(@as(u64, 0), cs2.journalWm(12345));
 }
 
 test "durable journal: seq survives close + reopen" {

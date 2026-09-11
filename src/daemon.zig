@@ -176,6 +176,12 @@ const Incoming = struct {
 
 const fetch_timeout_ms: i64 = 30_000;
 
+/// Journal-diff streaming chunk size (one LMDB read txn per chunk) and
+/// the requester's lazy watermark-persist interval.  A crash replays at
+/// most this many already-applied entries, which idempotency absorbs.
+const journal_stream_chunk: u64 = 4096;
+const wm_persist_every: u64 = 4096;
+
 /// Async local-content hash job.  processUpsert submits one of these
 /// instead of hashing on the core loop (every local file change re-hashed
 /// the whole file synchronously at debounce fire — the biggest known
@@ -1294,7 +1300,7 @@ pub const Daemon = struct {
             .tombstone => |m| self.onTombstone(p, m),
             .resync_req => |m| self.onResyncReq(p, m),
             .resync_entry => |m| self.onResyncEntry(p, m),
-            .resync_done => |count| self.onResyncDone(p, count),
+            .resync_done => |m| self.onResyncDone(p, m),
             .move_from => |m| {
                 if (p.state != .ready) return;
                 p.noteRemoteMove(m.cookie, m.path, m.ver, m.is_dir, now) catch {};
@@ -1929,16 +1935,23 @@ pub const Daemon = struct {
     // ---- resync ----
 
     fn sendResyncReq(self: *Daemon, p: *Peer) void {
-        // Full-record pull (rig-proven 2026-08-28): a conn drop mid-
-        // announce-burst loses queued frames, and the per-origin-MAX
-        // version vector cannot express the resulting hole — vector-diff
-        // resync reported "0 entries" while the requester was missing 934
-        // records (t-ringoverflow divergence).  An empty vector asks the
-        // peer to stream ALL records; entryAction idempotently ignores
-        // what we already hold and fetches the holes.  Reconnects are
-        // rare and trees are POC-scale; Phase 3's durable journal
-        // restores efficient diffing.
-        self.pushTo(p, .{ .resync_req = .{ .vector = undefined, .count = 0 } });
+        // Phase 3b watermark diff: the journal seq we last applied from
+        // THIS sender asks for a contiguous tail instead of a full-record
+        // pull.  Hole-safety by construction: journal seqs are per-sender
+        // monotonic and stream in order over TCP — a conn drop mid-burst
+        // can only truncate, and the persisted watermark resumes exactly
+        // at the cut (the per-origin-MAX vector could not express that
+        // hole; ring-overflow stranded 934 records, 2026-08-28).  The
+        // vector stays EMPTY on purpose: it also feeds the tombstone-GC
+        // ack horizon, where a coarse per-origin max suffers the very
+        // same hole unsoundness — horizon revival wants per-peer journal
+        // watermarks instead (later work, not yet).
+        // entryAction idempotently ignores anything replayed.
+        var rr = protocol.ResyncReq{ .vector = undefined, .count = 0 };
+        p.rs_jseq = 0; // a fresh stream restarts the in-flight high-water
+        if (p.node_id) |nid|
+            rr.journal_wm = self.cs.journalWm(contentset.nodeOrigin(nid));
+        self.pushTo(p, .{ .resync_req = rr });
     }
 
     /// Gap #7 ack horizon: record the member's announced vector.
@@ -1978,6 +1991,13 @@ pub const Daemon = struct {
         if (p.state != .ready) return;
         // Gap #7: the requester's vector doubles as its ack horizon proof.
         if (p.node_id) |nid| self.noteMemberVector(nid, m);
+        if (self.cs.journalDiffable(m.journal_wm)) {
+            self.serveResyncDiff(p, m.journal_wm);
+            return;
+        }
+        // Full-record pull: no usable watermark (first contact, GC'd
+        // range, or the sender's journal was rebuilt).  entryAction
+        // idempotently ignores what the requester already holds.
         var count: u64 = 0;
         var it = self.cs.map.iterator();
         while (it.next()) |e| {
@@ -1996,13 +2016,74 @@ pub const Daemon = struct {
             } }) catch return;
             count += 1;
         }
-        self.pushTo(p, .{ .resync_done = count });
-        log(.info, "served RESYNC to {s}: {d} entries", .{ peerName(p), count });
+        // The head rides along even on a full pull: the streamed map IS
+        // every record up to it, so the requester can journal-diff from
+        // here next time.
+        self.pushTo(p, .{ .resync_done = .{ .count = count, .journal_head = self.cs.journalHead() } });
+        log(.info, "served RESYNC to {s}: {d} entries (full pull)", .{ peerName(p), count });
+    }
+
+    /// Phase 3b: stream only what the requester's watermark misses, in
+    /// contiguous journal order.  Chunked: each tail call is a fresh short
+    /// read txn, so a long stream never pins LMDB's freelist and never
+    /// stalls writers on the serving node.  Saturation mid-stream aborts
+    /// WITHOUT a RESYNC_DONE (same as the full-pull path): the requester's
+    /// persisted watermark restarts the diff exactly at the cut.
+    fn serveResyncDiff(self: *Daemon, p: *Peer, wm: u64) void {
+        const head = self.cs.journalHead();
+        const Ctx = struct {
+            p: *Peer,
+            ok: bool = true,
+            count: u64 = 0,
+            last: u64 = 0,
+            fn push(ctx: *@This(), e: ContentSet.JournalEntry) bool {
+                const r = &e.rec;
+                ctx.p.send(.{ .resync_entry = .{
+                    .ver = r.ver,
+                    .is_dir = r.is_dir,
+                    .state = r.state,
+                    .mode = r.mode,
+                    .size = r.size,
+                    .mtime_sec = r.mtime_sec,
+                    .mtime_nsec = r.mtime_nsec,
+                    .path = e.path,
+                    .sha256 = r.sha256,
+                    .jseq = e.seq,
+                } }) catch {
+                    ctx.ok = false;
+                    return false;
+                };
+                ctx.last = e.seq;
+                ctx.count += 1;
+                return true;
+            }
+        };
+        var ctx = Ctx{ .p = p };
+        var from: u64 = wm + 1;
+        while (from <= head) {
+            const n = self.cs.journalTail(from, journal_stream_chunk, &ctx, Ctx.push);
+            if (!ctx.ok) {
+                log(.warn, "RESYNC diff to {s} truncated at journal seq {d} (send); peer resumes from its watermark", .{ peerName(p), ctx.last });
+                return;
+            }
+            if (n < journal_stream_chunk) break; // drained
+            from = ctx.last + 1;
+        }
+        self.pushTo(p, .{ .resync_done = .{ .count = ctx.count, .journal_head = head } });
+        log(.info, "served RESYNC diff to {s}: {d} entries from journal seq {d}..{d}", .{ peerName(p), ctx.count, wm + 1, head });
     }
 
     fn onResyncEntry(self: *Daemon, p: *Peer, m: protocol.ResyncEntry) void {
         if (p.state != .ready) return;
         if (!self.csGate()) return;
+        // Phase 3b: journal-sourced entries advance the in-flight
+        // high-water for this peer; persisted lazily (folded into the
+        // regular checkpoint batch — no fsync per entry).
+        if (m.jseq > 0 and m.jseq > p.rs_jseq) {
+            p.rs_jseq = m.jseq;
+            if (p.node_id != null and p.rs_jseq % wm_persist_every == 0)
+                self.cs.setJournalWm(contentset.nodeOrigin(p.node_id.?), p.rs_jseq) catch {};
+        }
         switch (resync.entryAction(&self.cs, m)) {
             .ignore => {},
             .tombstone => {
@@ -2038,9 +2119,21 @@ pub const Daemon = struct {
         }
     }
 
-    fn onResyncDone(self: *Daemon, p: *Peer, count: u64) void {
+    fn onResyncDone(self: *Daemon, p: *Peer, done: protocol.ResyncDone) void {
         if (p.state != .ready) return;
-        log(.info, "RESYNC from {s} complete: {d} entries", .{ peerName(p), count });
+        // The DONE ends a complete ordered stream: everything up to the
+        // sender's head was received-and-applied (or idempotently
+        // skipped).  Settle the peer watermark at the final point — this
+        // is the value the next RESYNC_REQ will advertise.
+        if (p.node_id) |nid| {
+            const settled = @max(p.rs_jseq, done.journal_head);
+            if (settled > 0 and settled > self.cs.journalWm(contentset.nodeOrigin(nid))) {
+                self.cs.setJournalWm(contentset.nodeOrigin(nid), settled) catch {};
+                log(.info, "journal watermark for {s} settled at seq {d}", .{ peerName(p), settled });
+            }
+        }
+        p.rs_jseq = 0;
+        log(.info, "RESYNC from {s} complete: {d} entries", .{ peerName(p), done.count });
         if (!self.resynced) {
             self.resynced = true;
             if (self.fs_frozen) return; // gap #16: no scan against the wrong fs
@@ -2475,6 +2568,17 @@ pub const Daemon = struct {
         self.ctlPrint(out, "# TYPE brfs_journal_entries gauge\n", .{});
         if (self.csGate())
             self.ctlPrint(out, "brfs_journal_entries{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.cs.journalCount() });
+        // Phase 3b: per-peer applied journal watermark (drives the RESYNC
+        // diff; a peer stuck low while our head climbs is a sick pull).
+        self.ctlPrint(out, "# TYPE brfs_journal_wm gauge\n", .{});
+        for (self.peers.items) |q| {
+            if (q.node_id) |nid|
+                self.ctlPrint(out, "brfs_journal_wm{{node=\"{s}\",peer=\"{s}\"}} {d}\n", .{
+                    self.cfg.node_id,
+                    nid,
+                    self.cs.journalWm(contentset.nodeOrigin(nid)),
+                });
+        }
         self.ctlPrint(out, "# TYPE brfs_resynced gauge\n", .{});
         self.ctlPrint(out, "brfs_resynced{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.resynced) });
         self.ctlPrint(out, "# TYPE brfs_ring_seq gauge\n", .{});

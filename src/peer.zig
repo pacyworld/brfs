@@ -68,6 +68,10 @@ pub const Peer = struct {
     next_retry_ms: i64 = 0,
     backoff_ms: i64 = backoff_initial_ms,
     moves: std.AutoHashMap(u32, RemoteMove), // cookie -> pending MOVE_FROM
+    /// Phase 3b: in-flight RESYNC stream's highest applied journal seq
+    /// from this peer (reset per RESYNC_REQ; persisted to the content set
+    /// lazily and at RESYNC_DONE).
+    rs_jseq: u64 = 0,
     /// TLS connection state (null when TLS not configured or not yet started).
     tls_conn: ?tls.TlsConn = null,
     /// Stable bounce buffer for TLS writes (see writeReady).  Empty until

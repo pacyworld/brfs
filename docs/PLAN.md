@@ -317,6 +317,22 @@ pairs. All ops idempotent. See docs/protocol.md.
   issued from the completion callback only after a fresh stat confirms
   the hashed bytes still stand (dirty flag re-drives otherwise), so
   versions are taken at announce time, never at submit time.
+  **Phase 3b watermark-based RESYNC diffing DONE 2026-09-10** (second
+  session): RESYNC_REQ carries the requester's contiguous applied journal
+  seq for the sender (0 = full pull, retained forever as the fallback for
+  first contact / GC'd range / rebuilt journal); the sender streams
+  journalTail(wm+1) in 4096-entry chunks (fresh LMDB read txn per chunk,
+  freelist never pinned); RESYNC_ENTRY gains the sender's journal seq;
+  RESYNC_DONE gains the sender's journal head which settles the new
+  watermark.  Watermarks persist per-peer in the meta DBI (wm_<origin>
+  keys), lazily during a stream (every 4096 applied) and authoritatively
+  at DONE.  Contiguity is the soundness argument the per-origin-MAX
+  vector could never give: a mid-stream conn drop truncates, nothing
+  more; the next RESYNC resumes at the persisted watermark and replays
+  at most one 4096-entry prefix idempotently.  The version vector stays
+  EMPTY (it also feeds the tombstone-GC ack horizon, where the same
+  over-coverage hole would return; horizon revival is later work).
+  Rig test: tests/vm/t-journal-resync.sh.
   **CI-backlog fixes 2026-09-10**: the libcrypto atexit test-binary
   crash was an LMDB cursor-closed-after-txn-commit UAF in journalGc
   (latent on the daemon's hourly journal GC, caught by UBSan under
