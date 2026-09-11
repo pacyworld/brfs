@@ -79,6 +79,25 @@ requester advertises that value as `journal_wm`:
   still carries `journal_head`, so the requester's very next RESYNC can
   journal-diff.
 
+**The served head is the COMMITTED head, not the in-memory one.** LMDB
+read txns cannot see the sender's pending write txn; serving by the
+in-memory seq would read an empty tail yet still settle the requester's
+watermark past it (rig-proven: an online burst's tail vanished this way
+for a rejoining peer). `journal_committed` advances at every flush, and
+the daemon's checkpoint pass pushes each newly-durable tail to every peer
+it has served (full-pull reseed if that peer's watermark went
+undiffable), so no serve ever waits for a reconnect to finish a window.
+Watermarks therefore never overtake durable state anywhere.
+
+**Dir renames are journaled per-descendant.** A wire rename moves the top
+entry; every member additionally rewrites each live descendant's record
+to the new path under the rename's version (identically on all nodes, so
+no per-child wire traffic is needed), tombstones the old paths, and —
+receiver side only — retargets in-flight child installs and re-fetches
+bytes that never landed. Because the sender's translation is itself
+journaled, diff streams carry the child rows: an offline joiner fetches
+`new/child`, never a NACK'd `old/child`.
+
 Contiguity is the soundness argument and it is why this mode cannot
 repeat the vector catastrophe: journal seqs are per-sender monotonic and
 the stream is applied in wire order, so the requester's persisted

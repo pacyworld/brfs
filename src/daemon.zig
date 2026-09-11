@@ -1297,7 +1297,7 @@ pub const Daemon = struct {
                 };
                 log(.info, "peer {s} handshake OK ({s})", .{ p.node_id.?, if (p.outbound) "outbound" else "inbound" });
                 if (self.dedupMesh(p, now)) return; // p lost the dedup
-                self.sendResyncReq(p);
+                self.sendResyncReq(p, false);
             },
             .announce => |m| self.onAnnounce(p, m),
             .fetch_req => |m| self.onFetchReq(p, m),
@@ -1775,13 +1775,13 @@ pub const Daemon = struct {
             }
         }
         // T19 race: a same-origin tombstone applies cleanly per the stored
-        // record, but a local edit can still sit in the journal's debounce
-        // window (never committed a version).  Without this the tombstone
-        // deletes the edited file silently; with it, the in-flight edit is
-        // quarantined before the delete (rig-proven 2026-08-30).  Rare
-        // false positive (attrib-only touch quarantines identical content)
-        // is acceptable — conflicts/ is operator-prunable.
-        if (!quarantine_loser and !m.is_dir and self.jr.hasPending(m.path))
+        // record, but a local edit can sit UNCOMMITTED in either half of
+        // the announce pipeline — the journal debounce window or the
+        // pending off-loop content hash (rig-proven 2026-09-10: the async
+        // hash moved the window out of hasPending's sight and T19's loser
+        // was deleted, not quarantined).  Quarantine before the delete.
+        if (!quarantine_loser and !m.is_dir and
+            (self.jr.hasPending(m.path) or self.pending_hash.contains(m.path)))
             quarantine_loser = true;
         // Echo suppression BEFORE the fs mutations: the deletes we perform
         // (and a quarantine move) must not re-enter the journal as local
@@ -2008,7 +2008,12 @@ pub const Daemon = struct {
 
     // ---- resync ----
 
-    fn sendResyncReq(self: *Daemon, p: *Peer) void {
+    /// RESYNC_REQ with the routine watermark-diff hint (full=false) or as
+    /// an explicit FULL pull (full=true).  Recovery paths (stall re-drive,
+    /// operator `brfsctl resync`) must full-pull: a watermark diff streams
+    /// only NEW rows and would never re-evaluate a record whose content
+    /// fetch failed (T15 rig-proven: NoSpaceLeft'd file stranded forever).
+    fn sendResyncReq(self: *Daemon, p: *Peer, full: bool) void {
         // Phase 3b watermark diff: the journal seq we last applied from
         // THIS sender asks for a contiguous tail instead of a full-record
         // pull.  Hole-safety by construction: journal seqs are per-sender
@@ -2023,8 +2028,10 @@ pub const Daemon = struct {
         // entryAction idempotently ignores anything replayed.
         var rr = protocol.ResyncReq{ .vector = undefined, .count = 0 };
         p.rs_jseq = 0; // a fresh stream restarts the in-flight high-water
-        if (p.node_id) |nid|
-            rr.journal_wm = self.cs.journalWm(contentset.nodeOrigin(nid));
+        if (!full) {
+            if (p.node_id) |nid|
+                rr.journal_wm = self.cs.journalWm(contentset.nodeOrigin(nid));
+        }
         self.pushTo(p, .{ .resync_req = rr });
     }
 
@@ -2342,11 +2349,12 @@ pub const Daemon = struct {
             if (self.incoming.fetchRemove(path)) |kv| self.alloc.free(kv.key);
             restalled = true;
         }
-        // Re-drive: a fresh vector pull re-fetches whatever we still lack
-        // (idempotent; peers stream only what our vector doesn't cover).
+        // Re-drive after stalls must be a FULL pull: entries already past
+        // the watermark never resurface in a diff, but their content may
+        // still be missing locally (exactly what the stall was about).
         if (restalled) {
             for (self.peers.items) |p| {
-                if (p.state == .ready) self.sendResyncReq(p);
+                if (p.state == .ready) self.sendResyncReq(p, true);
             }
         }
 
@@ -2757,7 +2765,10 @@ pub const Daemon = struct {
         var n: u64 = 0;
         for (self.peers.items) |p| {
             if (p.state == .ready) {
-                self.sendResyncReq(p);
+                // Operator-driven resync = the recovery valve: FULL pull,
+                // so records whose content fetch once failed re-evaluate
+                // (a watermark diff streams only new rows — see T15).
+                self.sendResyncReq(p, true);
                 n += 1;
             }
         }
