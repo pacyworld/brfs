@@ -218,6 +218,15 @@ pub const ContentSet = struct {
     /// committed atomically with the content set.
     journal_seq: u64 = 0,
     needs_scan: bool = false,
+    /// Gap #16 runtime freeze: the daemon's watched root resolved to a
+    /// different fsid than stamped (forced unmount / rebuilt fs).  The
+    /// env's data.mdb shares that fs — its mappings are revoked, so ANY
+    /// LMDB read or write is an assert/SIGBUS.  While latched every
+    /// LMDB-touching entry point below refuses; in-memory maps stay
+    /// queryable.  The pending write batch was aborted at the transition;
+    /// the only recovery is a process restart (the dead mappings can never
+    /// be re-attached to a remounted fs).
+    frozen: bool = false,
 
     /// Open (creating if needed) state_dir/csdb and load every record.
     /// node_id derives the local origin for version stamping.  A corrupt
@@ -498,6 +507,7 @@ pub const ContentSet = struct {
     /// Insert or replace the record for path, write-through into the
     /// pending LMDB txn.  Caller flushes at batch boundaries.
     pub fn upsert(self: *ContentSet, path: []const u8, rec: Record) !void {
+        if (self.frozen) return error.Frozen; // also skips the in-memory map
         if (!validRelPath(path)) return error.BadPath;
         if (path.len > max_path_len) return error.NameTooLong;
 
@@ -563,6 +573,7 @@ pub const ContentSet = struct {
     /// the daemon calls it on a timer and at shutdown.  Replays after a
     /// crash are safe because every downstream op is idempotent.
     pub fn checkpoint(self: *ContentSet, ring_seq: u64) !void {
+        if (self.frozen) return;
         if (ring_seq == self.ring_seq) return;
         self.ring_seq = ring_seq;
         try self.ensureTxn();
@@ -572,6 +583,7 @@ pub const ContentSet = struct {
     /// Commit the pending write txn (records + ring-seq + local seq
     /// ceiling in ONE atomic fsync'd commit — gap #12).
     pub fn flush(self: *ContentSet) !void {
+        if (self.frozen) return; // env revoked: committing touches dead pages
         if (self.wtxn == null) return;
         // Top up the reserved ceiling so the window stays a full
         // seq_reserve_window ahead at every commit boundary.
@@ -644,7 +656,7 @@ pub const ContentSet = struct {
 
     /// Count of journal entries (read-only snapshot).
     pub fn journalCount(self: *ContentSet) u64 {
-        if (self.env == null) return 0;
+        if (self.frozen or self.env == null) return 0;
         var txn: ?*c.MDB_txn = null;
         if (c.mdb_txn_begin(self.env, null, c.MDB_RDONLY, &txn) != 0) return 0;
         defer c.mdb_txn_abort(txn);
@@ -662,7 +674,7 @@ pub const ContentSet = struct {
         ctx: anytype,
         cb: fn (@TypeOf(ctx), JournalEntry) void,
     ) u64 {
-        if (self.env == null) return 0;
+        if (self.frozen or self.env == null) return 0;
         var txn: ?*c.MDB_txn = null;
         if (c.mdb_txn_begin(self.env, null, c.MDB_RDONLY, &txn) != 0) return 0;
         defer c.mdb_txn_abort(txn);
@@ -700,6 +712,7 @@ pub const ContentSet = struct {
     /// Delete journal entries with seq < min_seq.  Returns the number
     /// of entries removed.
     pub fn journalGc(self: *ContentSet, min_seq: u64) !u64 {
+        if (self.frozen) return 0;
         try self.ensureTxn();
         var cur: ?*c.MDB_cursor = null;
         try mdbCheck(c.mdb_cursor_open(self.wtxn, self.dbi_journal, &cur));
@@ -740,6 +753,7 @@ pub const ContentSet = struct {
     /// configured member's version vector covers it (they have all SEEN
     /// the delete — early collection).  Returns the number collected.
     pub fn gcTombstones(self: *ContentSet, now_sec: i64, horizon: ?AckHorizon) !u64 {
+        if (self.frozen) return 0;
         var doomed: std.ArrayList([]const u8) = .empty;
         defer doomed.deinit(self.alloc);
         var it = self.map.iterator();
@@ -808,11 +822,14 @@ pub const ContentSet = struct {
     }
 
     fn ensureTxn(self: *ContentSet) !void {
+        if (self.frozen) return error.Frozen;
         if (self.wtxn != null) return;
         try mdbCheck(c.mdb_txn_begin(self.env, null, 0, &self.wtxn));
     }
 
-    fn abortTxn(self: *ContentSet) void {
+    /// Public for the daemon's freeze transition: discards the pending
+    /// batch exactly like a crash would (memory-only; never touches pages).
+    pub fn abortTxn(self: *ContentSet) void {
         if (self.wtxn) |txn| {
             c.mdb_txn_abort(txn);
             self.wtxn = null;

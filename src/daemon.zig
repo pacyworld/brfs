@@ -547,6 +547,7 @@ pub const Daemon = struct {
             self.cs.setRootFsid(self.tree_fsid) catch {};
         } else if (self.cs.root_fsid != self.tree_fsid) {
             self.fs_frozen = true;
+            self.cs.frozen = true; // never write the wrong fs's env again
             events.delRoot(self.dev_fd, self.cfg.replicated_path) catch {};
             log(.err, "watched root fsid {x} != stamped {x}: filesystem unmounted/rebuilt — replication FROZEN until restart with the correct mount", .{ self.tree_fsid, self.cs.root_fsid });
         }
@@ -827,6 +828,7 @@ pub const Daemon = struct {
     // ---- journal work: the announce path ----
 
     fn processWork(self: *Daemon, work: *journal.Work) void {
+        if (!self.csGate()) return; // fs gone: staged events dissolve; the post-restart scan converges
         switch (work.*) {
             .upsert => |*e| self.processUpsert(e),
             .delete => |*e| self.processDelete(e),
@@ -985,6 +987,10 @@ pub const Daemon = struct {
         defer self.alloc.free(job.path);
         defer self.alloc.free(job.abs);
         const kv = self.pending_hash.fetchRemove(job.path) orelse return;
+        if (!self.csGate()) {
+            self.alloc.free(kv.key);
+            return;
+        }
         const dirtied = kv.value;
         self.alloc.free(kv.key);
 
@@ -1051,6 +1057,7 @@ pub const Daemon = struct {
     }
 
     fn processDelete(self: *Daemon, e: *journal.Entry) void {
+        if (!self.csGate()) return;
         const rec = self.cs.lookup(e.path) orelse return;
         if (rec.state == .deleted) return;
         // Gap #17 mass-delete guard (guard.zig): covers BOTH the live
@@ -1628,6 +1635,10 @@ pub const Daemon = struct {
         defer if (res.job.ack_peer) |ap| self.alloc.free(ap);
         defer if (res.job.quarantined) |q| self.alloc.free(q);
 
+        // fs gone mid-install: drop the result; the wire side recovers on
+        // the post-restart resync.
+        if (!self.csGate()) return;
+
         if (res.err) |err| {
             log(.warn, "install {s} failed: {s}", .{ path, @errorName(err) });
             self.cs.dropId(self.tree_fsid, res.job.fileid);
@@ -1739,6 +1750,7 @@ pub const Daemon = struct {
 
     fn onTombstone(self: *Daemon, p: *Peer, m: protocol.Tombstone) void {
         if (p.state != .ready) return;
+        if (!self.csGate()) return;
         var quarantine_loser = false;
         if (self.cs.lookup(m.path)) |rec| {
             switch (contentset.relate(m.ver, rec.ver)) {
@@ -1811,6 +1823,7 @@ pub const Daemon = struct {
 
     fn onMoveTo(self: *Daemon, p: *Peer, m: protocol.Move) void {
         if (p.state != .ready) return;
+        if (!self.csGate()) return;
         var mv = p.takeRemoteMove(m.cookie) orelse {
             // Unpaired TO: sender moved it in from outside its tree; we
             // need the content.
@@ -1887,6 +1900,7 @@ pub const Daemon = struct {
     }
 
     fn upsertFromWire(self: *Daemon, path: []const u8, ver: Version, is_dir: bool, mode: u16, size: u64, mtime_sec: i64, mtime_nsec: u32, sha: [32]u8) void {
+        if (!self.csGate()) return;
         var rec = contentset.Record{
             .ver = ver,
             .size = size,
@@ -1988,6 +2002,7 @@ pub const Daemon = struct {
 
     fn onResyncEntry(self: *Daemon, p: *Peer, m: protocol.ResyncEntry) void {
         if (p.state != .ready) return;
+        if (!self.csGate()) return;
         switch (resync.entryAction(&self.cs, m)) {
             .ignore => {},
             .tombstone => {
@@ -2106,13 +2121,12 @@ pub const Daemon = struct {
 
         // Rescan floor (ring overflow / unknown-dir events).
         if (self.need_rescan and now - self.last_rescan_ms >= rescan_cooldown_ms and self.resynced) {
-            if (!self.rootFsidOk()) {
+            if (!self.csGate()) {
                 // Gap #16, runtime half: a forced unmount mid-run swapped
                 // the path to the parent fs's mountpoint — the tree LOOKS
-                // empty.  Defer (keep need_rescan set) instead of
-                // tombstoning the mesh; remount restores the fsid and the
-                // next pass converges automatically.
-                log(.err, "watched root fsid changed (forced unmount?) — rescan deferred, tombstones frozen", .{});
+                // empty.  Keep need_rescan set instead of tombstoning the
+                // mesh (the transition logs once; recovery = restart, the
+                // revoked env mappings can never serve a remount).
                 self.last_rescan_ms = now;
             } else {
                 self.need_rescan = false;
@@ -2152,7 +2166,7 @@ pub const Daemon = struct {
         }
 
         // Ring-seq checkpoint (USN analog resume point).
-        if (now - self.last_checkpoint_ms >= checkpoint_interval_ms) {
+        if (now - self.last_checkpoint_ms >= checkpoint_interval_ms and self.csGate()) {
             self.last_checkpoint_ms = now;
             self.cs.checkpoint(self.jr.high_seq) catch {};
             self.cs.flush() catch {};
@@ -2162,7 +2176,7 @@ pub const Daemon = struct {
         // every configured member's announced vector covers the tombstone
         // (the all-member-ack horizon — early collection for a healthy
         // mesh).
-        if (now - self.last_gc_ms >= gc_interval_ms) {
+        if (now - self.last_gc_ms >= gc_interval_ms and self.csGate()) {
             self.last_gc_ms = now;
             const horizon = contentset.AckHorizon{ .ctx = self, .covers = ackCovers };
             const collected = self.cs.gcTombstones(@intCast(@divFloor(now, 1000)), horizon) catch 0;
@@ -2207,6 +2221,21 @@ pub const Daemon = struct {
         if (self.fs_frozen) return false;
         const cur = installer.fsidOf(self.cfg.replicated_path) catch return false;
         return cur == self.tree_fsid;
+    }
+
+    /// Content-set admission gate.  The csdb env lives on the watched fs;
+    /// once the root stops resolving to the stamped fsid (forced unmount),
+    /// the env's mappings are revoked and ANY LMDB touch is an assert or
+    /// SIGBUS.  Every mutation/commit/GC/env-read path funnels through
+    /// here.  The first failing check aborts the pending write batch
+    /// (memory-only) and latches cs.frozen; recovery needs a restart.
+    fn csGate(self: *Daemon) bool {
+        if (self.cs.frozen) return false;
+        if (self.rootFsidOk()) return true;
+        self.cs.abortTxn();
+        self.cs.frozen = true;
+        log(.err, "watched root fsid changed (forced unmount?) — csdb access frozen (rescan deferred, tombstones frozen); restart after remount", .{});
+        return false;
     }
 
     fn cleanStaging(self: *Daemon) void {
@@ -2390,8 +2419,13 @@ pub const Daemon = struct {
             if (self.guard.latched) "LATCHED — local tombstones suppressed" else "clear",
             self.guard.count,
         });
-        self.ctlPrint(out, "fs: {s}\n", .{if (self.fs_frozen) "FROZEN (fsid mismatch — see log)" else "ok"});
-        self.ctlPrint(out, "journal: seq={d} entries={d}\n", .{ self.cs.journalHead(), self.cs.journalCount() });
+        self.ctlPrint(out, "fs: {s}\n", .{if (self.fs_frozen or self.cs.frozen) "FROZEN (fsid mismatch — see log)" else "ok"});
+        if (self.csGate()) {
+            self.ctlPrint(out, "journal: seq={d} entries={d}\n", .{ self.cs.journalHead(), self.cs.journalCount() });
+        } else {
+            // env revoked: entry count lives behind dead mappings.
+            self.ctlPrint(out, "journal: seq={d} entries=frozen\n", .{self.cs.journalHead()});
+        }
     }
 
     /// Prometheus text exposition (gauges; brfsctl prepends the kernel
@@ -2439,7 +2473,8 @@ pub const Daemon = struct {
         self.ctlPrint(out, "# TYPE brfs_journal_seq counter\n", .{});
         self.ctlPrint(out, "brfs_journal_seq{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.cs.journalHead() });
         self.ctlPrint(out, "# TYPE brfs_journal_entries gauge\n", .{});
-        self.ctlPrint(out, "brfs_journal_entries{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.cs.journalCount() });
+        if (self.csGate())
+            self.ctlPrint(out, "brfs_journal_entries{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.cs.journalCount() });
         self.ctlPrint(out, "# TYPE brfs_resynced gauge\n", .{});
         self.ctlPrint(out, "brfs_resynced{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.resynced) });
         self.ctlPrint(out, "# TYPE brfs_ring_seq gauge\n", .{});

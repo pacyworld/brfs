@@ -131,12 +131,24 @@ have_event CREATE again.txt || fail "CREATE after move-back-in"
 ok "move-back-in re-flag"
 
 # --- DELROOT silence ----------------------------------------------------
+# The smoke daemon's own shutdown DELROOTs $TREE today, so by the time we
+# get here there may be nothing registered under it (the ioctl then
+# returns ENOENT and this step tested nothing).  Register a devtest-owned
+# root silenced by an explicit DELROOT instead: coverage must emit before
+# the delete and go quiet after.
 pkill -x brfsd; sleep 1
-$DEVTEST del "$TREE"
-before=$(sysctl -n security.brfs.event_count)
-touch "$TREE/after-delroot.txt"; sleep 0.3
-after=$(sysctl -n security.brfs.event_count)
-[ "$before" = "$after" ] || fail "events after DELROOT"
+DELTREE="$(dirname "$TREE")/tap-smoke-delroot"
+rm -rf "$DELTREE"
+mkdir -p "$DELTREE/sub"
+$DEVTEST add "$DELTREE"
+sleep 2                                    # deferred subtree walk
+touch "$DELTREE/sub/warm.txt"; sleep 1     # must emit (walk coverage)
+warm=$(sysctl -n security.brfs.event_count)
+$DEVTEST del "$DELTREE"
+touch "$DELTREE/sub/cold.txt"; sleep 1     # must be silent
+cold=$(sysctl -n security.brfs.event_count)
+[ "$warm" = "$cold" ] || fail "events after DELROOT"
+rm -rf "$DELTREE"
 ok "DELROOT silence"
 
 # --- unload veto + unload-with-flags regression -------------------------

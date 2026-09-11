@@ -16,9 +16,10 @@
 #   - daemon detects fsid gone (frozen)
 #   - recreating the path + restart re-resolves to the new vnode
 #
-# usage: sh tests/vm/t-rmdir-root.sh      (from the host)
+# usage: sh tests/vm/t-rmdir-root.sh      (from the host; default brfs-a)
+#        BRFS_NODE=10.66.0.12 sh tests/vm/t-rmdir-root.sh
 set -u
-A=10.66.0.11
+A=${BRFS_NODE:-10.66.0.11}
 CTLM=/tmp/brfs-ssh-ctl
 SSH="ssh -n -o BatchMode=yes -o ConnectTimeout=60 -o ControlPath=$CTLM-$A"
 fails=0
