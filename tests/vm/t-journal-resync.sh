@@ -196,8 +196,15 @@ if [ -n "$resume_from" ] && [ -n "$attempt_from" ] && [ "$resume_from" -gt "$att
 else
 	fail "resume-from=$resume_from vs attempt-from=$attempt_from — watermark progress lost on kill"
 fi
-# Cross-check: requester's settled wm equals sender head.
-wf=$(bwm_a); hd=$(ahead)
+# Cross-check: requester's settled wm equals sender head.  The DONE that
+# settles it lands AFTER content convergence is observable — poll, don't
+# one-shot (rig-proven race in this exact assertion).
+i=0; wf=""; hd=""
+while [ $i -lt 60 ]; do
+	wf=$(bwm_a); hd=$(ahead)
+	[ -n "$wf" ] && [ -n "$hd" ] && [ "$wf" -ge "$((hd - 10))" ] && break
+	sleep 2; i=$((i + 2))
+done
 echo "  final: b's wm for a=$wf, a's journal head=$hd"
 [ -n "$wf" ] && [ -n "$hd" ] && [ "$wf" -ge "$((hd - 10))" ] \
 	&& ok "watermarks trailed the sender head to convergence" \
