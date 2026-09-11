@@ -309,6 +309,20 @@ pairs. All ops idempotent. See docs/protocol.md.
   **onMoveTo hash off core loop DONE 2026-09-07** (same commit):
   the big-file-rename case called hashFile synchronously; now uses
   fileid/gen identity via noteEchoRename with auto_clear echo semantics.
+  **processUpsert hash off core loop DONE 2026-09-10**: every local file
+  change re-hashed the whole file synchronously at debounce fire (the
+  biggest remaining core-loop block).  Now the core does a stat-only
+  unchanged fast path (size/mode/mtime/inode identity) and hands real
+  content hashing to the single-FIFO completion worker; the announce is
+  issued from the completion callback only after a fresh stat confirms
+  the hashed bytes still stand (dirty flag re-drives otherwise), so
+  versions are taken at announce time, never at submit time.
+  **CI-backlog fixes 2026-09-10**: the libcrypto atexit test-binary
+  crash was an LMDB cursor-closed-after-txn-commit UAF in journalGc
+  (latent on the daemon's hourly journal GC, caught by UBSan under
+  jemalloc junk filling — CI now runs the unit suite under
+  MALLOC_CONF=junk:true); the kmod compile check skips on runners
+  without /usr/src (CI had been red since the workflow landed).
   **t-rmdir-root.sh DONE 2026-09-07**: dedicated rig test for the P0.2
   root-dir rmdir/revoke analytical answer (daemon survives, freezes,
   recovers after root recreation).

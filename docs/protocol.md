@@ -108,7 +108,15 @@ ATTRIB kernel events drive metadata-only ANNOUNCEs (mode/mtime).
 ## Write stability
 
 The journal debounces: a file is hashed and announced only after a
-quiet period (no MODIFY for N ms) or CLOSE_WRITE. After transfer, the
+quiet period (no MODIFY for N ms) or CLOSE_WRITE. Hashing runs on the
+completion worker, never on the core loop: the core submits a stat
+snapshot, and the announce is published from the completion callback
+only when a fresh stat still matches the snapshot (otherwise the job is
+re-driven). The unchanged fast path skips hashing entirely when the full
+stat identity (size, mode, mtime, inode) matches the stored record —
+residual hole: an in-place rewrite that then restores mtime via
+utimensat(2) evades detection until the next change or rescan (the
+rescan floor hashes suspicious entries and repairs). After transfer, the
 receiver's FETCH_ACK includes the sha256 of what it installed; a mismatch
 requeues.
 

@@ -5,7 +5,10 @@
 //! side (blocking read on /dev/brfs, batch push through a mutex-guarded
 //! queue, pipe-trick wakeup).  The completion worker owns the blocking
 //! half of installs (fsync/rename — a 200MB fsync stalled the core loop
-//! for tens of seconds on the rig and snowballed mesh-wide).  Everything
+//! for tens of seconds on the rig and snowballed mesh-wide) plus local
+//! content hashing out of processUpsert (every locally-changed file used
+//! to re-hash synchronously at debounce fire, stalling the whole mesh on
+//! big-file edits).  Everything
 //! else — journal, content set, peer protocol, installer fetch side,
 //! resync — runs on the single core thread, so no locking exists anywhere
 //! on the replication logic.  The completion worker is strictly FIFO and
@@ -173,10 +176,45 @@ const Incoming = struct {
 
 const fetch_timeout_ms: i64 = 30_000;
 
+/// Async local-content hash job.  processUpsert submits one of these
+/// instead of hashing on the core loop (every local file change re-hashed
+/// the whole file synchronously at debounce fire — the biggest known
+/// core-loop block after the install fsync fix).  The stat snapshot pins
+/// the bytes the announce describes: the result pass re-stats and only
+/// publishes when nothing moved, re-submitting once otherwise.
+const HashJob = struct {
+    path: []u8, // owned — replica-relative path
+    abs: []u8, // owned — absolute path the worker reads
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    mode: u16,
+    fileid: u64,
+    gen: u64,
+};
+
+const HashResult = struct {
+    job: HashJob,
+    sha256: [32]u8 = [_]u8{0} ** 32,
+    err: ?anyerror = null,
+};
+
+/// One worker queue item: install completion or content hash.
+const CompJob = union(enum) {
+    complete: installer.CompleteJob,
+    hash: HashJob,
+};
+
+const CompResult = union(enum) {
+    complete: installer.CompleteResult,
+    hash: HashResult,
+};
+
 /// Completion worker: owns the blocking half of installs (fsync, divergent-
-/// destination hash/quarantine, rename, meta) so the core loop never waits
-/// on a ZFS TXG.  Exactly ONE worker, FIFO: results land in submission
-/// order — the same-path version-ordering argument depends on it.
+/// destination hash/quarantine, rename, meta) and local content hashing, so
+/// the core loop never waits on a ZFS TXG or a big-file read.  Exactly ONE
+/// worker, FIFO: results land in submission order — the same-path
+/// version-ordering argument depends on it.
 /// Core->worker: mutex-guarded job queue + kick pipe (kqueue on the worker,
 /// close(kick_wr) = drain-and-exit per house rules).  Worker->core:
 /// mutex-guarded result queue + the shared wake pipe.
@@ -187,43 +225,60 @@ const CompletionWorker = struct {
     kick_wr: posix.fd_t,
     wake_wr: posix.fd_t,
     mutex: std.Thread.Mutex = .{},
-    jobs: std.ArrayList(installer.CompleteJob) = .empty,
+    jobs: std.ArrayList(CompJob) = .empty,
     res_mutex: std.Thread.Mutex = .{},
-    results: std.ArrayList(installer.CompleteResult) = .empty,
+    results: std.ArrayList(CompResult) = .empty,
 
-    fn submit(self: *CompletionWorker, job: installer.CompleteJob) void {
+    /// False when the job was dropped (OOM) — everything owned freed here.
+    fn submit(self: *CompletionWorker, job: CompJob) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.jobs.append(self.alloc, job) catch {
-            // OOM: drop the job (the file stays staged; the next announce/
-            // rescan re-drives the fetch).  Free what we own.
-            posix.close(job.fd);
-            self.alloc.free(job.path);
-            if (job.ack_peer) |ap| self.alloc.free(ap);
-            return;
+            // OOM: drop the job; the next announce/rescan/event re-drives.
+            switch (job) {
+                .complete => |j| {
+                    posix.close(j.fd);
+                    self.alloc.free(j.path);
+                    if (j.ack_peer) |ap| self.alloc.free(ap);
+                },
+                .hash => |j| {
+                    self.alloc.free(j.path);
+                    self.alloc.free(j.abs);
+                },
+            }
+            return false;
         };
         _ = posix.write(self.kick_wr, "x") catch {};
+        return true;
     }
 
-    fn popJob(self: *CompletionWorker) ?installer.CompleteJob {
+    fn popJob(self: *CompletionWorker) ?CompJob {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.jobs.items.len == 0) return null;
         return self.jobs.orderedRemove(0);
     }
 
-    fn pushResult(self: *CompletionWorker, res: installer.CompleteResult) void {
+    fn pushResult(self: *CompletionWorker, res: CompResult) void {
         self.res_mutex.lock();
         defer self.res_mutex.unlock();
         self.results.append(self.alloc, res) catch {
-            self.alloc.free(res.job.path);
-            if (res.job.ack_peer) |ap| self.alloc.free(ap);
+            switch (res) {
+                .complete => |r| {
+                    self.alloc.free(r.job.path);
+                    if (r.job.ack_peer) |ap| self.alloc.free(ap);
+                },
+                .hash => |r| {
+                    self.alloc.free(r.job.path);
+                    self.alloc.free(r.job.abs);
+                },
+            }
             return;
         };
         _ = posix.write(self.wake_wr, "x") catch {};
     }
 
-    fn takeResults(self: *CompletionWorker, out: *std.ArrayList(installer.CompleteResult)) void {
+    fn takeResults(self: *CompletionWorker, out: *std.ArrayList(CompResult)) void {
         self.res_mutex.lock();
         defer self.res_mutex.unlock();
         out.appendSlice(self.alloc, self.results.items) catch return;
@@ -261,12 +316,28 @@ fn completionMain(comp: *CompletionWorker) void {
             if (n == 0) break;
         }
         while (comp.popJob()) |job| {
-            var j = job;
-            var res = installer.CompleteResult{ .job = j };
-            if (comp.inst.finishComplete(&j)) |_| {} else |e| {
-                res.err = e;
+            switch (job) {
+                .complete => |j| {
+                    var jj = j;
+                    var res = installer.CompleteResult{ .job = jj };
+                    if (comp.inst.finishComplete(&jj)) |_| {} else |e| {
+                        res.err = e;
+                    }
+                    comp.pushResult(.{ .complete = res });
+                },
+                .hash => |j| {
+                    // Pure read of live-tree content; may observe a torn
+                    // mix under a racing writer — the core detects that via
+                    // its snapshot compare before announcing.
+                    var res = HashResult{ .job = j };
+                    if (installer.hashFile(j.abs)) |sha| {
+                        res.sha256 = sha;
+                    } else |e| {
+                        res.err = e;
+                    }
+                    comp.pushResult(.{ .hash = res });
+                },
             }
-            comp.pushResult(res);
         }
     }
 }
@@ -320,6 +391,11 @@ pub const Daemon = struct {
     last_repush_ms: i64 = 0,
     comp: CompletionWorker,
     comp_thread: ?std.Thread = null,
+    /// In-flight async content hashes (processUpsert offload), rel path ->
+    /// true when a newer local event arrived while the worker was reading.
+    /// The result pass announces only a hash taken on bytes that still
+    /// match a fresh stat with the flag clear; otherwise it re-submits.
+    pending_hash: std.StringHashMap(bool),
     running: bool = true,
     tls_ctx: ?tls_mod.TlsContext = null,
 
@@ -366,6 +442,7 @@ pub const Daemon = struct {
             .evq = .{ .alloc = alloc, .wake_wr = wake_wr },
             .wake_rd = wake_rd,
             .incoming = std.StringHashMap(Incoming).init(alloc),
+            .pending_hash = std.StringHashMap(bool).init(alloc),
             .tls_ctx = tls_ctx,
             // inst back-pointer is wired in run() (the Daemon is moved by
             // value out of init — &self.inst here would dangle).
@@ -767,46 +844,64 @@ pub const Daemon = struct {
             return;
         };
         const is_dir = installer.isDir(st);
-        const sha = if (is_dir) [_]u8{0} ** 32 else installer.hashFile(abs) catch return;
+        const mode: u16 = @intCast(@as(u32, @intCast(st.mode)) & 0o7777);
+        const size: u64 = @intCast(@max(st.size, 0));
+        const mtime_nsec: u32 = @intCast(@max(st.mtim.nsec, 0));
+        const fileid: u64 = @intCast(st.ino);
+        const gen: u64 = @intCast(st.gen);
 
         if (self.cs.lookup(e.path)) |rec| {
-            // Dirs: size/mtime change constantly as children come and go —
-            // content identity for a dir is "exists + mode".  Files: full
-            // (sha, size, mode) compare — ATTRIB events drive metadata-only
-            // announces (mode is replicated, uid/gid are not).
+            // Unchanged WITHOUT reading content: dirs compare mode only
+            // (size/mtime churn with every child), files compare the full
+            // stat identity (size, mode, mtime, inode).  A local edit
+            // bumps at least one; the write-temp + rename style moves the
+            // inode, which the fileid/gen compare catches.  Anything
+            // suspicious goes to the completion worker for an off-loop
+            // content hash.
             const unchanged = rec.state == .live and rec.is_dir == is_dir and
-                if (is_dir)
-                    rec.mode == @as(u16, @intCast(@as(u32, @intCast(st.mode)) & 0o7777))
-                else
-                    std.mem.eql(u8, &rec.sha256, &sha) and
-                        rec.size == @as(u64, @intCast(@max(st.size, 0))) and
-                        rec.mode == @as(u16, @intCast(@as(u32, @intCast(st.mode)) & 0o7777));
+                rec.mode == mode and
+                (is_dir or
+                    (rec.size == size and
+                        rec.mtime_sec == st.mtim.sec and rec.mtime_nsec == mtime_nsec and
+                        rec.id.fileid == fileid and
+                        (rec.id.gen == 0 or gen == 0 or rec.id.gen == gen)));
             if (unchanged) {
                 // Spurious event (attrib-only or echo we didn't mark):
                 // refresh identity silently, announce nothing.
                 var r = rec.*;
-                r.id = .{ .fsid = self.tree_fsid, .fileid = @intCast(st.ino), .gen = @intCast(st.gen) };
+                r.id = .{ .fsid = self.tree_fsid, .fileid = fileid, .gen = gen };
                 r.mtime_sec = @intCast(st.mtim.sec);
-                r.mtime_nsec = @intCast(@max(st.mtim.nsec, 0));
-                r.mode = @intCast(@as(u32, @intCast(st.mode)) & 0o7777);
+                r.mtime_nsec = mtime_nsec;
+                r.mode = mode;
                 self.cs.upsert(e.path, r) catch {};
                 return;
             }
         }
 
+        if (is_dir) {
+            self.announceLocal(e.path, true, size, mode, @intCast(st.mtim.sec), mtime_nsec, fileid, gen, [_]u8{0} ** 32);
+            return;
+        }
+        self.submitHashJob(e.path, abs, st) catch {}; // OOM: next event resubmits
+    }
+
+    /// Take a version, record, and broadcast a locally-observed state.
+    /// Shared by the dir path (sync, content-free) and the file path
+    /// (onHashed, content hash in hand).
+    fn announceLocal(self: *Daemon, path: []const u8, is_dir: bool, size: u64, mode: u16, mtime_sec: i64, mtime_nsec: u32, fileid: u64, gen: u64, sha: [32]u8) void {
         const ver = self.cs.nextVersion();
         const rec = contentset.Record{
-            .id = .{ .fsid = self.tree_fsid, .fileid = @intCast(st.ino), .gen = @intCast(st.gen) },
+            .id = .{ .fsid = self.tree_fsid, .fileid = fileid, .gen = gen },
             .ver = ver,
-            .size = @intCast(@max(st.size, 0)),
-            .mtime_sec = @intCast(st.mtim.sec),
-            .mtime_nsec = @intCast(@max(st.mtim.nsec, 0)),
-            .mode = @intCast(@as(u32, @intCast(st.mode)) & 0o7777),
+            .size = size,
+            .mtime_sec = mtime_sec,
+            .mtime_nsec = mtime_nsec,
+            .mode = mode,
             .is_dir = is_dir,
             .state = .live,
             .sha256 = sha,
         };
-        self.cs.upsert(e.path, rec) catch return;
+        self.cs.upsert(path, rec) catch return;
         self.broadcast(.{ .announce = .{
             .ver = ver,
             .is_dir = is_dir,
@@ -814,26 +909,145 @@ pub const Daemon = struct {
             .size = rec.size,
             .mtime_sec = rec.mtime_sec,
             .mtime_nsec = rec.mtime_nsec,
-            .path = e.path,
+            .path = path,
             .sha256 = sha,
         } });
-        log(.info, "announce {s} v=({x},{d}) size={d}{s}", .{ e.path, ver.origin, ver.seq, rec.size, if (is_dir) " dir" else "" });
+        log(.info, "announce {s} v=({x},{d}) size={d}{s}", .{ path, ver.origin, ver.seq, rec.size, if (is_dir) " dir" else "" });
 
         // The winning local change aborts a losing in-flight fetch
         // (saves the transfer; a completing fetch is the worker's — the
         // pre-landing discard and the superseded-revert cover it).
-        if (self.incoming.get(e.path)) |inf| {
+        if (self.incoming.get(path)) |inf| {
             const iv = inf.ver;
             const completing = inf.completing;
             if (!completing) switch (contentset.relate(ver, iv)) {
                 .newer, .conflict_incoming_wins => {
-                    log(.info, "aborting losing fetch {s} v=({x},{d})", .{ e.path, iv.origin, iv.seq });
-                    self.inst.abortFetch(e.path);
-                    if (self.incoming.fetchRemove(e.path)) |kv| self.alloc.free(kv.key);
+                    log(.info, "aborting losing fetch {s} v=({x},{d})", .{ path, iv.origin, iv.seq });
+                    self.inst.abortFetch(path);
+                    if (self.incoming.fetchRemove(path)) |kv| self.alloc.free(kv.key);
                 },
                 else => {},
             };
         }
+    }
+
+    /// Hand a content hash to the completion worker.  Per-path single
+    /// flight: a second change while hashing just dirties the pending
+    /// entry — the result pass announces only a hash taken on bytes that
+    /// still match a fresh stat, and re-submits once otherwise.
+    fn submitHashJob(self: *Daemon, path: []const u8, abs: []const u8, st: posix.Stat) !void {
+        if (self.pending_hash.getPtr(path)) |dirty| {
+            dirty.* = true;
+            return;
+        }
+        // Errdefer-free ownership: submit() consumes job_path/job_abs even
+        // on failure, so they must be freed exactly once, by exactly one
+        // side, on every arm.
+        const job_path = try self.alloc.dupe(u8, path);
+        const job_abs = self.alloc.dupe(u8, abs) catch |e| {
+            self.alloc.free(job_path);
+            return e;
+        };
+        const key = self.alloc.dupe(u8, path) catch |e| {
+            self.alloc.free(job_abs);
+            self.alloc.free(job_path);
+            return e;
+        };
+        self.pending_hash.put(key, false) catch |e| {
+            self.alloc.free(key);
+            self.alloc.free(job_abs);
+            self.alloc.free(job_path);
+            return e;
+        };
+        if (!self.comp.submit(.{ .hash = .{
+            .path = job_path,
+            .abs = job_abs,
+            .size = @intCast(@max(st.size, 0)),
+            .mtime_sec = @intCast(st.mtim.sec),
+            .mtime_nsec = @intCast(@max(st.mtim.nsec, 0)),
+            .mode = @intCast(@as(u32, @intCast(st.mode)) & 0o7777),
+            .fileid = @intCast(st.ino),
+            .gen = @intCast(st.gen),
+        } })) {
+            // submit() freed the job strings; retract the pending entry.
+            _ = self.pending_hash.fetchRemove(path);
+            self.alloc.free(key);
+            return error.SubmitFailed;
+        }
+    }
+
+    /// Completion worker -> core: a local content hash finished.  Version
+    /// issuance happens HERE (never at submit time): the announce must
+    /// describe bytes the hash was computed over, so a file that moved
+    /// during (or after) the read is re-driven instead of announced.
+    fn onHashed(self: *Daemon, res: *HashResult) void {
+        const job = &res.job;
+        defer self.alloc.free(job.path);
+        defer self.alloc.free(job.abs);
+        const kv = self.pending_hash.fetchRemove(job.path) orelse return;
+        const dirtied = kv.value;
+        self.alloc.free(kv.key);
+
+        const abs = self.inst.absPath(job.path) catch return;
+        defer self.alloc.free(abs);
+        const st = installer.statPath(abs) catch {
+            // Vanished behind the hash: run the delete path (a delete
+            // event may already have; both are idempotent).
+            var del = journal.Entry{ .path = job.path, .is_dir = false, .last_seq = 0 };
+            self.processDelete(&del);
+            return;
+        };
+        const is_dir = installer.isDir(st);
+        const mode: u16 = @intCast(@as(u32, @intCast(st.mode)) & 0o7777);
+        const size: u64 = @intCast(@max(st.size, 0));
+        const mtime_nsec: u32 = @intCast(@max(st.mtim.nsec, 0));
+        const fileid: u64 = @intCast(st.ino);
+        const gen: u64 = @intCast(st.gen);
+
+        if (res.err) |err| {
+            // Unreadable content (vanished mid-read, EACCES): keep the old
+            // record; the next event (or the rescan floor) re-drives.
+            log(.warn, "hash {s} failed: {s}", .{ job.path, @errorName(err) });
+            return;
+        }
+
+        const stable = !is_dir and !dirtied and
+            size == job.size and mode == job.mode and
+            st.mtim.sec == job.mtime_sec and mtime_nsec == job.mtime_nsec and
+            fileid == job.fileid and
+            (job.gen == 0 or gen == 0 or job.gen == gen);
+        if (!stable) {
+            if (is_dir) {
+                // Became a directory mid-flight: plain dir decision.
+                if (self.cs.lookup(job.path)) |rec| {
+                    if (rec.state == .live and rec.is_dir and rec.mode == mode) return;
+                }
+                self.announceLocal(job.path, true, size, mode, @intCast(st.mtim.sec), mtime_nsec, fileid, gen, [_]u8{0} ** 32);
+                return;
+            }
+            // Moved under the hash: re-drive from the fresh state.
+            self.submitHashJob(job.path, abs, st) catch {};
+            return;
+        }
+
+        // Stable: res.sha256 is the hash of the current bytes.
+        if (self.cs.lookup(job.path)) |rec| {
+            if (rec.state == .live and !rec.is_dir and
+                rec.size == size and rec.mode == mode and
+                std.mem.eql(u8, &rec.sha256, &res.sha256))
+            {
+                // Same bytes under fresh metadata (a touch): absorb
+                // silently, refresh identity/mtime.
+                var r = rec.*;
+                r.id = .{ .fsid = self.tree_fsid, .fileid = fileid, .gen = gen };
+                r.mtime_sec = @intCast(st.mtim.sec);
+                r.mtime_nsec = mtime_nsec;
+                r.mode = mode;
+                self.cs.upsert(job.path, r) catch {};
+                return;
+            }
+        }
+        self.announceLocal(job.path, false, size, mode, @intCast(st.mtim.sec), mtime_nsec, fileid, gen, res.sha256);
     }
 
     fn processDelete(self: *Daemon, e: *journal.Entry) void {
@@ -1403,7 +1617,7 @@ pub const Daemon = struct {
         self.cs.learnId(self.tree_fsid, job.fileid, job.gen, m.path) catch {};
         if (p.node_id) |nid| job.ack_peer = self.alloc.dupe(u8, nid) catch null;
         if (self.incoming.getPtr(m.path)) |e| e.completing = true;
-        self.comp.submit(job);
+        _ = self.comp.submit(.{ .complete = job });
         log(.info, "install queued {s} v=({x},{d}) size={d}", .{ m.path, m.ver.origin, m.ver.seq, meta.size });
     }
 
@@ -1505,10 +1719,13 @@ pub const Daemon = struct {
     }
 
     fn drainCompletions(self: *Daemon) void {
-        var results: std.ArrayList(installer.CompleteResult) = .empty;
+        var results: std.ArrayList(CompResult) = .empty;
         defer results.deinit(self.alloc);
         self.comp.takeResults(&results);
-        for (results.items) |*res| self.onInstalled(res);
+        for (results.items) |*res| switch (res.*) {
+            .complete => |*cr| self.onInstalled(cr),
+            .hash => |*hr| self.onHashed(hr),
+        };
     }
 
     fn onFetchAck(self: *Daemon, p: *Peer, m: protocol.FetchAck) void {
