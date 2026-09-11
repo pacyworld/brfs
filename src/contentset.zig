@@ -217,6 +217,14 @@ pub const ContentSet = struct {
     /// diffing (Phase 3b watermarks).  The seq is persisted in meta and
     /// committed atomically with the content set.
     journal_seq: u64 = 0,
+    /// Highest journal seq a reader can actually see: journal_seq moves
+    /// with every append, but LMDB read txns only observe COMMITTED
+    /// entries.  Advanced by flush() (and at open from meta).  RESYNC
+    /// diff serves must cap ranges at this value — serving from
+    /// journal_seq would read an empty tail and still settle the peer's
+    /// watermark past the uncommitted entries (rig-proven Phase 3b bug:
+    /// deletes pending in the write txn were skipped forever).
+    journal_committed: u64 = 0,
     needs_scan: bool = false,
     /// Gap #16 runtime freeze: the daemon's watched root resolved to a
     /// different fsid than stamped (forced unmount / rebuilt fs).  The
@@ -392,6 +400,7 @@ pub const ContentSet = struct {
         if (self.getMeta(txn, meta_ring_seq)) |v| self.ring_seq = v;
         if (self.getMeta(txn, meta_root_fsid)) |v| self.root_fsid = v;
         if (self.getMeta(txn, meta_journal_seq)) |v| self.journal_seq = v;
+        self.journal_committed = self.journal_seq; // everything on disk is committed
 
         // Phase 3b peer watermarks (wm_<origin hex16> keys; survive local
         // journal rebuilds — they index PEER journals).
@@ -641,6 +650,7 @@ pub const ContentSet = struct {
             self.needs_scan = true;
             return e;
         };
+        self.journal_committed = self.journal_seq; // now reader-visible
     }
 
     /// LMDB's commit IS the snapshot — kept for API/behaviour parity with
@@ -680,6 +690,12 @@ pub const ContentSet = struct {
     /// Current journal head seq (the highest seq written).
     pub fn journalHead(self: *const ContentSet) u64 {
         return self.journal_seq;
+    }
+
+    /// Highest seq a read txn can observe (flushed).  Diff serves and
+    /// DONE-settled watermarks must never pass this value.
+    pub fn journalCommitted(self: *const ContentSet) u64 {
+        return self.journal_committed;
     }
 
     /// Count of journal entries (read-only snapshot).
@@ -762,10 +778,12 @@ pub const ContentSet = struct {
 
     /// Can this journal serve a contiguous diff starting at wm+1?
     /// Requires a nonzero in-range watermark with GC not past it; overlap
-    /// (first < wm+1) simply replays into idempotent applies.
+    /// (first < wm+1) simply replays into idempotent applies.  Ranges are
+    /// capped at the committed head — a watermark past it means a rebuilt
+    /// or crash-lagged journal (full-pull fallback).
     pub fn journalDiffable(self: *ContentSet, wm: u64) bool {
         if (wm == 0) return false;
-        if (wm > self.journal_seq) return false; // peer ahead: rebuilt journal
+        if (wm > self.journal_committed) return false;
         const first = self.journalFirst();
         if (first == 0) return false; // empty
         return first <= wm + 1;
@@ -1525,6 +1543,133 @@ test "durable journal: chunked tail, early stop, first/diffable" {
     try std.testing.expect(!cs.journalDiffable(7)); // 7+1 < first: gap
     try std.testing.expect(cs.journalDiffable(8)); // exactly the floor
     try std.testing.expect(cs.journalDiffable(9)); // overlap replays
+}
+
+test "journal tail is readable while a write txn is pending" {
+    // The daemon tails the journal for RESYNC diffs while upserts keep
+    // accumulating in the pending write txn — the read snapshot must see
+    // every COMMITTED entry regardless.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var cs = try ContentSet.open(alloc, dir, "jpend");
+    defer cs.close();
+    var i: u64 = 0;
+    while (i < 8) : (i += 1) {
+        const p = try std.fmt.allocPrint(alloc, "p{d}", .{i});
+        defer alloc.free(p);
+        try cs.upsert(p, .{ .ver = .{ .origin = 1, .seq = i + 1 } });
+    }
+    try cs.flush();
+
+    // Two uncommitted upserts (the pending txn stays open behind them),
+    // then tail from 2: the eight committed entries must stream.
+    i = 8;
+    while (i < 10) : (i += 1) {
+        const p = try std.fmt.allocPrint(alloc, "p{d}", .{i});
+        defer alloc.free(p);
+        try cs.upsert(p, .{ .ver = .{ .origin = 1, .seq = i + 1 } });
+    }
+    const Col = struct {
+        last: u64 = 0,
+        n: u64 = 0,
+        fn cb(self: *@This(), e: ContentSet.JournalEntry) bool {
+            self.n += 1;
+            self.last = e.seq;
+            return true;
+        }
+    };
+    var col = Col{};
+    const n = cs.journalTail(2, 0, &col, Col.cb);
+    try std.testing.expectEqual(@as(u64, 7), n); // seqs 2..8 committed
+    try std.testing.expectEqual(@as(u64, 8), col.last);
+    try std.testing.expect(cs.journalDiffable(3));
+}
+
+test "journal tail from a mid-range watermark (daemon RESYNC shape)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var cs = try ContentSet.open(alloc, dir, "jscale");
+    defer cs.close();
+    var i: u64 = 0;
+    // Seed: 300 committed.
+    while (i < 300) : (i += 1) {
+        const p = try std.fmt.allocPrint(alloc, "s{d}", .{i});
+        defer alloc.free(p);
+        try cs.upsert(p, .{ .ver = .{ .origin = 1, .seq = i + 1 } });
+    }
+    try cs.flush();
+    // Burst: 520 committed AFTER the watermark point.
+    while (i < 820) : (i += 1) {
+        const p = try std.fmt.allocPrint(alloc, "b{d}", .{i});
+        defer alloc.free(p);
+        try cs.upsert(p, .{ .ver = .{ .origin = 1, .seq = i + 1 } });
+    }
+    try cs.flush();
+
+    try std.testing.expect(cs.journalDiffable(300));
+    try std.testing.expectEqual(@as(u64, 1), cs.journalFirst());
+    try std.testing.expectEqual(@as(u64, 820), cs.journalCount());
+    const Col = struct {
+        first: u64 = 0,
+        n: u64 = 0,
+        fn cb(self: *@This(), e: ContentSet.JournalEntry) bool {
+            if (self.n == 0) self.first = e.seq;
+            self.n += 1;
+            return true;
+        }
+    };
+    var col = Col{};
+    const n = cs.journalTail(301, 4096, &col, Col.cb);
+    try std.testing.expectEqual(@as(u64, 520), n);
+    try std.testing.expectEqual(@as(u64, 301), col.first);
+}
+
+test "journal committed head trails uncommitted appends (serve window)" {
+    // Rig-proven 2026-09-10: a diff serve capped at the in-memory head
+    // streamed NOTHING (read txns can't see the pending write txn) while
+    // the DONE still settled the peer's watermark past it — everything in
+    // the pending window was skipped permanently.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    var cs = try ContentSet.open(alloc, dir, "jcommit");
+    defer cs.close();
+    var i: u64 = 0;
+    while (i < 5) : (i += 1) {
+        const p = try std.fmt.allocPrint(alloc, "c{d}", .{i});
+        defer alloc.free(p);
+        try cs.upsert(p, .{ .ver = .{ .origin = 1, .seq = i + 1 } });
+    }
+    try cs.flush();
+    try std.testing.expectEqual(@as(u64, 5), cs.journalCommitted());
+    try std.testing.expectEqual(@as(u64, 5), cs.journalHead());
+
+    // Pending appends: head moves, committed does not.
+    i = 5;
+    while (i < 8) : (i += 1) {
+        const p = try std.fmt.allocPrint(alloc, "c{d}", .{i});
+        defer alloc.free(p);
+        try cs.upsert(p, .{ .ver = .{ .origin = 1, .seq = i + 1 } });
+    }
+    try std.testing.expectEqual(@as(u64, 8), cs.journalHead());
+    try std.testing.expectEqual(@as(u64, 5), cs.journalCommitted());
+    try std.testing.expect(cs.journalDiffable(5)); // at committed: ok
+    try std.testing.expect(!cs.journalDiffable(7)); // past committed: no
+
+    try cs.flush();
+    try std.testing.expectEqual(@as(u64, 8), cs.journalCommitted());
+    try std.testing.expect(cs.journalDiffable(7));
 }
 
 test "peer watermarks persist across close/reopen" {

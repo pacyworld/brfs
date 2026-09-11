@@ -72,6 +72,13 @@ pub const Peer = struct {
     /// from this peer (reset per RESYNC_REQ; persisted to the content set
     /// lazily and at RESYNC_DONE).
     rs_jseq: u64 = 0,
+    /// Phase 3b, serve side: this peer was served through this committed
+    /// journal head (the DONE it got).  The checkpoint-follow pass
+    /// re-serves the newly durable tail without waiting for a reconnect.
+    rs_served: u64 = 0,
+    /// False until the first RESYNC serve of any kind (rs_served == 0 is
+    /// a real serve-through value when the journal was empty at join).
+    rs_served_valid: bool = false,
     /// TLS connection state (null when TLS not configured or not yet started).
     tls_conn: ?tls.TlsConn = null,
     /// Stable bounce buffer for TLS writes (see writeReady).  Empty until

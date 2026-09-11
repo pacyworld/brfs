@@ -1126,6 +1126,12 @@ pub const Daemon = struct {
         tomb.state = .deleted;
         tomb.ver = ver;
         self.cs.upsert(r.from, tomb) catch return;
+        // Dir rename: descendant records move too, journaled like any
+        // other mutation — a joiner's diff stream must carry the child
+        // translations, not just the top-level move pair (rig-proven
+        // 2026-09-10: an offline member fetching the OLD child path got
+        // NACK-missing and never learned rdir2/f.txt at all).
+        if (is_dir) self.renameSubtreeRecords(null, r.from, r.to, ver);
 
         self.move_cookie +%= 1;
         const cookie = self.move_cookie;
@@ -1827,6 +1833,71 @@ pub const Daemon = struct {
         }
     }
 
+    /// Applied dir rename: rewrite every live descendant's record to the
+    /// new path under the rename's version, tombstone the old path, and
+    /// re-drive content fetches for descendants whose bytes never landed.
+    /// Every member runs the identical rewrite of the same versioned
+    /// rename, so the mesh stays coherent without per-child wire traffic.
+    /// (Rig-proven 2026-09-10: a rename racing a child's in-flight install
+    /// otherwise landed the file BACK AT THE OLD PATH — recreated parent
+    /// dir and all — then origin-noised the stray as fresh local content,
+    /// losing rdir2/f.txt mesh-wide.)
+    fn renameSubtreeRecords(self: *Daemon, p: ?*Peer, from: []const u8, to: []const u8, ver: Version) void {
+        const Desc = struct { p: []u8, rec: contentset.Record };
+        var descendants: std.ArrayList(Desc) = .empty;
+        defer {
+            for (descendants.items) |d| self.alloc.free(d.p);
+            descendants.deinit(self.alloc);
+        }
+        var it = self.cs.map.iterator();
+        while (it.next()) |e| {
+            const p2 = e.key_ptr.*;
+            if (e.value_ptr.state != .live) continue;
+            if (p2.len > from.len and std.mem.startsWith(u8, p2, from) and p2[from.len] == '/') {
+                const owned = self.alloc.dupe(u8, p2) catch return;
+                descendants.append(self.alloc, .{ .p = owned, .rec = e.value_ptr.* }) catch {
+                    self.alloc.free(owned);
+                    return;
+                };
+            }
+        }
+        for (descendants.items) |d| {
+            const suffix = d.p[from.len + 1 ..];
+            const newp = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ to, suffix }) catch return;
+            defer self.alloc.free(newp);
+            var nr = d.rec;
+            nr.ver = ver;
+            nr.state = .live;
+            self.cs.upsert(newp, nr) catch continue;
+            var old = nr;
+            old.state = .deleted;
+            self.cs.upsert(d.p, old) catch {};
+
+            if (d.rec.is_dir) continue; // dirs need no bytes
+            // Did the child's content survive os-side at the NEW path?
+            // (settled children moved with the renamed dir; an in-flight
+            // fetch staged bytes that never landed anywhere).
+            const abs_new = self.inst.absPath(newp) catch continue;
+            defer self.alloc.free(abs_new);
+            var exists = false;
+            if (installer.statPath(abs_new)) |st| {
+                exists = @as(u64, @intCast(@max(st.size, 0))) == d.rec.size;
+            } else |_| {}
+            if (exists) continue;
+
+            // Content fetch is receiver-side work (the rename originator
+            // owns the bytes already — it only needs its records moved).
+            const peer = p orelse continue;
+            if (self.incoming.get(d.p)) |inf2| {
+                if (!inf2.completing) {
+                    self.inst.abortFetch(d.p);
+                    if (self.incoming.fetchRemove(d.p)) |kv| self.alloc.free(kv.key);
+                }
+            }
+            self.startFetch(peer, newp, ver, d.rec.size, d.rec.sha256, d.rec.mode, d.rec.mtime_sec, d.rec.mtime_nsec);
+        }
+    }
+
     fn onMoveTo(self: *Daemon, p: *Peer, m: protocol.Move) void {
         if (p.state != .ready) return;
         if (!self.csGate()) return;
@@ -1891,6 +1962,9 @@ pub const Daemon = struct {
         tomb.state = .deleted;
         tomb.ver = m.ver;
         self.cs.upsert(mv.path, tomb) catch {};
+        // Descendant records move with the dir (in-flight child installs
+        // retarget to the new path; missing content re-fetches there).
+        if (m.is_dir) self.renameSubtreeRecords(p, mv.path, m.path, m.ver);
         log(.info, "applied rename {s} -> {s} v=({x},{d})", .{ mv.path, m.path, m.ver.origin, m.ver.seq });
     }
 
@@ -1995,9 +2069,13 @@ pub const Daemon = struct {
             self.serveResyncDiff(p, m.journal_wm);
             return;
         }
-        // Full-record pull: no usable watermark (first contact, GC'd
-        // range, or the sender's journal was rebuilt).  entryAction
-        // idempotently ignores what the requester already holds.
+        self.serveFullPull(p, m);
+    }
+
+    /// Full-record pull: no usable watermark (first contact, GC'd range,
+    /// or the sender's journal was rebuilt).  entryAction idempotently
+    /// ignores what the requester already holds.
+    fn serveFullPull(self: *Daemon, p: *Peer, m: protocol.ResyncReq) void {
         var count: u64 = 0;
         var it = self.cs.map.iterator();
         while (it.next()) |e| {
@@ -2016,10 +2094,13 @@ pub const Daemon = struct {
             } }) catch return;
             count += 1;
         }
-        // The head rides along even on a full pull: the streamed map IS
-        // every record up to it, so the requester can journal-diff from
-        // here next time.
-        self.pushTo(p, .{ .resync_done = .{ .count = count, .journal_head = self.cs.journalHead() } });
+        // The committed head rides along even on a full pull: the streamed
+        // map IS every record up to it, so the requester can journal-diff
+        // from here next time.
+        const head = self.cs.journalCommitted();
+        p.rs_served = head;
+        p.rs_served_valid = true;
+        self.pushTo(p, .{ .resync_done = .{ .count = count, .journal_head = head } });
         log(.info, "served RESYNC to {s}: {d} entries (full pull)", .{ peerName(p), count });
     }
 
@@ -2030,7 +2111,15 @@ pub const Daemon = struct {
     /// WITHOUT a RESYNC_DONE (same as the full-pull path): the requester's
     /// persisted watermark restarts the diff exactly at the cut.
     fn serveResyncDiff(self: *Daemon, p: *Peer, wm: u64) void {
-        const head = self.cs.journalHead();
+        // Only DURABLE entries may serve: read txns can't see the pending
+        // write txn, so a serve capped at journalHead would read an empty
+        // tail yet still settle the peer's watermark past it.  The
+        // checkpoint-follow pass re-serves the newly committed tail.
+        const head = self.cs.journalCommitted();
+        // Start line is also the resume-progress evidence the rig test
+        // parses (a killed stream's completion line never prints).
+        if (wm < head)
+            log(.info, "serving RESYNC diff to {s} from journal seq {d} (head {d})", .{ peerName(p), wm + 1, head });
         const Ctx = struct {
             p: *Peer,
             ok: bool = true,
@@ -2069,8 +2158,11 @@ pub const Daemon = struct {
             if (n < journal_stream_chunk) break; // drained
             from = ctx.last + 1;
         }
+        p.rs_served = head; // committed head as served — checkpoint-follow baseline
+        p.rs_served_valid = true;
         self.pushTo(p, .{ .resync_done = .{ .count = ctx.count, .journal_head = head } });
-        log(.info, "served RESYNC diff to {s}: {d} entries from journal seq {d}..{d}", .{ peerName(p), ctx.count, wm + 1, head });
+        if (ctx.count > 0)
+            log(.info, "served RESYNC diff to {s}: {d} entries from journal seq {d}..{d}", .{ peerName(p), ctx.count, wm + 1, head });
     }
 
     fn onResyncEntry(self: *Daemon, p: *Peer, m: protocol.ResyncEntry) void {
@@ -2261,8 +2353,26 @@ pub const Daemon = struct {
         // Ring-seq checkpoint (USN analog resume point).
         if (now - self.last_checkpoint_ms >= checkpoint_interval_ms and self.csGate()) {
             self.last_checkpoint_ms = now;
+            const committed_before = self.cs.journalCommitted();
             self.cs.checkpoint(self.jr.high_seq) catch {};
             self.cs.flush() catch {};
+            const committed_now = self.cs.journalCommitted();
+            // Diff-serves cap at the committed head (read txns can't see
+            // the pending txn), so entries appended DURING a serve window
+            // need a follow-up: push the newly durable tail to every peer
+            // we've served.  A peer whose last-served watermark went
+            // unusable (GC'd range, rebuilt journal) gets a full reseed
+            // instead — same fallback the requester-driven path takes.
+            if (committed_now > committed_before) {
+                for (self.peers.items) |q| {
+                    if (q.state != .ready or !q.rs_served_valid or q.rs_served >= committed_now) continue;
+                    if (self.cs.journalDiffable(q.rs_served)) {
+                        self.serveResyncDiff(q, q.rs_served);
+                    } else {
+                        self.serveFullPull(q, .{ .vector = undefined, .count = 0 });
+                    }
+                }
+            }
         }
 
         // Tombstone GC (gap #7): collect when the 7-day TTL expired OR
