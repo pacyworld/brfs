@@ -25,6 +25,9 @@ pub const Command = union(enum) {
     journal,
     /// Full resync: RESYNC_REQ to every ready peer + local rescan floor.
     resync,
+    /// On-demand GC pass (tombstones + journal) — the hourly timerPass
+    /// pass triggered by hand (D35 rig tests + operator use).
+    gc,
     conflicts_list,
     /// Restore a conflicts/ entry into the tree (joins as fresh local
     /// content — the tap announces it like any local create).
@@ -55,6 +58,7 @@ pub fn parseCommand(line: []const u8) Command {
     if (eq(u8, verb, "backlog")) return .backlog;
     if (eq(u8, verb, "journal")) return .journal;
     if (eq(u8, verb, "resync")) return .resync;
+    if (eq(u8, verb, "gc")) return .gc;
     if (eq(u8, verb, "conflicts")) {
         const sub = arg orelse return .conflicts_list;
         if (eq(u8, sub, "list")) return .conflicts_list;
@@ -109,6 +113,7 @@ test "parseCommand matrix" {
     try t.expect(parseCommand("backlog") == .backlog);
     try t.expect(parseCommand("journal") == .journal);
     try t.expect(parseCommand("resync") == .resync);
+    try t.expect(parseCommand("gc") == .gc);
     try t.expect(parseCommand("conflicts") == .conflicts_list);
     try t.expect(parseCommand("conflicts list") == .conflicts_list);
     try t.expect(parseCommand("  conflicts   prune \t\r\n") == .conflicts_prune);

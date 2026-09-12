@@ -179,8 +179,8 @@ pairs. All ops idempotent. See docs/protocol.md.
     carrying deleted_at (wall-clock retention stamp, NEVER ordering).
     gcTombstones() runs hourly from the daemon timer and drops tombstones
     older than 7 days (DFSR ConflictAndDeleted window).  The second half
-    of the locked retention rule — all-member-ack horizon — lands with
-    per-member ack tracking (still open; TTL alone is DFSR-equivalent).
+    of the locked retention rule — all-member-ack horizon — is D35
+    watermark-based (landed 2026-09-11; see Phase 3c below).
   - Gap #9 delete-vs-modify rule LOCKED: pure LWW on (seq, origin).  A
     winning offline modify (M > tombstone N) RESURRECTS the file (fetch/
     install over the tombstone; the deleting side has no copy to
@@ -329,10 +329,34 @@ pairs. All ops idempotent. See docs/protocol.md.
   at DONE.  Contiguity is the soundness argument the per-origin-MAX
   vector could never give: a mid-stream conn drop truncates, nothing
   more; the next RESYNC resumes at the persisted watermark and replays
-  at most one 4096-entry prefix idempotently.  The version vector stays
-  EMPTY (it also feeds the tombstone-GC ack horizon, where the same
-  over-coverage hole would return; horizon revival is later work).
+  at most one 4096-entry prefix idempotently.  The version vector stayed
+  EMPTY through Phase 3b (it also fed the tombstone-GC ack horizon, where
+  the same over-coverage hole would have returned) and is REMOVED in
+  Phase 3c.
   Rig test: tests/vm/t-journal-resync.sh.
+  **Phase 3c ack-horizon revival DONE 2026-09-11** (D35, protocol v3):
+  tombstone GC early-collection runs on per-peer journal-watermark
+  claims.  Every record carries the local journal seq of its own last
+  mutation (Record.journal_seq; record values grew 104→112 bytes, legacy
+  values decode provenance-0 = TTL-only).  Claims: RESYNC_REQ.journal_wm
+  (stream start) + new WM_ECHO from the stream receiver at its exact
+  watermark-persist points (lazy 4096-entry boundary, DONE settle) —
+  claims track activity; the checkpoint tail-push gives a quiet mesh a
+  stream to echo over every commit batch.  Sender keeps the LATEST claim
+  per member (never the max: a regressed claim = rebuilt member state;
+  its full pull re-covers everything first).  collection rule: every
+  configured peer's claim >= the tombstone's journal_seq AND every
+  configured peer has claimed at least once.  The journal itself remains
+  the delivery safety net: an early-collected tombstone re-serves to any
+  later low-claiming peer from its journal entry for the whole 1M-entry
+  retention depth.  Deleted: the RESYNC_REQ version vector,
+  buildVector/vectorCovers/MemberVector, brfs_member_vector_lag
+  (replaced by brfs_member_ack_wm per-member claim gauge).  Added:
+  `brfsctl gc` on-demand GC pass (the hourly pass by hand; rig tests
+  and operators can observe horizon behavior without an hour's wait).
+  Unit tests: claim-table semantics (rise/regress/quorum/jseq0), record
+  stamping + horizon consult, legacy-value decode + mixed-vintage journal
+  streaming, codec roundtrips.  Rig test: tests/vm/t-ackhorizon.sh.
   **CI-backlog fixes 2026-09-10**: the libcrypto atexit test-binary
   crash was an LMDB cursor-closed-after-txn-commit UAF in journalGc
   (latent on the daemon's hourly journal GC, caught by UBSan under
@@ -346,8 +370,8 @@ pairs. All ops idempotent. See docs/protocol.md.
   limiting/credits + fetch pipelining windows (receiver-driven pull is
   RTT-serialized: ~1 MiB per RTT per file — ~20 MB/s ceiling at 50 ms
   cross-region RTT), node add/remove, >3 nodes, resync
-  skip-on-(size,sha), watermark-based RESYNC diffing (Phase 3b),
-  upstreamable registration API if patch fallback used.
+  skip-on-(size,sha), upstreamable registration API if patch fallback
+  used.
 - **Code-review backlog landings 2026-08-28** (gaps #7/#10/#11/#14/#15/
   #16/#17/#18/#19 + man pages + CI + metrics):
   - #18 staging free-space precondition: beginFetch refuses a fetch whose
@@ -395,11 +419,14 @@ pairs. All ops idempotent. See docs/protocol.md.
     wipes state_dir.  ZFS fsid mount-stability verified empirically.
     Rig test: t-unmount.sh (testz scratch dataset).  Jailed-brfsd devfs
     ruleset sample: etc/devfs.rules.sample.
-  - #7 all-member-ack horizon: every member's RESYNC_REQ vector is
-    recorded (resync.MemberVector, keyed by fnv1a64(node_id)); a
-    tombstone is GC-collectable when TTL-expired OR covered by every
-    configured peer's vector (early collection on a healthy mesh; a
-    member never heard from keeps TTL as the only bound).
+  - #7 all-member-ack horizon: first landed on RESYNC_REQ version
+    vectors (superseded by D35 — vectors went permanently empty in
+    Phase 3b).  Now: every member's claimed applied watermark for OUR
+    journal (RESYNC_REQ.journal_wm + WM_ECHO) is recorded
+    (resync.ClaimSlot table, keyed by fnv1a64(node_id)); a tombstone is
+    GC-collectable when TTL-expired OR covered by every configured peer's
+    claim (early collection on a healthy mesh; a member never heard from
+    keeps TTL as the only bound).
   - #14/#15 writeups (KBI assertion, MAC rejection rationale) + #11/#16
     decision records: docs/design-decisions.md.
   - Man pages: man/man4/brfs.4, man/man5/brfs.conf.5, man/man8/brfsd.8,

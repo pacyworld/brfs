@@ -33,9 +33,10 @@ FETCH_REQ    ver | offset u64 | len u32 | path
 FETCH_DATA   ver | offset u64 | path | data (u32 len + bytes)
 FETCH_ACK    ver | path | sha256 [32]
 TOMBSTONE    ver | flags u16 | path
-RESYNC_REQ   count u32 | count * (origin u64 | max_seq u64)   (version vector)
-             | journal_wm u64  (Phase 3b: requester's contiguous applied
-                               journal seq for this sender; 0 = full pull)
+RESYNC_REQ   journal_wm u64  (requester's contiguous applied journal seq
+                               for this sender; 0 = full pull.  Doubles as
+                               the sender's ack-horizon evidence: "I settled
+                               your journal through N" — D35)
 RESYNC_ENTRY ver | flags u16 | state u8 | mode u16 | size u64 |
              mtime_sec i64 | mtime_nsec u32 | path | sha256 [32] |
              jseq u64   (sender's journal seq when journal-sourced, else 0)
@@ -47,18 +48,23 @@ RESYNC_DONE  count u64 | journal_head u64
                           post-join scan; journal_head settles the
                           requester's new watermark for this sender, and is
                           0 only when the sender has no journal at all)
+WM_ECHO      journal_wm u64  (D35: the stream receiver echoes its newly
+                           settled watermark back to the streamer — sent
+                           exactly where the receiver persists it: the lazy
+                           4096-entry boundary and the DONE settle)
 ```
 
 RESYNC_ENTRY carries `state` (1=live, 2=deleted) so tombstones propagate
 during catch-up. Rename cookie 0 is a valid cookie (first rename after
 boot); pair by cookie value, not by "nonzero".
 
-**RESYNC_REQ still sends an empty vector.** The vector's pull role is
-replaced by the journal watermark (below); filling it would also feed the
-tombstone-GC ack horizon, where a coarse per-origin max over-covers
-records a mid-burst conn drop never delivered — the same unsoundness that
-made vector-diff resync lose 934 records (rig-proven 2026-08-28). The
-ack horizon stays TTL-only until per-peer journal watermarks replace it.
+**The version vector is gone (v3).** Its pull role was replaced by the
+journal watermark in Phase 3b, and its survived-empty vestige left the
+tombstone-GC ack horizon TTL-only. D35 re-founded the horizon on claims
+about whole journals instead of per-origin maxima (see below); a coarse
+per-origin max over-covers records a mid-burst conn drop never delivered
+— the same unsoundness that made vector-diff resync lose 934 records
+(rig-proven 2026-08-28).
 
 ## Watermark-diff RESYNC (Phase 3b, protocol v2)
 
@@ -114,6 +120,38 @@ Per-path semantics inside a diff stream are identical to a full pull
 announce traffic interleaved with a stream is reconciled by the same rule.
 A journal-diff stream of 0 entries is legal and converges immediately.
 
+## Ack-horizon revival (D35, protocol v3)
+
+Tombstones are collectable early (before their 7-day TTL) once every
+configured member provably holds the delete. The claim currency is the
+same watermark machinery:
+
+- Every content-set write stamps its record with the local journal seq of
+  its own mutation (`Record.journal_seq`, persisted in the record value;
+  pre-D35 values decode as 0 = provenance unknown, never early-collected).
+- A member **claims** coverage of another node's journal through N in two
+  places: `RESYNC_REQ.journal_wm` (at every stream start) and **WM_ECHO**
+  (from the receiver back to the streamer at the exact points it settles
+  a watermark — the 4096-entry lazy-persist boundary and the DONE
+  settle). Claims therefore flow with activity; an idle mesh sends
+  nothing, and the checkpoint tail-push gives a healthy mesh a stream to
+  echo over at every commit batch.
+- The sender keeps the LATEST claim per member (never the max — a
+  regressed claim means the member's state was rebuilt and its full pull
+  re-covers everything first).
+- `gcTombstones` early-collects a tombstone with `journal_seq = s` iff
+  every claim is >= s and every configured peer has claimed at least once.
+  Claims are contiguous-by-construction "I applied your journal through
+  N" proofs, which is the hole-free soundness the per-origin-MAX vector
+  could never give.
+
+Early collection is belt-and-suspenders safe against delivery loss: the
+tombstone leaves the records DBI but its journal entry lives on (1M-entry
+retention), so any peer that later claims below s re-learns the delete
+from a diff stream. Only journal GC of the entry AND a member never
+rising past it yields the same stray-resurrection class the TTL window
+already documents.
+
 Decoding is strict: every byte of the payload must be consumed
 (TrailingGarbage), every length field must fit the frame (Truncated), and
 paths must pass the validation below before ANY filesystem use.
@@ -143,12 +181,13 @@ incremented on every local mutation. Clock time plays no role in ordering
 | 4  | FETCH_DATA  | path, ver, offset, len, data | one requested chunk; empty data at offset==size completes a 0-byte file |
 | 5  | FETCH_ACK   | path, ver, sha256 | post-install hash re-verify |
 | 6  | TOMBSTONE   | path, ver, ISDIR | delete |
-| 7  | RESYNC_REQ  | content-set summary | joining node → peer |
-| 8  | RESYNC_ENTRY| path, ISDIR, size, mtime, sha256, ver | peer → joining node |
+| 7  | RESYNC_REQ  | journal_wm | joining node → peer; also the ack-horizon claim |
+| 8  | RESYNC_ENTRY| path, ISDIR, size, mtime, sha256, ver, jseq | peer → joining node |
 | 9  | MOVE_FROM   | path, ver, cookie, ISDIR | rename source |
 | 10 | MOVE_TO     | path, ver, cookie, ISDIR | rename destination |
 | 11 | NACK        | path, ver, error code | explicit failure; never silently drop |
-| 12 | RESYNC_DONE | count | stream terminator; receiver runs post-join scan |
+| 12 | RESYNC_DONE | count, journal_head | stream terminator; receiver settles watermark, runs post-join scan |
+| 13 | WM_ECHO     | journal_wm | settled-watermark echo to the streamer (D35 ack horizon) |
 
 ## Directories
 

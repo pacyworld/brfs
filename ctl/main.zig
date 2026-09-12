@@ -92,7 +92,7 @@ pub fn main() !u8 {
 
     const eq = std.mem.eql;
     if (eq(u8, cmd, "status") or eq(u8, cmd, "peers") or eq(u8, cmd, "backlog") or
-        eq(u8, cmd, "journal") or eq(u8, cmd, "resync"))
+        eq(u8, cmd, "journal") or eq(u8, cmd, "resync") or eq(u8, cmd, "gc"))
         return cmdRemote(cmd);
 
     if (eq(u8, cmd, "conflicts")) {
@@ -181,6 +181,7 @@ fn usage() void {
         "  backlog                     Journal/fetch/completion queue depths\n" ++
         "  journal                     Journal stats (moves, echoes, high_seq)\n" ++
         "  resync                      RESYNC_REQ to all peers + local rescan\n" ++
+        "  gc                          Run the tombstone/journal GC pass now\n" ++
         "  metrics                     Prometheus text exposition (kernel + daemon)\n" ++
         "  conflicts list              List quarantined (conflict-loser) files\n" ++
         "  conflicts restore <name>    Move a quarantined file back into the tree\n" ++

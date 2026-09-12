@@ -11,9 +11,9 @@
 //!   FETCH_DATA   origin u64 | seq u64 | offset u64 | path | data (u32 len + bytes)
 //!   FETCH_ACK    origin u64 | seq u64 | path | sha256 [32]
 //!   TOMBSTONE    origin u64 | seq u64 | flags u16 | path
-//!   RESYNC_REQ   count u32 | count * (origin u64 | max_seq u64)     (version vector)
-//!                | journal_wm u64  (Phase 3b: requester's contiguous applied
-//!                journal seq for THIS sender; 0 = full pull)
+//!   RESYNC_REQ   journal_wm u64  (requester's contiguous applied journal
+//!                seq for THIS sender; 0 = full pull.  Also the sender's
+//!                ack-horizon evidence: "I settled your journal through N")
 //!   RESYNC_ENTRY origin u64 | seq u64 | flags u16 | state u8 | mode u16 | size u64 |
 //!                mtime_sec i64 | mtime_nsec u32 | path | sha256 [32] | jseq u64
 //!                (jseq = sender journal seq when journal-sourced, else 0)
@@ -24,6 +24,10 @@
 //!                 receiver runs its post-join scan; journal_head = sender's
 //!                 journal head at stream start, 0 when stream not journaled —
 //!                 the requester's authoritative new watermark)
+//!   WM_ECHO      journal_wm u64  (D35: a stream RECEIVER reports the
+//!                watermark it just durably settled for the streamer's
+//!                journal, at the same points it persists it: the lazy
+//!                4096-entry boundary and the DONE settle)
 //!
 //! flags bit0 = ISDIR.  All ops are idempotent; every incoming path is
 //! validated (contentset.validRelPath) before the caller may touch the
@@ -36,10 +40,11 @@ const contentset = @import("contentset.zig");
 
 pub const max_frame: u32 = 16 * 1024 * 1024;
 /// v2 (Phase 3b): RESYNC_REQ.journal_wm, RESYNC_ENTRY.jseq,
-/// RESYNC_DONE.journal_head.  Refused by v1 peers at HELLO.
-pub const protocol_version: u16 = 2;
+/// RESYNC_DONE.journal_head.
+/// v3 (D35): the (permanently empty since Phase 3b) version vector leaves
+/// RESYNC_REQ; WM_ECHO added.  Refused by mismatched peers at HELLO.
+pub const protocol_version: u16 = 3;
 pub const nonce_len = 16;
-pub const max_vector = 64; // version-vector entries (mesh is <= 16 nodes)
 
 pub const Op = enum(u16) {
     hello = 1,
@@ -54,6 +59,7 @@ pub const Op = enum(u16) {
     move_to = 10,
     nack = 11,
     resync_done = 12,
+    wm_echo = 13,
     _,
 };
 
@@ -110,18 +116,24 @@ pub const Tombstone = struct {
     path: []const u8,
 };
 
-pub const VectorEntry = struct { origin: u64, max_seq: u64 };
-
 pub const ResyncReq = struct {
-    vector: [max_vector]VectorEntry,
-    count: u16,
     /// Requester's highest CONTIGUOUS journal seq received-and-applied
     /// from this sender (per-sender state; 0 = no watermark -> the sender
     /// streams full records).  Journal seqs are per-sender monotonic and
     /// streamed in order over an ordered channel, so a watermark never
     /// expresses a hole — the failure the per-origin-MAX vector had
-    /// (D15/ring-overflow lesson) does not apply.
+    /// (D15/ring-overflow lesson; the vector was removed in v3) does not
+    /// apply.
     journal_wm: u64 = 0,
+};
+
+/// D35 ack-horizon claim: a RESYNC stream receiver reports the watermark
+/// it has settled for the streamer's journal (sent exactly where the
+/// receiver persists its watermark — the lazy 4096-entry boundary and the
+/// DONE settle).  The streaming peer uses it as sound early-collection
+/// evidence for tombstone GC.
+pub const WmEcho = struct {
+    journal_wm: u64,
 };
 
 pub const ResyncEntry = struct {
@@ -175,9 +187,11 @@ pub const Message = union(enum) {
     /// Terminates a RESYNC stream.  The receiver records journal_head as
     /// its new watermark (when > 0) and runs its post-join local scan.
     resync_done: ResyncDone,
+    /// Ack-horizon claim from a stream receiver (D35; see WmEcho).
+    wm_echo: WmEcho,
 };
 
-pub const DecodeError = error{ Truncated, FrameTooLarge, BadOp, BadPath, TrailingGarbage, VectorTooLarge };
+pub const DecodeError = error{ Truncated, FrameTooLarge, BadOp, BadPath, TrailingGarbage };
 
 /// Peek at a receive buffer: returns the total frame length (header +
 /// op + payload) if a full frame is buffered, 0 if more bytes are needed,
@@ -246,11 +260,6 @@ pub fn encode(alloc: Allocator, msg: Message) ![]u8 {
         },
         .resync_req => |m| {
             try appendInt(w, alloc, u16, @intFromEnum(Op.resync_req));
-            try appendInt(w, alloc, u32, m.count);
-            for (m.vector[0..m.count]) |ve| {
-                try appendInt(w, alloc, u64, ve.origin);
-                try appendInt(w, alloc, u64, ve.max_seq);
-            }
             try appendInt(w, alloc, u64, m.journal_wm);
         },
         .resync_entry => |m| {
@@ -284,6 +293,10 @@ pub fn encode(alloc: Allocator, msg: Message) ![]u8 {
             try appendInt(w, alloc, u16, @intFromEnum(Op.resync_done));
             try appendInt(w, alloc, u64, m.count);
             try appendInt(w, alloc, u64, m.journal_head);
+        },
+        .wm_echo => |m| {
+            try appendInt(w, alloc, u16, @intFromEnum(Op.wm_echo));
+            try appendInt(w, alloc, u64, m.journal_wm);
         },
     }
 
@@ -358,16 +371,7 @@ pub fn decode(payload: []const u8) DecodeError!Message {
             const path = try r.path();
             break :blk .{ .tombstone = .{ .ver = ver, .is_dir = (flags & flag_isdir) != 0, .path = path } };
         },
-        .resync_req => blk: {
-            const count = try r.u32v();
-            if (count > max_vector) return error.VectorTooLarge;
-            var rr = ResyncReq{ .vector = undefined, .count = @intCast(count) };
-            for (0..count) |i| {
-                rr.vector[i] = .{ .origin = try r.u64v(), .max_seq = try r.u64v() };
-            }
-            rr.journal_wm = try r.u64v();
-            break :blk .{ .resync_req = rr };
-        },
+        .resync_req => .{ .resync_req = .{ .journal_wm = try r.u64v() } },
         .resync_entry => blk: {
             const ver = try r.ver();
             const flags = try r.u16v();
@@ -408,6 +412,7 @@ pub fn decode(payload: []const u8) DecodeError!Message {
             break :blk .{ .nack = .{ .ver = ver, .code = code, .path = path } };
         },
         .resync_done => .{ .resync_done = .{ .count = try r.u64v(), .journal_head = try r.u64v() } },
+        .wm_echo => .{ .wm_echo = .{ .journal_wm = try r.u64v() } },
         _ => return error.BadOp,
     };
     if (r.pos != payload.len) return error.TrailingGarbage;
@@ -569,15 +574,14 @@ test "roundtrip every opcode" {
         try t.expect(rt.msg.tombstone.is_dir);
     }
     {
-        var rr = ResyncReq{ .vector = undefined, .count = 2, .journal_wm = 4242 };
-        rr.vector[0] = .{ .origin = 111, .max_seq = 55 };
-        rr.vector[1] = .{ .origin = 222, .max_seq = 66 };
-        const rt = try roundtrip(.{ .resync_req = rr });
+        const rt = try roundtrip(.{ .resync_req = .{ .journal_wm = 4242 } });
         defer t.allocator.free(rt.frame);
-        try t.expectEqual(@as(u16, 2), rt.msg.resync_req.count);
-        try t.expectEqual(@as(u64, 222), rt.msg.resync_req.vector[1].origin);
-        try t.expectEqual(@as(u64, 66), rt.msg.resync_req.vector[1].max_seq);
         try t.expectEqual(@as(u64, 4242), rt.msg.resync_req.journal_wm);
+    }
+    {
+        const rt = try roundtrip(.{ .wm_echo = .{ .journal_wm = 31337 } });
+        defer t.allocator.free(rt.frame);
+        try t.expectEqual(@as(u64, 31337), rt.msg.wm_echo.journal_wm);
     }
     {
         const rt = try roundtrip(.{ .resync_entry = .{

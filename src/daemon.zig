@@ -385,12 +385,14 @@ pub const Daemon = struct {
     /// and the watch registration are frozen until the mount is fixed and
     /// the daemon restarted.
     fs_frozen: bool = false,
-    /// Gap #7 ack horizon: the last version vector each member announced
-    /// (from its RESYNC_REQ), keyed by fnv1a64(node_id).  Refreshed at
-    /// every handshake (both sides RESYNC_REQ on ready) and every
-    /// operator resync, so vectors track liveness for free.
-    member_vectors: [config.max_peers]resync.MemberVector =
-        [_]resync.MemberVector{.{}} ** config.max_peers,
+    /// Gap #7/D35 ack horizon: the latest applied watermark each member
+    /// claimed for OUR journal (from RESYNC_REQ.journal_wm and WM_ECHO),
+    /// keyed by fnv1a64(node_id).  Claims refresh with stream activity —
+    /// echoes ride the receiver's persist points (the 4096-entry boundary
+    /// and the DONE settle), and the checkpoint tail-push gives a quiet
+    /// mesh a stream to echo over at every commit batch.
+    member_claims: [config.max_peers]resync.ClaimSlot =
+        [_]resync.ClaimSlot{.{}} ** config.max_peers,
     last_rescan_ms: i64 = 0,
     last_checkpoint_ms: i64 = 0,
     last_gc_ms: i64 = 0,
@@ -1307,6 +1309,7 @@ pub const Daemon = struct {
             .resync_req => |m| self.onResyncReq(p, m),
             .resync_entry => |m| self.onResyncEntry(p, m),
             .resync_done => |m| self.onResyncDone(p, m),
+            .wm_echo => |m| self.onWmEcho(p, m),
             .move_from => |m| {
                 if (p.state != .ready) return;
                 p.noteRemoteMove(m.cookie, m.path, m.ver, m.is_dir, now) catch {};
@@ -2019,14 +2022,9 @@ pub const Daemon = struct {
         // pull.  Hole-safety by construction: journal seqs are per-sender
         // monotonic and stream in order over TCP — a conn drop mid-burst
         // can only truncate, and the persisted watermark resumes exactly
-        // at the cut (the per-origin-MAX vector could not express that
-        // hole; ring-overflow stranded 934 records, 2026-08-28).  The
-        // vector stays EMPTY on purpose: it also feeds the tombstone-GC
-        // ack horizon, where a coarse per-origin max suffers the very
-        // same hole unsoundness — horizon revival wants per-peer journal
-        // watermarks instead (later work, not yet).
-        // entryAction idempotently ignores anything replayed.
-        var rr = protocol.ResyncReq{ .vector = undefined, .count = 0 };
+        // at the cut.  The value doubles as our ack-horizon claim TO that
+        // peer (D35).  entryAction idempotently ignores anything replayed.
+        var rr = protocol.ResyncReq{ .journal_wm = 0 };
         p.rs_jseq = 0; // a fresh stream restarts the in-flight high-water
         if (!full) {
             if (p.node_id) |nid|
@@ -2035,58 +2033,49 @@ pub const Daemon = struct {
         self.pushTo(p, .{ .resync_req = rr });
     }
 
-    /// Gap #7 ack horizon: record the member's announced vector.
-    fn noteMemberVector(self: *Daemon, node_id: []const u8, req: protocol.ResyncReq) void {
-        const h = std.hash.Fnv1a_64.hash(node_id);
-        var slot: ?*resync.MemberVector = null;
-        for (&self.member_vectors) |*mv| {
-            if (mv.used and mv.node_hash == h) {
-                slot = mv;
-                break;
-            }
-            if (!mv.used and slot == null) slot = mv;
-        }
-        const mv = slot orelse return; // table full: TTL-only GC for this member
-        mv.used = true;
-        mv.node_hash = h;
-        for (req.vector[0..req.count]) |ve| mv.record(ve.origin, ve.max_seq);
+    /// D35 ack horizon: record the member's claimed watermark for OUR
+    /// journal (RESYNC_REQ journal_wm on the serve side; WM_ECHO from
+    /// peers we serve).
+    fn noteMemberClaim(self: *Daemon, node_id: []const u8, wm: u64) void {
+        _ = resync.noteClaim(&self.member_claims, node_id, wm);
     }
 
-    /// Gap #7 horizon predicate: true when every configured peer has
-    /// reported a vector AND every reported vector covers ver.  A member
-    /// never heard from keeps TTL as the only retention bound (a wiped
-    /// member rejoining later resurrects — accepted; that is the TTL
-    /// window's documented failure mode).
-    fn ackCovers(ctx: *const anyopaque, ver: Version) bool {
+    /// D35 horizon predicate: true when every configured peer has claimed
+    /// a watermark covering the record's journal_seq.  A member never
+    /// heard from keeps TTL as the only retention bound (a wiped member
+    /// rejoining later resurrects — accepted; that is the TTL window's
+    /// documented failure mode).
+    fn ackCovers(ctx: *const anyopaque, rec: contentset.Record) bool {
         const self: *const Daemon = @ptrCast(@alignCast(ctx));
-        var held: u64 = 0;
-        for (&self.member_vectors) |*mv| {
-            if (!mv.used) continue;
-            held += 1;
-            if (!mv.covers(ver)) return false;
-        }
-        return held >= self.cfg.num_peers;
+        return resync.claimsCover(&self.member_claims, self.cfg.num_peers, rec.journal_seq);
     }
 
     fn onResyncReq(self: *Daemon, p: *Peer, m: protocol.ResyncReq) void {
         if (p.state != .ready) return;
-        // Gap #7: the requester's vector doubles as its ack horizon proof.
-        if (p.node_id) |nid| self.noteMemberVector(nid, m);
+        // D35: the requester's watermark doubles as its ack-horizon claim.
+        if (p.node_id) |nid| self.noteMemberClaim(nid, m.journal_wm);
         if (self.cs.journalDiffable(m.journal_wm)) {
             self.serveResyncDiff(p, m.journal_wm);
             return;
         }
-        self.serveFullPull(p, m);
+        self.serveFullPull(p);
+    }
+
+    /// D35: a peer we serve reports its settled watermark for OUR journal
+    /// — ack-horizon evidence at par with the RESYNC_REQ claim, but
+    /// flowing with stream activity instead of reconnects.
+    fn onWmEcho(self: *Daemon, p: *Peer, m: protocol.WmEcho) void {
+        if (p.state != .ready) return;
+        if (p.node_id) |nid| self.noteMemberClaim(nid, m.journal_wm);
     }
 
     /// Full-record pull: no usable watermark (first contact, GC'd range,
     /// or the sender's journal was rebuilt).  entryAction idempotently
     /// ignores what the requester already holds.
-    fn serveFullPull(self: *Daemon, p: *Peer, m: protocol.ResyncReq) void {
+    fn serveFullPull(self: *Daemon, p: *Peer) void {
         var count: u64 = 0;
         var it = self.cs.map.iterator();
         while (it.next()) |e| {
-            if (resync.vectorCovers(&m, e.value_ptr.ver)) continue;
             const rec = e.value_ptr.*;
             p.send(.{ .resync_entry = .{
                 .ver = rec.ver,
@@ -2180,8 +2169,11 @@ pub const Daemon = struct {
         // regular checkpoint batch — no fsync per entry).
         if (m.jseq > 0 and m.jseq > p.rs_jseq) {
             p.rs_jseq = m.jseq;
-            if (p.node_id != null and p.rs_jseq % wm_persist_every == 0)
+            if (p.node_id != null and p.rs_jseq % wm_persist_every == 0) {
                 self.cs.setJournalWm(contentset.nodeOrigin(p.node_id.?), p.rs_jseq) catch {};
+                // D35: ack-horizon claims ride the persist points.
+                self.pushTo(p, .{ .wm_echo = .{ .journal_wm = p.rs_jseq } });
+            }
         }
         switch (resync.entryAction(&self.cs, m)) {
             .ignore => {},
@@ -2229,6 +2221,9 @@ pub const Daemon = struct {
             if (settled > 0 and settled > self.cs.journalWm(contentset.nodeOrigin(nid))) {
                 self.cs.setJournalWm(contentset.nodeOrigin(nid), settled) catch {};
                 log(.info, "journal watermark for {s} settled at seq {d}", .{ peerName(p), settled });
+                // D35: tell the server its journal is settled here
+                // through `settled` (its tombstone-GC ack evidence).
+                self.pushTo(p, .{ .wm_echo = .{ .journal_wm = settled } });
             }
         }
         p.rs_jseq = 0;
@@ -2377,33 +2372,19 @@ pub const Daemon = struct {
                     if (self.cs.journalDiffable(q.rs_served)) {
                         self.serveResyncDiff(q, q.rs_served);
                     } else {
-                        self.serveFullPull(q, .{ .vector = undefined, .count = 0 });
+                        self.serveFullPull(q);
                     }
                 }
             }
         }
 
-        // Tombstone GC (gap #7): collect when the 7-day TTL expired OR
-        // every configured member's announced vector covers the tombstone
-        // (the all-member-ack horizon — early collection for a healthy
-        // mesh).
+        // Tombstone GC (gap #7/D35): collect when the 7-day TTL expired
+        // OR every configured member's claimed journal watermark covers
+        // the tombstone (the all-member-ack horizon — early collection
+        // for a healthy mesh).
         if (now - self.last_gc_ms >= gc_interval_ms and self.csGate()) {
             self.last_gc_ms = now;
-            const horizon = contentset.AckHorizon{ .ctx = self, .covers = ackCovers };
-            const collected = self.cs.gcTombstones(@intCast(@divFloor(now, 1000)), horizon) catch 0;
-            if (collected > 0)
-                log(.info, "tombstone GC: {d} collected", .{collected});
-            // Journal GC: keep the last 7 days worth of entries; if the
-            // journal head is above the retention floor, trim everything
-            // below it.  The floor is conservative: even a peer that was
-            // offline for 6 days can still catch up via the journal.
-            const jhead = self.cs.journalHead();
-            if (jhead > journal_retain_count) {
-                const jfloor = jhead - journal_retain_count;
-                const jgc = self.cs.journalGc(jfloor) catch 0;
-                if (jgc > 0)
-                    log(.info, "journal GC: {d} entries trimmed (floor={d})", .{ jgc, jfloor });
-            }
+            _ = self.gcPass(now);
         }
 
         // Watch-root re-push (watch-removal flag-strip mitigation).
@@ -2423,6 +2404,40 @@ pub const Daemon = struct {
                     log(.warn, "watch-root re-push failed: {s}", .{@errorName(err)});
             }
         }
+    }
+
+    const GcResult = struct { tombstones: u64 = 0, journaled: u64 = 0 };
+
+    /// One GC pass: tombstones (TTL or ack-horizon early collection) plus
+    /// the journal trim.  Runs hourly from timerPass and on demand via
+    /// `brfsctl gc`.  Caller holds the cadence; the csGate is checked here.
+    fn gcPass(self: *Daemon, now_ms: i64) GcResult {
+        var out = GcResult{};
+        if (!self.csGate()) return out;
+        const horizon = contentset.AckHorizon{ .ctx = self, .covers = ackCovers };
+        out.tombstones = self.cs.gcTombstones(@intCast(@divFloor(now_ms, 1000)), horizon) catch 0;
+        if (out.tombstones > 0)
+            log(.info, "tombstone GC: {d} collected", .{out.tombstones});
+        // Journal GC: keep the last journal_retain_count entries; if the
+        // journal head is above the retention floor, trim everything
+        // below it.  The floor is conservative: even a long-offline peer
+        // can still catch up via the journal.
+        const jhead = self.cs.journalHead();
+        if (jhead > journal_retain_count) {
+            const jfloor = jhead - journal_retain_count;
+            out.journaled = self.cs.journalGc(jfloor) catch 0;
+            if (out.journaled > 0)
+                log(.info, "journal GC: {d} entries trimmed (floor={d})", .{ out.journaled, jfloor });
+        }
+        return out;
+    }
+
+    /// Operator GC trigger (`brfsctl gc`) — the hourly tombstone/journal
+    /// pass on demand.  Exists so operators and rig tests can observe
+    /// ack-horizon behavior without an hour-long wait.
+    fn ctlGc(self: *Daemon, out: *std.ArrayList(u8)) void {
+        const r = self.gcPass(peer_mod.nowMs());
+        self.ctlPrint(out, "gc: tombstones={d} journal_trimmed={d}\n", .{ r.tombstones, r.journaled });
     }
 
     /// Runtime half of the gap #16 forced-unmount guard: the CURRENT fsid
@@ -2503,13 +2518,14 @@ pub const Daemon = struct {
             .backlog => self.ctlBacklog(out),
             .journal => self.ctlJournal(out),
             .resync => self.ctlResync(out),
+            .gc => self.ctlGc(out),
             .conflicts_list => self.ctlConflictsList(out),
             .conflicts_restore => |name| self.ctlConflictsRestore(out, name),
             .conflicts_prune => |filter| self.ctlConflictsPrune(out, filter),
             .metrics => self.ctlMetrics(out),
             .massdelete => self.ctlMassdelete(out, false),
             .massdelete_resume => self.ctlMassdelete(out, true),
-            .unknown => out.appendSlice(self.alloc, "ERR unknown command (status|peers|backlog|journal|resync|metrics|conflicts list|restore <name>|prune [substr]|massdelete [resume])\n") catch {},
+            .unknown => out.appendSlice(self.alloc, "ERR unknown command (status|peers|backlog|journal|resync|gc|metrics|conflicts list|restore <name>|prune [substr]|massdelete [resume])\n") catch {},
         }
     }
 
@@ -2640,10 +2656,10 @@ pub const Daemon = struct {
     }
 
     /// Prometheus text exposition (gauges; brfsctl prepends the kernel
-    /// counters).  brfs_member_vector_lag is the convergence health check:
-    /// per member, the total seq distance between our content set and the
-    /// member's last announced vector — 0 on every member means the mesh
-    /// is caught up.
+    /// counters).  brfs_journal_wm is our applied watermark per serving
+    /// member; brfs_member_ack_wm is the mesh's claimed watermark for OUR
+    /// journal (the D35 ack horizon — head minus claim = how far a member
+    /// trails before its next stream covers it).
     fn ctlMetrics(self: *Daemon, out: *std.ArrayList(u8)) void {
         var live: u64 = 0;
         var tombs: u64 = 0;
@@ -2702,15 +2718,10 @@ pub const Daemon = struct {
         self.ctlPrint(out, "# TYPE brfs_ring_seq gauge\n", .{});
         self.ctlPrint(out, "brfs_ring_seq{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.cs.ring_seq });
 
-        const ours = resync.buildVector(&self.cs);
-        self.ctlPrint(out, "# TYPE brfs_member_vector_lag gauge\n", .{});
-        for (&self.member_vectors) |*mv| {
-            if (!mv.used) continue;
-            var lag: u64 = 0;
-            for (ours.vector[0..ours.count]) |ve| {
-                lag += ve.max_seq -| mv.maxSeq(ve.origin);
-            }
-            self.ctlPrint(out, "brfs_member_vector_lag{{node=\"{s}\",member=\"{x}\"}} {d}\n", .{ self.cfg.node_id, mv.node_hash, lag });
+        self.ctlPrint(out, "# TYPE brfs_member_ack_wm gauge\n", .{});
+        for (&self.member_claims) |*s| {
+            if (!s.used) continue;
+            self.ctlPrint(out, "brfs_member_ack_wm{{node=\"{s}\",member=\"{x}\"}} {d}\n", .{ self.cfg.node_id, s.node_hash, s.wm });
         }
     }
 
@@ -2731,16 +2742,33 @@ pub const Daemon = struct {
         self.ctlPrint(out, "mass-delete guard released ({s}); rescan scheduled\n", .{if (was) "was latched" else "was not latched"});
     }
 
+    /// The member's latest ack-horizon claim for our journal (D35), if
+    /// it ever claimed.  `brfsctl peers` shows it as the claim= column.
+    fn memberClaim(self: *const Daemon, node_id: []const u8) ?u64 {
+        const h = contentset.nodeOrigin(node_id);
+        for (&self.member_claims) |*s| {
+            if (s.used and s.node_hash == h) return s.wm;
+        }
+        return null;
+    }
+
     fn ctlPeers(self: *Daemon, out: *std.ArrayList(u8)) void {
         for (self.peers.items) |p| {
             var abuf: [64]u8 = undefined;
             const addr_s = if (p.addr) |a| std.fmt.bufPrint(&abuf, "{f}", .{a}) catch "?" else "-";
-            self.ctlPrint(out, "{s}\t{s}\t{s}\t{s}\twbuf={d}\n", .{
+            var cbuf: [24]u8 = undefined;
+            // D35 ack-horizon claim this member last made about us.
+            const claim_s: []const u8 = if (p.node_id != null and self.memberClaim(p.node_id.?) != null)
+                std.fmt.bufPrint(&cbuf, "{d}", .{self.memberClaim(p.node_id.?).?}) catch "?"
+            else
+                "-";
+            self.ctlPrint(out, "{s}\t{s}\t{s}\t{s}\twbuf={d}\tclaim={s}\n", .{
                 p.node_id orelse "?",
                 @tagName(p.state),
                 if (p.outbound) "outbound" else "inbound",
                 addr_s,
                 p.wbuf.items.len,
+                claim_s,
             });
         }
     }

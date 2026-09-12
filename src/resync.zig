@@ -11,11 +11,14 @@
 //!    lives, with a fresh local version).  Also rebuilds the content set's
 //!    dir index so kernel events resolve to paths again.
 //!
-//! 2. RESYNC pull (layer 4): a version vector (per-origin max seq)
-//!    exchanged with peers; the sender streams RESYNC_ENTRY for every
-//!    record the receiver's vector doesn't cover.  Drives both the
-//!    initial-seed join (gap #8: non-primary with an empty set pulls
-//!    BEFORE announcing anything local) and offline-node catch-up (T6).
+//! 2. RESYNC pull (layer 4): the requester advertises its contiguous
+//!    applied journal watermark for the sender (RESYNC_REQ.journal_wm);
+//!    the sender streams a journal diff from it (0 = legacy full pull,
+//!    all records; entryAction's version compare makes it idempotent).
+//!    Drives both the initial-seed join (gap #8: non-primary with an
+//!    empty set pulls BEFORE announcing anything local) and offline-node
+//!    catch-up (T6).  Stream receivers echo their settled watermarks back
+//!    (WM_ECHO), feeding the tombstone-GC ack horizon (D35).
 
 const std = @import("std");
 const posix = std.posix;
@@ -161,78 +164,48 @@ pub fn scan(
     return stats;
 }
 
-/// Our version vector: per-origin max seq over all records (tombstones
-/// included — they must propagate too).
-pub fn buildVector(cs: *const contentset.ContentSet) protocol.ResyncReq {
-    var req = protocol.ResyncReq{ .vector = undefined, .count = 0 };
-    var it = cs.map.iterator();
-    while (it.next()) |e| {
-        const v = e.value_ptr.ver;
-        var found = false;
-        for (req.vector[0..req.count]) |*ve| {
-            if (ve.origin == v.origin) {
-                ve.max_seq = @max(ve.max_seq, v.seq);
-                found = true;
-                break;
-            }
-        }
-        if (!found and req.count < protocol.max_vector) {
-            req.vector[req.count] = .{ .origin = v.origin, .max_seq = v.seq };
-            req.count += 1;
-        }
-    }
-    return req;
-}
-
-/// Sender-side filter: does the receiver's vector need this record?
-pub fn vectorCovers(req: *const protocol.ResyncReq, ver: contentset.Version) bool {
-    for (req.vector[0..req.count]) |ve| {
-        if (ve.origin == ver.origin) return ver.seq <= ve.max_seq;
-    }
-    return false;
-}
-
-/// Gap #7 ack horizon: one member's announced version vector (from its
-/// RESYNC_REQ).  Fixed-size, keyed by fnv1a64(node_id); bounds match the
-/// wire vector bounds (protocol.max_vector).
-pub const MemberVector = struct {
+/// D35 ack horizon: the latest journal watermark one member claimed to
+/// have applied from OUR journal (via RESYNC_REQ.journal_wm / WM_ECHO).
+pub const ClaimSlot = struct {
     used: bool = false,
     node_hash: u64 = 0,
-    origins: [protocol.max_vector]u64 = undefined,
-    max_seqs: [protocol.max_vector]u64 = undefined,
-    n: usize = 0,
-
-    pub fn record(self: *MemberVector, origin: u64, max_seq: u64) void {
-        for (self.origins[0..self.n], 0..) |o, i| {
-            if (o == origin) {
-                self.max_seqs[i] = @max(self.max_seqs[i], max_seq);
-                return;
-            }
-        }
-        if (self.n >= protocol.max_vector) return;
-        self.origins[self.n] = origin;
-        self.max_seqs[self.n] = max_seq;
-        self.n += 1;
-    }
-
-    /// Does this member's vector cover the version (i.e. it has SEEN the
-    /// record/tombstone)?
-    pub fn covers(self: *const MemberVector, ver: contentset.Version) bool {
-        for (self.origins[0..self.n], 0..) |o, i| {
-            if (o == ver.origin) return ver.seq <= self.max_seqs[i];
-        }
-        return false;
-    }
-
-    /// The member's max seq for an origin (0 = never seen) — the
-    /// convergence-lag metric.
-    pub fn maxSeq(self: *const MemberVector, origin: u64) u64 {
-        for (self.origins[0..self.n], 0..) |o, i| {
-            if (o == origin) return self.max_seqs[i];
-        }
-        return 0;
-    }
+    wm: u64 = 0,
 };
+
+/// Record a member's claim.  LATEST claim wins — never take the max:
+/// a regressed claim means the member's durable state was rebuilt
+/// (journal reset -> full pull), and honoring the regression holds the
+/// horizon back until their full pull re-covers everything.  Returns
+/// false when the table is full (that member stays TTL-only).
+pub fn noteClaim(slots: []ClaimSlot, node_id: []const u8, wm: u64) bool {
+    const h = contentset.nodeOrigin(node_id);
+    var free_slot: ?*ClaimSlot = null;
+    for (slots) |*s| {
+        if (s.used and s.node_hash == h) {
+            s.wm = wm;
+            return true;
+        }
+        if (!s.used and free_slot == null) free_slot = s;
+    }
+    const s = free_slot orelse return false;
+    s.* = .{ .used = true, .node_hash = h, .wm = wm };
+    return true;
+}
+
+/// Horizon predicate: every claiming member's watermark must cover jseq,
+/// and at least `required` members must have claimed (the configured
+/// peer count).  jseq == 0 = provenance unknown (pre-D35 record or a
+/// failed best-effort journal append) -> never covered, TTL-only.
+pub fn claimsCover(slots: []const ClaimSlot, required: u64, jseq: u64) bool {
+    if (jseq == 0) return false;
+    var held: u64 = 0;
+    for (slots) |*s| {
+        if (!s.used) continue;
+        held += 1;
+        if (s.wm < jseq) return false;
+    }
+    return held >= required;
+}
 
 /// Receiver-side decision for one RESYNC_ENTRY.
 pub const EntryAction = enum { ignore, fetch, adopt, tombstone };
@@ -305,22 +278,41 @@ fn drainJournal(j: *journal.Journal) []journal.Work {
     return out.toOwnedSlice(t.allocator) catch unreachable;
 }
 
-test "MemberVector record/covers (gap #7 ack horizon)" {
-    var mv = MemberVector{};
-    try t.expect(!mv.used);
-    mv.used = true;
-    mv.node_hash = 0xdead;
-    try t.expect(!mv.covers(.{ .origin = 1, .seq = 1 })); // empty covers nothing
-    mv.record(1, 10);
-    try t.expect(mv.covers(.{ .origin = 1, .seq = 10 }));
-    try t.expect(mv.covers(.{ .origin = 1, .seq = 3 })); // below max
-    try t.expect(!mv.covers(.{ .origin = 1, .seq = 11 })); // above max
-    try t.expect(!mv.covers(.{ .origin = 2, .seq = 1 })); // unknown origin
-    mv.record(1, 5); // never regresses
-    try t.expect(mv.covers(.{ .origin = 1, .seq = 10 }));
-    mv.record(2, 7);
-    try t.expect(mv.covers(.{ .origin = 2, .seq = 7 }));
-    try t.expectEqual(@as(usize, 2), mv.n);
+test "claim table: note/cover/horizon (D35 ack horizon)" {
+    var slots = [_]ClaimSlot{.{}} ** 3;
+
+    // Nobody claimed: nothing is covered, jseq 0 is never covered.
+    try t.expect(!claimsCover(&slots, 2, 5));
+    try t.expect(!claimsCover(&slots, 0, 0));
+
+    // One member below the horizon.
+    try t.expect(noteClaim(&slots, "node-b", 10));
+    try t.expect(!claimsCover(&slots, 2, 5)); // quorum not met
+
+    // Second member joins the claim set; both cover 10.
+    try t.expect(noteClaim(&slots, "node-c", 20));
+    try t.expect(claimsCover(&slots, 2, 10));
+    try t.expect(claimsCover(&slots, 2, 5)); // below both
+    try t.expect(!claimsCover(&slots, 2, 11)); // above node-b's claim
+
+    // Third member claims low: blocks coverage of anything past 1.
+    try t.expect(noteClaim(&slots, "node-d", 1));
+    try t.expect(!claimsCover(&slots, 2, 5));
+
+    // Its claim rises to the horizon: coverage of the shared low point
+    // unlocks; anything past the LOWEST claim stays blocked.
+    try t.expect(noteClaim(&slots, "node-d", 30));
+    try t.expect(claimsCover(&slots, 2, 10));
+    try t.expect(!claimsCover(&slots, 2, 11)); // node-b trails at 10
+
+    // Full table rejects a NEW member (bounded slots > configured peers).
+    try t.expect(!noteClaim(&slots, "node-e", 999));
+
+    // LATEST claim wins, never the max: a regressed claim (rebuilt
+    // journal on the member) is honored and trims coverage back.
+    try t.expect(noteClaim(&slots, "node-d", 3));
+    try t.expect(claimsCover(&slots, 2, 3));
+    try t.expect(!claimsCover(&slots, 2, 4));
 }
 
 test "first scan announces the seeded tree" {
@@ -564,30 +556,6 @@ test "file resurrecting over a tombstone gets a fresh local version" {
     try t.expectEqual(@as(usize, 1), works.len);
     try t.expect(works[0] == .upsert);
     try t.expectEqualStrings("ghost.txt", works[0].upsert.path);
-}
-
-test "version vector covers and filters" {
-    const alloc = t.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir);
-
-    var cs = try contentset.ContentSet.open(alloc, dir, "test");
-    defer cs.close();
-    var r1 = contentset.Record{ .ver = .{ .origin = 1, .seq = 5 } };
-    try cs.upsert("a", r1);
-    r1.ver = .{ .origin = 2, .seq = 9 };
-    try cs.upsert("b", r1);
-    r1.ver = .{ .origin = 1, .seq = 12 };
-    try cs.upsert("c", r1);
-
-    const vec = buildVector(&cs);
-    try t.expectEqual(@as(u16, 2), vec.count);
-    try t.expect(vectorCovers(&vec, .{ .origin = 1, .seq = 12 }));
-    try t.expect(vectorCovers(&vec, .{ .origin = 1, .seq = 3 }));
-    try t.expect(!vectorCovers(&vec, .{ .origin = 1, .seq = 13 }));
-    try t.expect(!vectorCovers(&vec, .{ .origin = 3, .seq = 1 }));
 }
 
 test "entryAction matrix" {

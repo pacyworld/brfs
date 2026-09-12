@@ -43,7 +43,12 @@ content-set counts (live records and tombstones), sequence counters,
 in-flight fetches, and the mass-delete guard state.
 .It Cm peers
 Mesh peers: node id, connection state, direction, address, write-buffer
-depth.
+depth, and the member's latest ack-horizon watermark claim for our
+journal (the
+.Cm claim
+column;
+.Ql -
+when the member never claimed).
 .It Cm backlog
 Queue depths: pending journal entries, incoming fetches, completion
 queue.
@@ -55,6 +60,11 @@ Send RESYNC_REQ to every ready peer and schedule a local rescan.
 Use after freeing disk space (a fetch aborted by
 .Er ENOSPC
 is not retried automatically) or to force convergence.
+.It Cm gc
+Run the hourly tombstone/journal GC pass immediately.
+A tombstone is collected when its 7-day TTL expired or every configured
+member's claimed journal watermark covers it (the ack horizon), so this
+is the operator-observable check of mesh convergence.
 .It Cm conflicts Cm list
 List quarantined files (conflict losers) under
 .Pa state_dir/conflicts/ .

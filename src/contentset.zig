@@ -16,10 +16,15 @@
 //!     deleted_at wall-clock stamp (retention bookkeeping only — ordering
 //!     stays pure version vectors, T18).  gcTombstones() drops tombstones
 //!     older than tombstone_ttl_sec (7 days, the DFSR ConflictAndDeleted
-//!     window).  The all-member-ack horizon half of the locked retention
-//!     rule (keep until ALL members' last-ack ver exceeds the tombstone
-//!     ver OR the TTL, whichever is longer) lands with per-member ack
-//!     tracking; TTL alone is DFSR-equivalent until then.
+//!     window).  The all-member-ack horizon half of the retention rule is
+//!     WATERMARK-based (D35): every upsert stamps its record with the local
+//!     journal seq of its own mutation; a tombstone is early-collected once
+//!     every configured member has reported a contiguous applied watermark
+//!     (RESYNC_REQ.journal_wm / WM_ECHO) at or past that seq — sound and
+//!     hole-free by the journal's contiguity, unlike the per-origin-MAX
+//!     vector it replaces.  Records without provenance (journal_seq 0:
+//!     pre-D35 values, or a failed best-effort journal append) stay
+//!     TTL-only.
 //!   - Corruption fallback: an env that fails to open or load is moved
 //!     aside (csdb.corrupt-<ts>) and rebuilt empty with needs_scan — the
 //!     set is a cache of ground truth, never the only copy.
@@ -99,6 +104,12 @@ pub const Record = struct {
     /// bookkeeping for gap #7 GC; never consulted for ordering and never
     /// sent on the wire).
     deleted_at: i64 = 0,
+    /// Local journal seq appended with this record's current state (D35).
+    /// The ack horizon proves coverage against it: a peer claiming applied
+    /// through >= journal_seq holds this state (or an LWW-newer one, which
+    /// supersedes the tombstone anyway).  0 = provenance unknown ->
+    /// TTL-only GC.
+    journal_seq: u64 = 0,
 };
 
 const DirKey = struct { fsid: u64, fileid: u64 };
@@ -132,9 +143,11 @@ const meta_journal_seq = "journal_seq";
 /// this between commits take the forced-reserve path in nextVersion().
 const seq_reserve_window: u64 = 65536;
 
-/// Record value layout: fixed 104 bytes, big-endian.  The path is the LMDB
-/// key and is not repeated in the value.
-const value_len = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 2 + 1 + 1 + 8 + 32;
+/// Record value layout: fixed 112 bytes, big-endian.  The path is the LMDB
+/// key and is not repeated in the value.  Pre-D35 values lack the trailing
+/// journal_seq (legacy_value_len) and decode with journal_seq = 0.
+const legacy_value_len = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 2 + 1 + 1 + 8 + 32;
+const value_len = legacy_value_len + 8;
 
 pub fn nodeOrigin(node_id: []const u8) u64 {
     return std.hash.Fnv1a_64.hash(node_id);
@@ -168,12 +181,16 @@ fn mvalSlice(v: *const c.MDB_val) []const u8 {
     return p[0..v.mv_size];
 }
 
-/// All-member-ack horizon (gap #7): supplied by the daemon, which tracks
-/// each member's announced version vector (from RESYNC_REQs).
+/// All-member-ack horizon (gap #7, D35 watermark revival): supplied by
+/// the daemon, which tracks each member's last-claimed applied journal
+/// watermark (from RESYNC_REQ.journal_wm and WM_ECHO).
 pub const AckHorizon = struct {
     ctx: *const anyopaque,
-    /// True when every configured member's vector covers ver.
-    covers: *const fn (ctx: *const anyopaque, ver: Version) bool,
+    /// True when every configured member's claim covers the record's
+    /// journal_seq (and every configured member has claimed at least
+    /// once).  Implementations return false for journal_seq == 0
+    /// records — unprovable, TTL-only.
+    covers: *const fn (ctx: *const anyopaque, rec: Record) bool,
 };
 
 pub const ContentSet = struct {
@@ -558,11 +575,27 @@ pub const ContentSet = struct {
         if (r.ver.origin == self.local_origin and r.ver.seq >= self.local_next_seq)
             self.local_next_seq = r.ver.seq + 1;
 
-        var buf: [value_len]u8 = undefined;
-        const body = encodeRecord(&buf, r);
         self.ensureTxn() catch |e| {
             self.abortTxn();
             return e;
+        };
+
+        // Durable journal: append this mutation with the next journal seq
+        // and stamp the record with it (D35 — the ack horizon proves
+        // peer coverage against rec.journal_seq).  The journal entry is
+        // (path ++ record) keyed by seq.  The path comes first so tailing
+        // iterators can decode it without external lookup.  Journal writes
+        // are best-effort: a failure leaves the record correct but
+        // un-provable (TTL-only GC) and the scan floor is the fallback.
+        self.journal_seq += 1;
+        const jseq = self.journal_seq;
+        r.journal_seq = jseq;
+        var buf: [value_len]u8 = undefined;
+        var body = encodeRecord(&buf, r);
+        self.appendJournal(path, body) catch {
+            self.journal_seq = jseq - 1; // nothing durable carried this seq
+            r.journal_seq = 0;
+            body = encodeRecord(&buf, r);
         };
         var k = mval(path);
         var d = mval(body);
@@ -570,12 +603,6 @@ pub const ContentSet = struct {
             self.abortTxn();
             return e;
         };
-        // Durable journal: append this mutation with the next journal seq.
-        // The journal entry is (path ++ record) keyed by seq.  The path
-        // comes first so tailing iterators can decode it without external
-        // lookup.  Journal writes are best-effort: a failure leaves the
-        // content set correct (the scan floor is the universal fallback).
-        self.appendJournal(path, body) catch {};
 
         const gop = try self.map.getOrPut(path);
         if (!gop.found_existing) {
@@ -663,10 +690,9 @@ pub const ContentSet = struct {
 
     // ---- durable journal ----
 
-    /// Append a journal entry under the next journal seq.  Called from
-    /// upsert inside the pending write txn.
+    /// Append a journal entry under journal_seq (already bumped by
+    /// upsert).  Called inside the pending write txn.
     fn appendJournal(self: *ContentSet, path: []const u8, rec_body: []const u8) !void {
-        self.journal_seq += 1;
         var seq_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_buf, self.journal_seq, .big);
         var jk = mval(&seq_buf);
@@ -747,11 +773,15 @@ pub const ContentSet = struct {
             if (kslice.len != 8) break;
             const seq = std.mem.readInt(u64, kslice[0..8], .big);
             const vslice = mvalSlice(&v);
-            if (vslice.len < 2 + value_len) continue; // corrupt entry
+            if (vslice.len < 2) continue; // corrupt entry
             const plen = std.mem.readInt(u16, vslice[0..2], .big);
-            if (vslice.len < 2 + plen + value_len) continue;
+            if (vslice.len < 2 + plen) continue;
+            const body = vslice[2 + plen ..];
+            // Both value vintages stream: pre-D35 bodies are 8 bytes
+            // shorter and decode with journal_seq = 0.
+            if (body.len != value_len and body.len != legacy_value_len) continue;
             const path = vslice[2 .. 2 + plen];
-            const rec = decodeRecord(vslice[2 + plen .. 2 + plen + value_len]) catch continue;
+            const rec = decodeRecord(body) catch continue;
             count += 1;
             if (!cb(ctx, .{ .seq = seq, .path = path, .rec = rec })) break;
         }
@@ -844,12 +874,13 @@ pub const ContentSet = struct {
         return count;
     }
 
-    /// Gap #7: drop tombstones past the retention rule.  Live records are
-    /// never collected.  A tombstone is collectable when EITHER the 7-day
-    /// TTL expired (the DFSR ConflictAndDeleted window — the fallback for
-    /// members gone too long) OR the all-member-ack horizon reports every
-    /// configured member's version vector covers it (they have all SEEN
-    /// the delete — early collection).  Returns the number collected.
+    /// Gap #7/D35: drop tombstones past the retention rule.  Live records
+    /// are never collected.  A tombstone is collectable when EITHER the
+    /// 7-day TTL expired (the DFSR ConflictAndDeleted window — the
+    /// fallback for members gone too long) OR the all-member-ack horizon
+    /// reports every configured member's applied watermark covers the
+    /// tombstone's journal_seq (they have all SEEN the delete — early
+    /// collection).  Returns the number collected.
     pub fn gcTombstones(self: *ContentSet, now_sec: i64, horizon: ?AckHorizon) !u64 {
         if (self.frozen) return 0;
         var doomed: std.ArrayList([]const u8) = .empty;
@@ -859,7 +890,7 @@ pub const ContentSet = struct {
             const r = e.value_ptr;
             if (r.state != .deleted or r.deleted_at == 0) continue;
             const ttl_expired = now_sec - r.deleted_at >= tombstone_ttl_sec;
-            const acked = if (horizon) |h| h.covers(h.ctx, r.ver) else false;
+            const acked = if (horizon) |h| h.covers(h.ctx, r.*) else false;
             if (!ttl_expired and !acked) continue;
             doomed.append(self.alloc, e.key_ptr.*) catch break;
         }
@@ -973,11 +1004,14 @@ fn encodeRecord(buf: []u8, rec: Record) []const u8 {
     w.u8v(@intFromEnum(rec.state));
     w.i64v(rec.deleted_at);
     w.bytes(&rec.sha256);
+    w.u64v(rec.journal_seq);
     return w.done();
 }
 
 fn decodeRecord(buf: []const u8) !Record {
-    if (buf.len != value_len) return error.BadFrame;
+    // Pre-D35 values lack journal_seq: provenance unknown (journal_seq 0
+    // keeps them on the TTL-only retention track).
+    if (buf.len != value_len and buf.len != legacy_value_len) return error.BadFrame;
     var r = Reader{ .buf = buf };
     var rec = Record{};
     rec.id.fsid = r.u64v();
@@ -993,6 +1027,7 @@ fn decodeRecord(buf: []const u8) !Record {
     rec.state = std.meta.intToEnum(State, r.u8v()) catch return error.BadFrame;
     rec.deleted_at = r.i64v();
     r.bytesInto(&rec.sha256);
+    if (buf.len == value_len) rec.journal_seq = r.u64v();
     return rec;
 }
 
@@ -1304,8 +1339,8 @@ test "tombstone GC: all-member-ack horizon collects before TTL (gap #7)" {
 
     const H = struct {
         cover: bool,
-        fn covers(ctx: *const anyopaque, ver: Version) bool {
-            _ = ver;
+        fn covers(ctx: *const anyopaque, rec: Record) bool {
+            _ = rec;
             const h: *const @This() = @ptrCast(@alignCast(ctx));
             return h.cover;
         }
@@ -1327,6 +1362,130 @@ test "tombstone GC: all-member-ack horizon collects before TTL (gap #7)" {
     // Horizon says all members have seen it: collected immediately.
     try std.testing.expectEqual(@as(u64, 1), try cs.gcTombstones(now, .{ .ctx = &yes, .covers = H.covers }));
     try std.testing.expect(cs.lookup("seen-by-all.txt") == null);
+}
+
+test "D35: upserts stamp their journal seq; the horizon consults it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    const H = struct {
+        floor: u64,
+        fn covers(ctx: *const anyopaque, rec: Record) bool {
+            const h: *const @This() = @ptrCast(@alignCast(ctx));
+            // Daemon-shaped rule: provenanceless records never covered.
+            return rec.journal_seq != 0 and h.floor >= rec.journal_seq;
+        }
+    };
+
+    var cs = try ContentSet.open(alloc, dir, "test-node");
+    defer cs.close();
+
+    try cs.upsert("live.txt", sampleRecord(1));
+    var tomb = sampleRecord(2);
+    tomb.state = .deleted;
+    try cs.upsert("gone.txt", tomb);
+    var tomb0 = sampleRecord(3);
+    tomb0.state = .deleted;
+    try cs.upsert("legacy.txt", tomb0);
+
+    // Stamps: increase one per upsert, recorded IN the record.
+    try std.testing.expectEqual(@as(u64, 1), cs.lookup("live.txt").?.journal_seq);
+    try std.testing.expectEqual(@as(u64, 2), cs.lookup("gone.txt").?.journal_seq);
+    try std.testing.expectEqual(@as(u64, 3), cs.lookup("legacy.txt").?.journal_seq);
+
+    // Horizon floor below the tombstone's seq retains it; at it, collects.
+    var low = H{ .floor = 1 };
+    var high = H{ .floor = 2 };
+    const now = std.time.timestamp();
+    try std.testing.expectEqual(@as(u64, 0), try cs.gcTombstones(now, .{ .ctx = &low, .covers = H.covers }));
+    try std.testing.expectEqual(@as(u64, 1), try cs.gcTombstones(now, .{ .ctx = &high, .covers = H.covers }));
+    try std.testing.expect(cs.lookup("gone.txt") == null);
+    try std.testing.expect(cs.lookup("legacy.txt") != null); // seq 3 > floor
+
+    // Provenance-0 tombstones are TTL-only even above the floor.
+    cs.map.getPtr("legacy.txt").?.journal_seq = 0;
+    try std.testing.expectEqual(@as(u64, 0), try cs.gcTombstones(now, .{ .ctx = &high, .covers = H.covers }));
+    // ... but the TTL rule still applies.
+    cs.map.getPtr("legacy.txt").?.deleted_at = now - tombstone_ttl_sec - 1;
+    try std.testing.expectEqual(@as(u64, 1), try cs.gcTombstones(now, .{ .ctx = &high, .covers = H.covers }));
+}
+
+test "D35: legacy pre-journal_seq loads decode provenance-0 and still stream" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpStateDir(alloc, &tmp);
+    defer alloc.free(dir);
+
+    const legacy_rec = sampleRecord(9);
+    var vbuf: [value_len]u8 = undefined;
+    const full = encodeRecord(&vbuf, legacy_rec); // journal_seq field: 0
+    const dec = try decodeRecord(full[0..legacy_value_len]);
+    try std.testing.expectEqual(@as(u64, 0), dec.journal_seq);
+    try std.testing.expectEqual(legacy_rec.size, dec.size);
+    try std.testing.expectEqual(legacy_rec.sha256, dec.sha256);
+
+    {
+        // Plant a legacy record + legacy journal entry exactly as a
+        // pre-D35 daemon wrote them (short body; the old meta counter
+        // held the planted seq).
+        var cs = try ContentSet.open(alloc, dir, "test-node");
+        try cs.ensureTxn();
+        const path = "legacy.txt";
+        var rk = mval(path);
+        var rd = mval(full[0..legacy_value_len]);
+        try mdbCheck(c.mdb_put(cs.wtxn, cs.dbi_records, &rk, &rd, 0));
+        var jbuf: [2 + max_path_len + legacy_value_len]u8 = undefined;
+        std.mem.writeInt(u16, jbuf[0..2], @intCast(path.len), .big);
+        @memcpy(jbuf[2 .. 2 + path.len], path);
+        @memcpy(jbuf[2 + path.len .. 2 + path.len + legacy_value_len], full[0..legacy_value_len]);
+        var skb: [8]u8 = undefined;
+        std.mem.writeInt(u64, &skb, 4242, .big);
+        var jk = mval(&skb);
+        var jv = mval(jbuf[0 .. 2 + path.len + legacy_value_len]);
+        try mdbCheck(c.mdb_put(cs.wtxn, cs.dbi_journal, &jk, &jv, 0));
+        cs.journal_seq = 4242;
+        try cs.flush();
+        cs.close();
+    }
+    {
+        var cs = try ContentSet.open(alloc, dir, "test-node");
+        defer cs.close();
+
+        // The legacy record loads with provenance 0 (TTL-only GC track).
+        const got = cs.lookup("legacy.txt").?;
+        try std.testing.expectEqual(@as(u64, 0), got.journal_seq);
+        try std.testing.expectEqual(@as(u64, 4242), cs.journalHead());
+
+        // New upserts stamp right after the planted head.
+        try cs.upsert("fresh.txt", sampleRecord(1));
+        try std.testing.expectEqual(@as(u64, 4243), cs.lookup("fresh.txt").?.journal_seq);
+        try cs.flush();
+
+        // journalTail streams BOTH vintages (the Phase 3b durable-serve
+        // class: a skipped entry is permanent loss past the watermark).
+        const Ctx = struct {
+            seqs: [8]u64 = undefined,
+            stamps: [8]u64 = undefined,
+            n: usize = 0,
+            fn acc(ctx: *@This(), e: ContentSet.JournalEntry) bool {
+                ctx.seqs[ctx.n] = e.seq;
+                ctx.stamps[ctx.n] = e.rec.journal_seq;
+                ctx.n += 1;
+                return true;
+            }
+        };
+        var ctx = Ctx{};
+        const n = cs.journalTail(4242, 10, &ctx, Ctx.acc);
+        try std.testing.expectEqual(@as(u64, 2), n);
+        try std.testing.expectEqual(@as(u64, 4242), ctx.seqs[0]);
+        try std.testing.expectEqual(@as(u64, 0), ctx.stamps[0]); // legacy body
+        try std.testing.expectEqual(@as(u64, 4243), ctx.seqs[1]);
+        try std.testing.expectEqual(@as(u64, 4243), ctx.stamps[1]); // stamped
+    }
 }
 
 test "gap #9 delete-vs-modify rule: LWW on (seq, origin) decides" {
