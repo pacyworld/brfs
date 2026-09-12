@@ -1,9 +1,9 @@
 # BrFS (BSD Replicated File System) — DFSR-style Replicated Folder Engine for FreeBSD
 
-Status: IMPLEMENTATION (v0.9, 2026-09-07) — Phase 0 + Phase 1 + Phase 2
-complete; Phase 3 underway: durable per-volume journal landed (LMDB-backed
-append-only change log, hourly GC, brfsctl/metrics integration);
-onMoveTo hash-off-core-loop fix landed; t-rmdir-root rig test added
+Status: IMPLEMENTATION (v0.9, 2026-09-12) — Phase 0 + Phase 1 + Phase 2
+complete; Phase 3 underway: durable journal, watermark RESYNC diffing,
+ack-horizon, fetch pipelining + rate limiting, and RDC deltas
+(cross-file seeds, protocol v4) all landed and rig-proven.
 Name: FINAL — **BrFS** ("Brrr... it's cold"). Daemon: `brfsd`, kmod: `brfs.ko`, utility: `brfsctl`.
 Owner: Daniel
 Target: FreeBSD 15.0+ (VFS event notification points / inotify landed 15.0-RELEASE)
@@ -384,9 +384,57 @@ pairs. All ops idempotent. See docs/protocol.md.
   and a 2 MiB/s egress cap paces a 16 MiB file to 7.25 s (~7 s model);
   WAN track, repl-tests, t12-t20, t-journal-resync, t-ackhorizon,
   t-guard re-PASS on the new binaries.
-  Remaining Phase 3 items: RDC deltas (>64KB, cross-file seeds), node
-  add/remove, >3 nodes, resync skip-on-(size,sha), upstreamable
-  registration API if patch fallback used.
+  **RDC deltas + cross-file seeds DONE 2026-09-12** (D37, protocol v4):
+  files at/above rdc_min (default 64 KiB, config+SIGHUP `rdc`/`rdc_min`)
+  replicate by chunk manifest instead of whole-file pull.  Content-
+  defined chunking (gear rolling hash, min 16 KiB / ~32 KiB mean / 64 KiB
+  hard max; BLAKE3-truncated-16 chunk ids — see "performance" below).
+  Requester sends CHUNK_REQ; the sender's completion worker recomputes
+  the file's whole sha256 while cutting chunks (mismatch = NACK-stale +
+  fresh ANNOUNCE, the fetch_req convention), caches the manifest per
+  (fileid,gen) behind a sha+size guard for fan-out, and streams MANIFEST
+  frames (~512 KiB, ordered, cursor-chained).  The receiver resolves
+  each chunk against a content-addressed seed index — a SEPARATE
+  rebuildable LMDB env (state_dir/rdcdb, by_path + DUPSORT by_hash,
+  MDB_NOSYNC with checkpoint-cadence sync): verified local copies run on
+  the completion worker (pread+hash per chunk; stale entries degenerate
+  to literals), missing bytes pull as literal ranges through the
+  unchanged FETCH_REQ/FETCH_DATA pipelined window (lit/copies write
+  disjoint staging offsets; completion = plan accounted; final whole-file
+  sha256 on the worker before install).  Index feeds: local announce
+  hash jobs chunk in their existing read pass; RDC installs re-index
+  from their finishComplete pass; file/dir renames re-key
+  (renamePath/renamePrefix, no re-chunk); hourly sweep evicts tombstoned
+  paths; MDB_MAP_FULL latches insert-read-only (logs+metric; recovery:
+  restart after removing state_dir/rdcdb).  Every failure degrades to
+  the pre-D37 whole pull (no index | nack_no_rdc | per-chunk verify
+  failure | final hash mismatch).  Metrics: brfs_rdc_copy_bytes,
+  brfs_rdc_literal_bytes, brfs_rdc_manifests_served,
+  brfs_rdc_index_chunks, brfs_rdc_index_readonly; brfsctl status shows
+  the same.  Rig: t-rdc.sh — 1 MiB edit of 16 MiB replicated with
+  15.6 MiB local-copy + 1.1 MiB literal; cross-file seed (15 MiB of
+  another file + 1 MiB novel) same shape; sender-side rdc=false
+  (nack_no_rdc) and receiver-side downgrade paths; a genuinely stale
+  index (offline byte overwrite, identity-preserved) copied 0 bytes
+  (verify-on-use rejected every chunk) and still converged.
+  Rig-found fixes en route: the completion worker copied the CompleteJob
+  into the result BEFORE finishComplete mutations (silently dropped
+  job.quarantined for the superseded-install restore AND every RDC
+  install's chunk set — pre-existing latent bug, now jobs land in
+  results post-mutation); per-chunk SHA-256 dominated the D37 pass at
+  24 MB/s on the rig Xeons (no SHA-NI; T13's 1.1 GiB announce blew its
+  600 s budget) — chunk ids are BLAKE3 now (~14x) and the whole-file
+  announce/install digest uses libcrypto EVP (~10x) with an equivalence
+  unit test; hostile FETCH_REQ len > 1 MiB could panic the serve-side
+  pread slice (clamped).  t-shaping's content gates now poll for the
+  landed file ("install queued" precedes the worker-side hash+rename).
+  Full battery re-PASS on D37 binaries: repl-tests, t12-t20 9/9 (incl.
+  T13), t-journal-resync, t-ackhorizon, t-guard, t-shaping, t21-t24-wan,
+  t-rdc.  103 host unit tests (Debug+ReleaseSafe; CI jemalloc-poisoned).
+  Remaining Phase 3 items: node add/remove, >3 nodes, resync
+  skip-on-(size,sha) (now partially subsumed: RDC dedups byte-identical
+  regions already; the skip wins the no-manifest fast path for exact
+  duplicates), upstreamable registration API if patch fallback used.
 - **Code-review backlog landings 2026-08-28** (gaps #7/#10/#11/#14/#15/
   #16/#17/#18/#19 + man pages + CI + metrics):
   - #18 staging free-space precondition: beginFetch refuses a fetch whose

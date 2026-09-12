@@ -57,6 +57,14 @@ rate_limit = 0
 # SIGHUP-reloadable.
 # fetch_window = 8388608
 
+# RDC deltas (D37): files at or above rdc_min bytes replicate as a chunk
+# manifest — chunks this node already holds anywhere in its tree are
+# copied locally (verified on read); only missing bytes cross the wire
+# as literal ranges through the ordinary pipelined fetch window. rdc =
+# false disables manifest mode (whole-file pulls). Both SIGHUP-reloadable.
+# rdc = true
+# rdc_min = 65536
+
 # Event classes to drop at intake (gap #11, selective filtering). The
 # kernel tap is emit-all by design; filtering happens in the daemon.
 # Dropped content classes are recovered by the scan floor, NOT in real

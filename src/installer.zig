@@ -18,6 +18,7 @@ const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const contentset = @import("contentset.zig");
+const rdc = @import("rdc.zig");
 
 extern "c" fn utimensat(dirfd: c_int, path: [*:0]const u8, times: *const [2]posix.timespec, flags: c_int) c_int;
 extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
@@ -99,6 +100,14 @@ pub const CompleteJob = struct {
     /// (owned; set by finishComplete).  The daemon needs it to restore
     /// the winner's content when a superseded install is reverted.
     quarantined: ?[]u8 = null,
+    /// D37 RDC install: chunks landed out of offset order (local copies
+    /// + literal ranges via disjoint pwrite regions), so there is no
+    /// incremental hash — finishComplete hashes the staged file (and
+    /// chunks it for the rdc index) on the worker instead.
+    hash_in_worker: bool = false,
+    /// Chunk entries cut during the worker hash pass (owned; the daemon
+    /// indexes, then frees).  Empty for non-RDC installs.
+    rdc_chunks: []rdc.ChunkEnt = &.{},
 };
 
 pub const CompleteResult = struct {
@@ -121,6 +130,12 @@ const Fetch = struct {
     // re-hash the whole file on the core thread (200 MiB blocked the event
     // loop for tens of seconds on the bhyve rig, stalling all conns).
     hasher: std.crypto.hash.sha2.Sha256,
+    /// D37 RDC mode: literals land in declared ranges while local chunk
+    /// copies are pwritten by the completion worker into disjoint
+    /// offsets.  No ordering, no incremental hash (see CompleteJob's
+    /// hash_in_worker).  received tracks TOTAL bytes landed (either
+    /// direction); completion is received == size.
+    rdc: bool = false,
 };
 
 pub const Installer = struct {
@@ -167,7 +182,9 @@ pub const Installer = struct {
         self.alloc.free(self.conflicts);
     }
 
-    fn stagingPath(self: *Installer, scratch: *[4096]u8, path: []const u8, ver: contentset.Version) ![]const u8 {
+    /// Public: the completion worker's chunk-copy jobs derive the staging
+    /// path to pwrite verified local chunks into it.
+    pub fn stagingPath(self: *Installer, scratch: *[4096]u8, path: []const u8, ver: contentset.Version) ![]const u8 {
         // Unique per (path, version): a re-FETCH after a hash mismatch
         // never collides with the aborted staging file.
         return std.fmt.bufPrint(scratch, "{s}/{x}-{x}-{x}.part", .{
@@ -189,8 +206,10 @@ pub const Installer = struct {
         return @as(u64, @intCast(st.f_bavail)) * st.f_bsize;
     }
 
-    /// Open a staging file for an incoming version of path.
-    pub fn beginFetch(self: *Installer, path: []const u8, ann: anytype) !void {
+    /// Open a staging file for an incoming version of path.  rdc_mode:
+    /// the daemon will stage literal ranges out of order + worker-copied
+    /// local chunks (no incremental hash; the worker hashes at complete).
+    pub fn beginFetch(self: *Installer, path: []const u8, ann: anytype, rdc_mode: bool) !void {
         if (self.fetches.contains(path)) return error.FetchInProgress;
         try spaceCheck(try self.stagingFreeBytes(), ann.size);
         var scratch: [4096]u8 = undefined;
@@ -211,6 +230,7 @@ pub const Installer = struct {
             .mtime_sec = ann.mtime_sec,
             .mtime_nsec = ann.mtime_nsec,
             .hasher = std.crypto.hash.sha2.Sha256.init(.{}),
+            .rdc = rdc_mode,
         };
         try self.fetches.put(owned, f);
     }
@@ -229,6 +249,30 @@ pub const Installer = struct {
         }
         f.hasher.update(data);
         f.received += data.len;
+    }
+
+    /// Write one literal range of an RDC fetch.  The daemon validated
+    /// (offset, len) against its outstanding-literal FIFO; here we only
+    /// bound and stage.  No incremental hash (out of order vs worker-
+    /// written copies) — the completion worker hashes the staged file.
+    pub fn writeChunkRdc(self: *Installer, path: []const u8, ver: contentset.Version, offset: u64, data: []const u8) !void {
+        const f = self.fetches.get(path) orelse return error.NoFetch;
+        if (!f.ver.eql(ver)) return error.StaleFetch;
+        if (!f.rdc) return error.NotRdcFetch;
+        if (offset + data.len > f.size) return error.Overshoot;
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = try posix.pwrite(f.fd, data[off..], @intCast(offset + off));
+            off += n;
+        }
+        f.received += data.len;
+    }
+
+    /// Book worker-copied bytes against an RDC fetch (the worker pwrites
+    /// the staging file directly through its own fd).
+    pub fn noteRdcCopied(self: *Installer, path: []const u8, n: u32) void {
+        const f = self.fetches.get(path) orelse return;
+        f.received += n;
     }
 
     pub fn fetchComplete(self: *Installer, path: []const u8) bool {
@@ -311,8 +355,16 @@ pub const Installer = struct {
         const f = kv.value;
 
         var actual: [32]u8 = undefined;
-        f.hasher.final(&actual);
-        const bad = !std.mem.eql(u8, &actual, &f.sha256);
+        var bad = false;
+        if (f.rdc) {
+            // Out-of-order staging left the incremental hasher untouched;
+            // the completion worker hashes the staged file and compares
+            // against the announce's sha.
+            actual = f.sha256;
+        } else {
+            f.hasher.final(&actual);
+            bad = !std.mem.eql(u8, &actual, &f.sha256);
+        }
 
         var st: posix.Stat = undefined;
         const stat_ok = std.c.fstat(f.fd, &st) == 0;
@@ -338,6 +390,7 @@ pub const Installer = struct {
             .mtime_nsec = f.mtime_nsec,
             .fileid = @intCast(st.ino),
             .gen = @intCast(st.gen),
+            .hash_in_worker = f.rdc,
         };
         f.fd = -1; // ownership moved
         self.alloc.destroy(f);
@@ -353,6 +406,23 @@ pub const Installer = struct {
         var scratch: [4096]u8 = undefined;
         const spath = try self.stagingPath(&scratch, job.path, job.ver);
         errdefer std.fs.cwd().deleteFile(spath) catch {};
+
+        // D37: RDC-assembled staging (chunks landed out of order from
+        // local copies + literals) gets its whole-file hash HERE, where
+        // blocking reads are legal; the same pass cuts the chunks the
+        // daemon re-indexes this content under.
+        if (job.hash_in_worker) {
+            const dig = rdc.hashAndChunkFile(self.alloc, spath) catch |e| {
+                posix.close(job.fd);
+                return e;
+            };
+            if (dig.size != job.size or !std.mem.eql(u8, &dig.sha256, &job.sha256)) {
+                self.alloc.free(dig.chunks);
+                posix.close(job.fd);
+                return error.HashMismatch;
+            }
+            job.rdc_chunks = dig.chunks;
+        }
 
         posix.fsync(job.fd) catch |e| {
             posix.close(job.fd);
@@ -549,7 +619,7 @@ test "fetch, chunk, install lands content atomically" {
 
     const data = "hello replicated world";
     const ann = announceOf(data, 1);
-    try rig.inst.beginFetch("sub/dir/file.txt", ann);
+    try rig.inst.beginFetch("sub/dir/file.txt", ann, false);
     // Two chunks to exercise offset sequencing.
     try rig.inst.writeChunk("sub/dir/file.txt", ann.ver, 0, data[0..5]);
     try rig.inst.writeChunk("sub/dir/file.txt", ann.ver, 5, data[5..]);
@@ -576,7 +646,7 @@ test "split complete: core-side verify + worker-side install" {
 
     const data = "split install content";
     const ann = announceOf(data, 3);
-    try rig.inst.beginFetch("split.txt", ann);
+    try rig.inst.beginFetch("split.txt", ann, false);
     try rig.inst.writeChunk("split.txt", ann.ver, 0, data);
 
     var job = try rig.inst.beginComplete("split.txt");
@@ -596,7 +666,7 @@ test "split complete: hash mismatch stays synchronous and drops staging" {
     var rig = try TestRig.make(alloc);
     defer rig.destroy(alloc);
     var ann = announceOf("correct", 1);
-    try rig.inst.beginFetch("f", ann);
+    try rig.inst.beginFetch("f", ann, false);
     try rig.inst.writeChunk("f", ann.ver, 0, "corrupt");
     ann.sha256[0] ^= 0xff;
     rig.inst.fetches.get("f").?.sha256 = ann.sha256;
@@ -612,7 +682,7 @@ test "out-of-order chunk is a hard error" {
     var rig = try TestRig.make(alloc);
     defer rig.destroy(alloc);
     const ann = announceOf("abcdef", 1);
-    try rig.inst.beginFetch("f", ann);
+    try rig.inst.beginFetch("f", ann, false);
     try t.expectError(error.GapInFetch, rig.inst.writeChunk("f", ann.ver, 3, "d"));
     rig.inst.abortFetch("f");
 }
@@ -622,7 +692,7 @@ test "hash mismatch aborts the install and drops staging" {
     var rig = try TestRig.make(alloc);
     defer rig.destroy(alloc);
     var ann = announceOf("correct", 1);
-    try rig.inst.beginFetch("f", ann);
+    try rig.inst.beginFetch("f", ann, false);
     try rig.inst.writeChunk("f", ann.ver, 0, "corrupt");
     ann.sha256[0] ^= 0xff; // sender's announced hash no longer matches
     rig.inst.fetches.get("f").?.sha256 = ann.sha256;
@@ -645,7 +715,7 @@ test "divergent destination is quarantined, not overwritten" {
 
     const data = "group version";
     const ann = announceOf(data, 7);
-    try rig.inst.beginFetch("conflict.txt", ann);
+    try rig.inst.beginFetch("conflict.txt", ann, false);
     try rig.inst.writeChunk("conflict.txt", ann.ver, 0, data);
     _ = try rig.inst.complete("conflict.txt");
 
@@ -671,7 +741,7 @@ test "tombstone removes files and trees" {
 
     const data = "x";
     const ann = announceOf(data, 1);
-    try rig.inst.beginFetch("d/f.txt", ann);
+    try rig.inst.beginFetch("d/f.txt", ann, false);
     try rig.inst.writeChunk("d/f.txt", ann.ver, 0, data);
     _ = try rig.inst.complete("d/f.txt");
 
@@ -681,7 +751,7 @@ test "tombstone removes files and trees" {
     try t.expectError(error.FileNotFound, statPath(f_abs));
 
     // Dir tombstone with residue (per-file tombstones never arrived).
-    try rig.inst.beginFetch("d2/f.txt", ann);
+    try rig.inst.beginFetch("d2/f.txt", ann, false);
     try rig.inst.writeChunk("d2/f.txt", ann.ver, 0, data);
     _ = try rig.inst.complete("d2/f.txt");
     try rig.inst.tombstone("d2", true);
@@ -711,12 +781,85 @@ test "beginFetch refuses a fetch that cannot fit" {
 
     var ann = announceOf("x", 1);
     ann.size = std.math.maxInt(u64) / 2;
-    try t.expectError(error.NoSpaceLeft, rig.inst.beginFetch("huge.bin", ann));
+    try t.expectError(error.NoSpaceLeft, rig.inst.beginFetch("huge.bin", ann, false));
     try t.expect(!rig.inst.fetchInProgress("huge.bin"));
 
     // A sane size stages fine on the same rig.
-    try rig.inst.beginFetch("small.bin", announceOf("x", 1));
+    try rig.inst.beginFetch("small.bin", announceOf("x", 1), false);
     rig.inst.abortFetch("small.bin");
+}
+
+test "rdc fetch: out-of-order staging, worker-side hash + chunk pass" {
+    const alloc = t.allocator;
+    var rig = try TestRig.make(alloc);
+    defer rig.destroy(alloc);
+
+    // Content: 3 x 48 KiB distinctly patterned spans.
+    var data: [144 * 1024]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(((i / (48 * 1024)) *% 97 +% i) & 0xff);
+    const ann = announceOf(&data, 5);
+    try rig.inst.beginFetch("big.bin", ann, true);
+
+    var scratch: [4096]u8 = undefined;
+    const spath = try rig.inst.stagingPath(&scratch, "big.bin", ann.ver);
+
+    // Worker-copy simulation: the completion worker opens its own fd and
+    // pwrites a VERIFIED middle region; the core books those bytes.
+    {
+        const sfd = try posix.open(spath, .{ .ACCMODE = .RDWR }, 0);
+        defer posix.close(sfd);
+        const mid = data[48 * 1024 .. 96 * 1024];
+        var off: usize = 0;
+        while (off < mid.len) {
+            off += try posix.pwrite(sfd, mid[off..], @intCast(48 * 1024 + off));
+        }
+    }
+    rig.inst.noteRdcCopied("big.bin", 48 * 1024);
+
+    // Literals land OUT OF ORDER (tail first, then head).
+    try rig.inst.writeChunkRdc("big.bin", ann.ver, 96 * 1024, data[96 * 1024 ..]);
+    try rig.inst.writeChunkRdc("big.bin", ann.ver, 0, data[0 .. 48 * 1024]);
+    try t.expect(rig.inst.fetchComplete("big.bin"));
+
+    var job = try rig.inst.beginComplete("big.bin");
+    defer alloc.free(job.path);
+    defer if (job.rdc_chunks.len > 0) alloc.free(job.rdc_chunks);
+    try t.expect(job.hash_in_worker);
+    try rig.inst.finishComplete(&job);
+    try t.expect(job.rdc_chunks.len >= 2); // actually chunk-cut
+
+    const got = try readTreeFile(alloc, &rig, "big.bin");
+    defer alloc.free(got);
+    try t.expectEqualSlices(u8, &data, got);
+}
+
+test "rdc fetch: a bad byte assembled anywhere fails the worker hash" {
+    const alloc = t.allocator;
+    var rig = try TestRig.make(alloc);
+    defer rig.destroy(alloc);
+
+    var data = [_]u8{7} ** 4096;
+    const ann = announceOf(&data, 9);
+    try rig.inst.beginFetch("f.bin", ann, true);
+    try rig.inst.writeChunkRdc("f.bin", ann.ver, 0, &data);
+    // Tamper with the staging content post-write (a lying copy job's
+    // pwrite that skipped verification).
+    {
+        var scratch: [4096]u8 = undefined;
+        const spath = try rig.inst.stagingPath(&scratch, "f.bin", ann.ver);
+        const sfd = try posix.open(spath, .{ .ACCMODE = .RDWR }, 0);
+        defer posix.close(sfd);
+        _ = try posix.pwrite(sfd, "!", 2048);
+    }
+    data[2048] = '!'; // the staged bytes
+    try t.expect(rig.inst.fetchComplete("f.bin"));
+    var job = try rig.inst.beginComplete("f.bin");
+    defer alloc.free(job.path);
+    try t.expectError(error.HashMismatch, rig.inst.finishComplete(&job));
+    // errdefer cleaned the staging file.
+    var scratch: [4096]u8 = undefined;
+    const spath2 = try rig.inst.stagingPath(&scratch, "f.bin", ann.ver);
+    try t.expectError(error.FileNotFound, statPath(spath2));
 }
 
 test "staging on a different filesystem is rejected at init" {

@@ -39,6 +39,7 @@ const resync = @import("resync.zig");
 const ctl = @import("ctl.zig");
 const tls_mod = @import("tls.zig");
 const guard_mod = @import("guard.zig");
+const rdc = @import("rdc.zig");
 
 const ContentSet = contentset.ContentSet;
 const Journal = journal.Journal;
@@ -162,6 +163,10 @@ const Incoming = struct {
     /// a source fallback reseeds it at the staged tail before
     /// re-windowing from there.
     req_hi: u64 = 0,
+    /// D37 chunk-manifest plan (big files).  rdc_disabled sticks once a
+    /// source NACKs a CHUNK_REQ: the fetch restarts as a plain pull.
+    rdc: ?RdcFetch = null,
+    rdc_disabled: bool = false,
 
     fn markTried(self: *Incoming, node_id: []const u8) void {
         if (self.wasTried(node_id)) return;
@@ -188,6 +193,30 @@ const fetch_timeout_ms: i64 = 30_000;
 /// vs ~1 MiB per RTT serialized.
 const fetch_window_bytes_default: u64 = 8 * 1024 * 1024;
 
+/// D37: files at/above this many bytes replicate as chunk manifests +
+/// local seed copies + literal ranges (the FETCH_REQ machinery) instead
+/// of a serial whole-file pull.
+const rdc_min_default: u64 = 64 * 1024;
+
+/// Sender-side manifest cache depth: one cached manifest per recent big
+/// content version (keyed by vnode identity, content-guarded by the
+/// record's sha256/size at serve time).
+const manifest_cache_max = 8;
+
+/// Packed MANIFEST frames cap their entry payload at this.
+const manifest_frame_bytes: usize = 512 * 1024;
+
+/// Manifest cache key: vnode identity.  Identity alone is NOT proof of
+/// content (an in-place rewrite keeps fileid; gen is not bumped by
+/// writes) — the record's sha256+size must match the cached digest too.
+const ManifestKey = struct { fileid: u64, gen: u64 };
+
+const CachedManifest = struct {
+    size: u64,
+    sha256: [32]u8,
+    raw: []u8, // owned packed entries: len u32 BE | hash16
+};
+
 /// Rate-limit refill wake cadence while any peer is credit-parked.
 const rl_wake_ms: i64 = 100;
 
@@ -212,23 +241,148 @@ const HashJob = struct {
     mode: u16,
     fileid: u64,
     gen: u64,
+    /// D37: also cut RDC chunk entries in the same read pass (big files —
+    /// the result feeds the cross-file seed index).
+    chunk: bool = false,
 };
 
 const HashResult = struct {
     job: HashJob,
     sha256: [32]u8 = [_]u8{0} ** 32,
+    /// D37: chunk entries cut in the same read pass when the file is at
+    /// or above rdc_min (owned; core indexes + frees).
+    chunks: []rdc.ChunkEnt = &.{},
     err: ?anyerror = null,
 };
 
-/// One worker queue item: install completion or content hash.
+/// D37 sender side: compute the chunk manifest for a serving request.
+/// The hash pass doubles as the staleness check (the announce's sha is
+/// re-derived over live bytes; a mismatch means the record moved on and
+/// the core answers nack_stale + fresh ANNOUNCE, the fetch_req rule).
+const ManifestJob = struct {
+    path: []u8, // owned — replica-relative
+    abs: []u8, // owned
+    ver: Version,
+};
+
+const ManifestResult = struct {
+    job: ManifestJob,
+    sha256: [32]u8 = [_]u8{0} ** 32,
+    size: u64 = 0,
+    fileid: u64 = 0,
+    gen: u64 = 0,
+    chunks: []rdc.ChunkEnt = &.{}, // owned
+    err: ?anyerror = null,
+};
+
+/// D37 receiver side: one local chunk copy, verified-at-read then
+/// pwritten into the staging file (all on the completion worker).
+/// Sources are tried in order — an index entry can be stale (the tree
+/// file moved under it); verify-on-use turns that into a miss.
+const max_copy_srcs = 4;
+const max_copy_ents = 64;
+
+const CopySrc = struct {
+    path: []u8, // owned — replica-relative source of identical bytes
+    off: u64,
+};
+
+const CopyEnt = struct {
+    seg_idx: u32, // index into the fetch's RdcFetch.segs
+    dst_off: u64,
+    len: u32,
+    hash: [rdc.hash_len]u8,
+    n_srcs: u8 = 0,
+    srcs: [max_copy_srcs]CopySrc = undefined,
+};
+
+const CopyJob = struct {
+    path: []u8, // owned — replica-relative path of the fetch (result key)
+    ver: Version,
+    /// Stale-result disambiguator: a fetch abort+restart at the same
+    /// version reuses the staging path AND the identical manifest plan,
+    /// so a late result from the pre-restart copy batch would otherwise
+    /// book bytes that are no longer staged (its pwrites landed on an
+    /// unlinked inode).  Fresh plans get a fresh id.
+    plan_id: u64,
+    n_ents: u8,
+    ents: [max_copy_ents]CopyEnt,
+};
+
+const CopyResult = struct {
+    job: CopyJob,
+    /// Bit i set = ents[i] copied+verified.  Failed entries are re-issued
+    /// as literal fetches by the core.
+    ok_mask: u64 = 0,
+};
+
+/// One worker queue item: install completion, content hash, chunk
+/// manifest computation, or local chunk copy.
 const CompJob = union(enum) {
     complete: installer.CompleteJob,
     hash: HashJob,
+    manifest: ManifestJob,
+    copy: CopyJob,
 };
 
 const CompResult = union(enum) {
     complete: installer.CompleteResult,
     hash: HashResult,
+    manifest: ManifestResult,
+    copy: CopyResult,
+};
+
+fn freeManifestJob(alloc: Allocator, j: *const ManifestJob) void {
+    alloc.free(j.path);
+    alloc.free(j.abs);
+}
+
+fn freeCopyJob(alloc: Allocator, j: *const CopyJob) void {
+    alloc.free(j.path);
+    for (j.ents[0..j.n_ents]) |e| {
+        for (e.srcs[0..e.n_srcs]) |s| alloc.free(s.path);
+    }
+}
+
+/// D37 receiver-side chunk plan for one big-file fetch.  Manifest
+/// entries become segs in arrival order; each seg is resolved by a local
+/// verified copy (completion worker) or a literal range pulled with the
+/// existing FETCH_REQ/DATA window machinery.  Staging writes are
+/// positional and disjoint, so copies and literals may land in any
+/// relative order; completion is every seg resolved.
+const RdcSeg = struct {
+    state: enum(u8) { unresolved, copy_wait, done } = .unresolved,
+    off: u64,
+    len: u32,
+    hash: [rdc.hash_len]u8,
+};
+
+/// A maximal run of literal (to-be-fetched) bytes; sliced into
+/// chunk_size FETCH_REQs as the window allows.
+const LitRange = struct {
+    off: u64,
+    end: u64, // exclusive
+    next: u64, // first not-yet-requested offset (next == end => fully requested)
+};
+
+/// One in-flight literal FETCH_REQ piece.
+const LitPiece = struct { off: u64, len: u32 };
+
+const RdcFetch = struct {
+    plan_id: u64 = 0, // see CopyJob.plan_id
+    segs: std.ArrayList(RdcSeg) = .empty,
+    manifest_cursor: u64 = 0, // next expected start_off on the manifest stream
+    manifest_done: bool = false,
+    lit_plan: std.ArrayList(LitRange) = .empty, // ranges awaiting requests
+    lit_out: std.ArrayList(LitPiece) = .empty, // outstanding pieces, request order (FIFO arrivals)
+    lit_out_bytes: u64 = 0,
+    copied_bytes: u64 = 0, // observability
+
+    fn deinit(self: *RdcFetch, alloc: Allocator) void {
+        self.segs.deinit(alloc);
+        self.lit_plan.deinit(alloc);
+        self.lit_out.deinit(alloc);
+    }
 };
 
 /// Completion worker: owns the blocking half of installs (fsync, divergent-
@@ -266,6 +420,8 @@ const CompletionWorker = struct {
                     self.alloc.free(j.path);
                     self.alloc.free(j.abs);
                 },
+                .manifest => |j| freeManifestJob(self.alloc, &j),
+                .copy => |j| freeCopyJob(self.alloc, &j),
             }
             return false;
         };
@@ -288,11 +444,18 @@ const CompletionWorker = struct {
                 .complete => |r| {
                     self.alloc.free(r.job.path);
                     if (r.job.ack_peer) |ap| self.alloc.free(ap);
+                    if (r.job.rdc_chunks.len > 0) self.alloc.free(r.job.rdc_chunks);
                 },
                 .hash => |r| {
                     self.alloc.free(r.job.path);
                     self.alloc.free(r.job.abs);
+                    if (r.chunks.len > 0) self.alloc.free(r.chunks);
                 },
+                .manifest => |r| {
+                    freeManifestJob(self.alloc, &r.job);
+                    if (r.chunks.len > 0) self.alloc.free(r.chunks);
+                },
+                .copy => |r| freeCopyJob(self.alloc, &r.job),
             }
             return;
         };
@@ -340,23 +503,94 @@ fn completionMain(comp: *CompletionWorker) void {
             switch (job) {
                 .complete => |j| {
                     var jj = j;
-                    var res = installer.CompleteResult{ .job = jj };
+                    // res.job must capture jj AFTER finishComplete: the
+                    // worker mutates the job (quarantined copy pointer,
+                    // D37 rdc_chunks) — a pre-mutation copy silently
+                    // dropped the quarantine restore and the chunk index
+                    // seeding (rig-proven: installs left the rdc index
+                    // empty).
+                    var err0: ?anyerror = null;
                     if (comp.inst.finishComplete(&jj)) |_| {} else |e| {
-                        res.err = e;
+                        err0 = e;
                     }
-                    comp.pushResult(.{ .complete = res });
+                    comp.pushResult(.{ .complete = .{ .job = jj, .err = err0 } });
                 },
                 .hash => |j| {
                     // Pure read of live-tree content; may observe a torn
                     // mix under a racing writer — the core detects that via
                     // its snapshot compare before announcing.
                     var res = HashResult{ .job = j };
-                    if (installer.hashFile(j.abs)) |sha| {
-                        res.sha256 = sha;
+                    blk: {
+                        if (j.chunk) {
+                            if (rdc.hashAndChunkFile(comp.alloc, j.abs)) |dig| {
+                                res.sha256 = dig.sha256;
+                                res.chunks = dig.chunks;
+                                break :blk;
+                            } else |_| {}
+                            // Chunk pass failed: fall through to plain hash
+                            // (index misses beat no announce).
+                        }
+                        if (installer.hashFile(j.abs)) |sha| {
+                            res.sha256 = sha;
+                        } else |e| {
+                            res.err = e;
+                        }
+                    }
+                    comp.pushResult(.{ .hash = res });
+                },
+                .manifest => |j| {
+                    // Serving-side D37: cut the manifest for the requested
+                    // version.  Same torn-read caveat as the hash job; the
+                    // core compares sha/size against the stored record.
+                    var res = ManifestResult{ .job = j };
+                    if (rdc.hashAndChunkFile(comp.alloc, j.abs)) |dig| {
+                        res.sha256 = dig.sha256;
+                        res.size = dig.size;
+                        res.chunks = dig.chunks;
+                        if (installer.statPath(j.abs)) |st| {
+                            res.fileid = @intCast(st.ino);
+                            res.gen = @intCast(st.gen);
+                        } else |_| {}
                     } else |e| {
                         res.err = e;
                     }
-                    comp.pushResult(.{ .hash = res });
+                    comp.pushResult(.{ .manifest = res });
+                },
+                .copy => |j| {
+                    // Receiver-side D37: verified local chunk copies into
+                    // the staging file.  Disjoint offsets per ent; failures
+                    // land back on the core as literal requests.
+                    var res = CopyResult{ .job = j };
+                    var scratch: [4096]u8 = undefined;
+                    const spath = comp.inst.stagingPath(&scratch, j.path, j.ver) catch {
+                        comp.pushResult(.{ .copy = res });
+                        continue;
+                    };
+                    const sfd = posix.open(spath, .{ .ACCMODE = .RDWR }, 0) catch {
+                        comp.pushResult(.{ .copy = res });
+                        continue;
+                    };
+                    defer posix.close(sfd);
+                    for (j.ents[0..j.n_ents], 0..) |e, ei| {
+                        var wrote = false;
+                        for (e.srcs[0..e.n_srcs]) |s| {
+                            const src_abs = std.fs.path.join(comp.alloc, &.{ comp.inst.root, s.path }) catch continue;
+                            defer comp.alloc.free(src_abs);
+                            const bytes = rdc.readChunkVerified(comp.alloc, src_abs, s.off, e.len, &e.hash) catch null orelse continue;
+                            defer comp.alloc.free(bytes);
+                            var off: usize = 0;
+                            while (off < bytes.len) {
+                                const n = posix.pwrite(sfd, bytes[off..], @intCast(e.dst_off + off)) catch break;
+                                off += n;
+                            }
+                            if (off == bytes.len) {
+                                res.ok_mask |= @as(u64, 1) << @intCast(ei);
+                                wrote = true;
+                                break;
+                            }
+                        }
+                    }
+                    comp.pushResult(.{ .copy = res });
                 },
             }
         }
@@ -427,10 +661,47 @@ pub const Daemon = struct {
     /// never re-read after init (reloadConfig replaces these).
     rate_limit: u64 = 0,
     fetch_window: u64 = fetch_window_bytes_default,
+    /// D37 RDC deltas: transfer mode for files >= rdc_min (chunk manifests
+    /// + verified local-seed copies + literal ranges through the ordinary
+    /// fetch window).  Both SIGHUP-reloadable.  rdc_index is the
+    /// cross-file seed store (null = no seeds: big files still replicate,
+    /// just as all-literal manifests).  rdc_index_ro latches on
+    /// MDB_MAP_FULL: reads continue, inserts stop, transfers degrade.
+    rdc_enabled: bool = true,
+    rdc_min: u64 = rdc_min_default,
+    rdc_index: ?rdc.Index = null,
+    rdc_index_ro: bool = false,
+    /// Sender-side manifest cache (fan-out: announce a big file to N
+    /// peers, ChunkReq answers come from cache after the first cut).
+    manifest_cache: std.AutoHashMap(ManifestKey, CachedManifest),
+    manifest_cache_order: std.ArrayList(ManifestKey) = .empty,
+    /// Paths with a manifest job on the completion worker; waiters hold
+    /// owned node_id strings (peers can disconnect mid-compute).
+    manifest_inflight: std.StringHashMap(std.ArrayList([]u8)),
+    /// D37 observability counters.
+    rdc_lit_bytes: u64 = 0,
+    rdc_copy_bytes: u64 = 0,
+    rdc_manifests_served: u64 = 0,
+    /// Fresh-id source for RdcFetch plans (see CopyJob.plan_id).
+    rdc_plan_seq: u64 = 1,
 
     pub fn init(alloc: Allocator, cfg: *const config.Config, psk: []const u8, dev_fd: posix.fd_t, wake_rd: posix.fd_t, wake_wr: posix.fd_t) !Daemon {
         var cs = try ContentSet.open(alloc, cfg.state_dir, cfg.node_id);
         errdefer cs.close();
+
+        // D37: the chunk index is a rebuildable cache — corruption moves
+        // the env aside and retries once; any other failure runs without
+        // seeds (big files still replicate as all-literal manifests).
+        var rdc_ix: ?rdc.Index = rdc.Index.open(alloc, cfg.state_dir) catch |e1| blk: {
+            log(.warn, "rdc index open failed ({s}); attempting rebuild", .{@errorName(e1)});
+            rdc.Index.moveAside(alloc, cfg.state_dir) catch {};
+            break :blk rdc.Index.open(alloc, cfg.state_dir) catch |e2| {
+                log(.warn, "rdc index unavailable ({s}); running without cross-file seeds", .{@errorName(e2)});
+                break :blk null;
+            };
+        };
+        errdefer if (rdc_ix) |*ix| ix.close();
+
         const inst = try installer.Installer.init(alloc, cfg.replicated_path, cfg.state_dir);
 
         // TLS context (optional: only when cert+key are configured).
@@ -472,9 +743,14 @@ pub const Daemon = struct {
             .wake_rd = wake_rd,
             .incoming = std.StringHashMap(Incoming).init(alloc),
             .pending_hash = std.StringHashMap(bool).init(alloc),
+            .manifest_inflight = std.StringHashMap(std.ArrayList([]u8)).init(alloc),
+            .manifest_cache = std.AutoHashMap(ManifestKey, CachedManifest).init(alloc),
             .tls_ctx = tls_ctx,
             .rate_limit = cfg.rate_limit,
             .fetch_window = if (cfg.fetch_window > 0) cfg.fetch_window else fetch_window_bytes_default,
+            .rdc_enabled = cfg.rdc,
+            .rdc_min = if (cfg.rdc_min > 0) cfg.rdc_min else rdc_min_default,
+            .rdc_index = rdc_ix,
             // inst back-pointer is wired in run() (the Daemon is moved by
             // value out of init — &self.inst here would dangle).
             .comp = .{ .alloc = alloc, .inst = undefined, .kick_rd = kpfds[0], .kick_wr = kpfds[1], .wake_wr = wake_wr },
@@ -961,7 +1237,7 @@ pub const Daemon = struct {
                 .newer, .conflict_incoming_wins => {
                     log(.info, "aborting losing fetch {s} v=({x},{d})", .{ path, iv.origin, iv.seq });
                     self.inst.abortFetch(path);
-                    if (self.incoming.fetchRemove(path)) |kv| self.alloc.free(kv.key);
+                    if (self.incoming.fetchRemove(path)) |kv| self.freeIncoming(kv);
                 },
                 else => {},
             };
@@ -1005,6 +1281,7 @@ pub const Daemon = struct {
             .mode = @intCast(@as(u32, @intCast(st.mode)) & 0o7777),
             .fileid = @intCast(st.ino),
             .gen = @intCast(st.gen),
+            .chunk = self.rdc_enabled and @as(u64, @intCast(@max(st.size, 0))) >= self.rdc_min,
         } })) {
             // submit() freed the job strings; retract the pending entry.
             _ = self.pending_hash.fetchRemove(path);
@@ -1021,6 +1298,9 @@ pub const Daemon = struct {
         const job = &res.job;
         defer self.alloc.free(job.path);
         defer self.alloc.free(job.abs);
+        // Indexed (or rejected) chunks are cleared by the index arms;
+        // anything else exits through here.
+        defer if (res.chunks.len > 0) self.alloc.free(res.chunks);
         const kv = self.pending_hash.fetchRemove(job.path) orelse return;
         if (!self.csGate()) {
             self.alloc.free(kv.key);
@@ -1078,17 +1358,31 @@ pub const Daemon = struct {
                 std.mem.eql(u8, &rec.sha256, &res.sha256))
             {
                 // Same bytes under fresh metadata (a touch): absorb
-                // silently, refresh identity/mtime.
+                // silently, refresh identity/mtime.  The index entries
+                // (if any) describe proven-identical bytes — refresh
+                // harmlessly in both arms below.
                 var r = rec.*;
                 r.id = .{ .fsid = self.tree_fsid, .fileid = fileid, .gen = gen };
                 r.mtime_sec = @intCast(st.mtim.sec);
                 r.mtime_nsec = mtime_nsec;
                 r.mode = mode;
                 self.cs.upsert(job.path, r) catch {};
+                if (res.chunks.len > 0) {
+                    self.rdcIndexAdd(job.path, res.chunks);
+                    self.alloc.free(res.chunks);
+                    res.chunks = &.{};
+                }
                 return;
             }
         }
         self.announceLocal(job.path, false, size, mode, @intCast(st.mtim.sec), mtime_nsec, fileid, gen, res.sha256);
+        // D37: the same read pass cut chunk entries — seed the index so
+        // peers can delta against this content (cross-file too).
+        if (res.chunks.len > 0) {
+            self.rdcIndexAdd(job.path, res.chunks);
+            self.alloc.free(res.chunks);
+            res.chunks = &.{};
+        }
     }
 
     fn processDelete(self: *Daemon, e: *journal.Entry) void {
@@ -1161,6 +1455,14 @@ pub const Daemon = struct {
         // 2026-09-10: an offline member fetching the OLD child path got
         // NACK-missing and never learned rdir2/f.txt at all).
         if (is_dir) self.renameSubtreeRecords(null, r.from, r.to, ver);
+        // D37: the content didn't move — re-key seed chunks instead of
+        // paying a re-chunk.  (A dirty rename re-hashes/re-indexes via
+        // processUpsert below; its stale old entries sweep out hourly.)
+        if (is_dir) {
+            self.rdcRenamePrefix(r.from, r.to);
+        } else if (!r.dirty and dst.size >= self.rdc_min) {
+            self.rdcRenamePath(r.from, r.to);
+        }
 
         self.move_cookie +%= 1;
         const cookie = self.move_cookie;
@@ -1336,6 +1638,8 @@ pub const Daemon = struct {
             .fetch_req => |m| self.onFetchReq(p, m),
             .fetch_data => |m| self.onFetchData(p, m),
             .fetch_ack => |m| self.onFetchAck(p, m),
+            .chunk_req => |m| self.onChunkReq(p, m),
+            .manifest => |m| self.onManifest(p, m),
             .tombstone => |m| self.onTombstone(p, m),
             .resync_req => |m| self.onResyncReq(p, m),
             .resync_entry => |m| self.onResyncEntry(p, m),
@@ -1353,6 +1657,45 @@ pub const Daemon = struct {
                 // completing fetch belongs to the worker.
                 const cur = self.incoming.get(m.path) orelse return;
                 if (!cur.ver.eql(m.ver) or cur.completing) return;
+                // D37: the source refused to cut a manifest — restart the
+                // SAME attempt as a plain whole-file pull.
+                if (m.code == nack_no_rdc) {
+                    if (self.incoming.getPtr(m.path)) |mp| {
+                        if (mp.rdc != null) {
+                            log(.info, "rdc {s}: source declined manifest; downgrading to whole-file pull", .{m.path});
+                            if (mp.rdc) |*rs| rs.deinit(self.alloc);
+                            mp.rdc = null;
+                            mp.rdc_disabled = true;
+                            self.inst.abortFetch(m.path);
+                            self.inst.beginFetch(m.path, mp.*, false) catch return;
+                            mp.req_hi = 0;
+                            mp.deadline_ms = now + fetch_timeout_ms;
+                            self.fillFetchWindow(p, m.path);
+                        }
+                    }
+                    return;
+                }
+                // D37: CHUNK_REQ nack-missing — same gap #10 fallback, but
+                // the chunk plan restarts against the new source (staged
+                // sparse bytes are discarded; copies re-verify locally).
+                if (m.code == nack_missing and cur.rdc != null) {
+                    if (self.pickAlternateSource(m.path)) |alt| {
+                        log(.info, "rdc fetch {s} v=({x},{d}): source fallback {s} -> {s} (manifest restart)", .{
+                            m.path, m.ver.origin, m.ver.seq, peerName(p), peerName(alt),
+                        });
+                        if (self.incoming.getPtr(m.path)) |mp| {
+                            mp.deadline_ms = now + fetch_timeout_ms;
+                            if (mp.rdc) |*rs| rs.deinit(self.alloc);
+                            mp.rdc = RdcFetch{};
+                            mp.rdc.?.plan_id = self.rdc_plan_seq;
+                            self.rdc_plan_seq +%= 1;
+                            self.inst.abortFetch(m.path);
+                            self.inst.beginFetch(m.path, mp.*, true) catch return;
+                        }
+                        self.pushTo(alt, .{ .chunk_req = .{ .ver = m.ver, .path = m.path } });
+                        return;
+                    }
+                }
                 if (m.code == nack_missing) {
                     // Gap #10 source-selection: the announce source doesn't
                     // hold the content — fall back to another ready peer,
@@ -1375,7 +1718,7 @@ pub const Daemon = struct {
                 }
                 if (m.code == nack_missing or m.code == nack_stale) {
                     self.inst.abortFetch(m.path);
-                    if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
+                    if (self.incoming.fetchRemove(m.path)) |kv| self.freeIncoming(kv);
                 }
             },
         }
@@ -1511,12 +1854,28 @@ pub const Daemon = struct {
         // (this announce carries the version we actually want now).
         if (self.inst.fetchInProgress(path))
             self.inst.abortFetch(path);
-        self.inst.beginFetch(path, meta) catch |err| {
+        if (self.incoming.getPtr(path)) |mp| {
+            if (mp.rdc) |*rs| rs.deinit(self.alloc);
+            mp.rdc = null;
+        }
+        const use_rdc = self.rdc_enabled and !meta.rdc_disabled and
+            size != std.math.maxInt(u64) and size >= self.rdc_min;
+        self.inst.beginFetch(path, meta, use_rdc) catch |err| {
             log(.warn, "beginFetch {s}: {s}", .{ path, @errorName(err) });
             return;
         };
-        if (self.incoming.getPtr(path)) |mp| mp.req_hi = 0;
-        self.fillFetchWindow(p, path);
+        if (self.incoming.getPtr(path)) |mp| {
+            if (use_rdc) {
+                mp.rdc = RdcFetch{};
+                mp.rdc.?.plan_id = self.rdc_plan_seq;
+                self.rdc_plan_seq +%= 1;
+                log(.info, "rdc fetch {s} v=({x},{d}) size={d}: requesting manifest", .{ path, ver.origin, ver.seq, size });
+                self.pushTo(p, .{ .chunk_req = .{ .ver = ver, .path = path } });
+            } else {
+                mp.req_hi = 0;
+                self.fillFetchWindow(p, path);
+            }
+        }
     }
 
     /// Receiver-driven pull with a pipelined window (D36): keep up to
@@ -1528,6 +1887,7 @@ pub const Daemon = struct {
     /// the staged tail and re-windows from there.
     fn fillFetchWindow(self: *Daemon, p: *Peer, path: []const u8) void {
         const meta = self.incoming.getPtr(path) orelse return;
+        if (meta.rdc != null) return; // D37: literal windows run off driveRdc
         const ver = meta.ver;
         const staged = self.inst.fetchOffset(path);
         while (meta.req_hi < meta.size and meta.req_hi -| staged < self.fetch_window) {
@@ -1596,8 +1956,10 @@ pub const Daemon = struct {
             return;
         };
         defer posix.close(fd);
-        const want: usize = @intCast(@min(@as(u64, m.len), rec.size - m.offset));
         var buf: [installer.chunk_size]u8 = undefined;
+        // Clamp to the buffer: a hostile FETCH_REQ may ask past 1 MiB
+        // (protocol allows up to max_frame) — never slice past buf.
+        const want: usize = @intCast(@min(@as(u64, m.len), @min(rec.size - m.offset, buf.len)));
         var data: []const u8 = &.{};
         if (want > 0) {
             const n = posix.pread(fd, buf[0..want], @intCast(m.offset)) catch return;
@@ -1629,10 +1991,17 @@ pub const Daemon = struct {
         // the completing chunk — their trailing empty DATA lands after
         // the fetch has been removed.  Not an error.
         if (!self.inst.fetchInProgress(m.path) and self.incoming.get(m.path) == null) return;
+        // D37 literal arrivals route to the chunk-plan bookkeeping.
+        if (self.incoming.get(m.path)) |inc| {
+            if (inc.rdc != null) {
+                self.onFetchDataRdc(p, m);
+                return;
+            }
+        }
         self.inst.writeChunk(m.path, m.ver, m.offset, m.data) catch |err| {
             log(.warn, "writeChunk {s}: {s}", .{ m.path, @errorName(err) });
             self.inst.abortFetch(m.path);
-            if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
+            if (self.incoming.fetchRemove(m.path)) |kv| self.freeIncoming(kv);
             return;
         };
         if (!self.inst.fetchComplete(m.path)) {
@@ -1645,7 +2014,7 @@ pub const Daemon = struct {
                 // size).  Abort; the sender's next ANNOUNCE re-drives.
                 log(.warn, "fetch {s}: short file at offset {d}, aborting", .{ m.path, m.offset });
                 self.inst.abortFetch(m.path);
-                if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
+                if (self.incoming.fetchRemove(m.path)) |kv| self.freeIncoming(kv);
                 return;
             }
             self.fillFetchWindow(p, m.path);
@@ -1658,7 +2027,7 @@ pub const Daemon = struct {
         };
         var job = self.inst.beginComplete(m.path) catch |err| {
             log(.warn, "install {s} failed: {s}", .{ m.path, @errorName(err) });
-            if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
+            if (self.incoming.fetchRemove(m.path)) |kv| self.freeIncoming(kv);
             // protocol.md: a hash mismatch REQUEUES (bounded — the file
             // may be actively changing on the sender; each retry re-reads).
             if (err == error.HashMismatch and meta.retries < 3) {
@@ -1698,12 +2067,559 @@ pub const Daemon = struct {
         log(.info, "install queued {s} v=({x},{d}) size={d}", .{ m.path, m.ver.origin, m.ver.seq, meta.size });
     }
 
+    /// FETCH_DATA for an RDC fetch = one outstanding literal piece.
+    /// Ordered conn + request order == arrival order, so an arrival must
+    /// match the head of the outstanding FIFO.
+    fn onFetchDataRdc(self: *Daemon, p: *Peer, m: protocol.FetchData) void {
+        const inc = self.incoming.getPtr(m.path) orelse return;
+        if (!inc.ver.eql(m.ver)) return;
+        const rs = &(inc.rdc orelse return);
+        if (rs.lit_out.items.len == 0) {
+            log(.warn, "rdc fetch {s}: unsolicited literal at off={d}; aborting", .{ m.path, m.offset });
+            self.abortIncoming(m.path);
+            return;
+        }
+        const head = rs.lit_out.items[0];
+        if (m.offset != head.off or m.data.len > head.len) {
+            log(.warn, "rdc fetch {s}: literal desync (got off={d} len={d}, want off={d} len<={d}); aborting", .{
+                m.path, m.offset, m.data.len, head.off, head.len,
+            });
+            self.abortIncoming(m.path);
+            return;
+        }
+        if (m.data.len == 0) {
+            log(.warn, "rdc fetch {s}: empty literal (shrank at sender?); aborting", .{m.path});
+            self.abortIncoming(m.path);
+            return;
+        }
+        self.inst.writeChunkRdc(m.path, m.ver, m.offset, m.data) catch |err| {
+            log(.warn, "rdc writeChunk {s}: {s}", .{ m.path, @errorName(err) });
+            self.abortIncoming(m.path);
+            return;
+        };
+        self.rdc_lit_bytes += m.data.len;
+        rs.lit_out_bytes -= m.data.len;
+        if (m.data.len == head.len)
+            _ = rs.lit_out.orderedRemove(0)
+        else
+            rs.lit_out.items[0] = .{ .off = head.off + m.data.len, .len = head.len - @as(u32, @intCast(m.data.len)) };
+        inc.deadline_ms = peer_mod.nowMs() + fetch_timeout_ms;
+        self.driveRdc(p, m.path);
+    }
+
+    // ---- D37: RDC chunk-manifest fetch path ----
+    //
+    // Index maintenance hooks.  All failures are performance-only
+    // (transfers degrade toward literal pulls); MapFull latches read-only.
+
+    /// Insert/replace path's chunk entries (local hash job announce or
+    /// RDC install completion).  Delete-before-insert inside addPath
+    /// keeps same-path replaces bounded.
+    fn rdcIndexAdd(self: *Daemon, path: []const u8, chunks: []const rdc.ChunkEnt) void {
+        if (!self.rdc_enabled or self.rdc_index_ro or chunks.len == 0) return;
+        const ix = &(self.rdc_index orelse return);
+        ix.addPath(path, chunks) catch |e| {
+            if (e == error.MapFull) {
+                self.rdc_index_ro = true;
+                log(.err, "rdc index full (4 GiB map): inserts disabled, reads continue — recovery: stop brfsd, remove state_dir/rdcdb, restart", .{});
+            } else {
+                log(.warn, "rdc index add {s}: {s}", .{ path, @errorName(e) });
+            }
+        };
+    }
+
+    fn rdcRenamePath(self: *Daemon, from: []const u8, to: []const u8) void {
+        if (!self.rdc_enabled) return;
+        const ix = &(self.rdc_index orelse return);
+        ix.renamePath(self.alloc, from, to) catch |e|
+            log(.warn, "rdc index rename {s} -> {s}: {s}", .{ from, to, @errorName(e) });
+    }
+
+    fn rdcRenamePrefix(self: *Daemon, from: []const u8, to: []const u8) void {
+        if (!self.rdc_enabled) return;
+        const ix = &(self.rdc_index orelse return);
+        ix.renamePrefix(self.alloc, from, to) catch |e|
+            log(.warn, "rdc index rename {s}/ -> {s}/: {s}", .{ from, to, @errorName(e) });
+    }
+
+    // ---- D37: RDC chunk-manifest fetch path ----
+    //
+    // Big-file transfer: the sender streams a CHUNK manifest (ordered
+    // content-defined entries); the receiver resolves each chunk against
+    // its local content-addressed index (verified copies on the
+    // completion worker) and pulls what it lacks as literal ranges via
+    // the ordinary FETCH_REQ/FETCH_DATA pipelined window.  Fallback at
+    // every level is today's whole-file pull: no index (all literals),
+    // CHUNK_REQ refused (downgrade), stale seeds (per-chunk verify
+    // fails -> literal), anything at all (final whole-file hash).
+
+    /// Sender side: a peer wants the manifest for an announced version.
+    fn onChunkReq(self: *Daemon, p: *Peer, m: protocol.PathVer) void {
+        if (p.state != .ready) return;
+        const rec = self.cs.lookup(m.path) orelse {
+            self.sendNack(p, m.path, m.ver, nack_missing);
+            return;
+        };
+        if (rec.state != .live or rec.is_dir) {
+            self.sendNack(p, m.path, m.ver, nack_missing);
+            return;
+        }
+        if (!rec.ver.eql(m.ver)) {
+            // Same convention as onFetchReq: answer with the fresh record.
+            self.sendNack(p, m.path, m.ver, nack_stale);
+            self.announceRecord(p, m.path, rec);
+            return;
+        }
+        if (!self.rdc_enabled or rec.size < self.rdc_min) {
+            self.sendNack(p, m.path, m.ver, nack_no_rdc);
+            return;
+        }
+
+        // Cached manifest?  Identity + content guard: serve only when the
+        // stored record still describes the cached cut exactly.
+        const key = ManifestKey{ .fileid = rec.id.fileid, .gen = rec.id.gen };
+        if (rec.id.fileid != 0) {
+            if (self.manifest_cache.get(key)) |cached| {
+                if (cached.size == rec.size and std.mem.eql(u8, &cached.sha256, &rec.sha256)) {
+                    self.streamManifest(p, m.path, rec, cached.raw);
+                    return;
+                }
+                self.evictManifest(key);
+            }
+        }
+
+        // One chunk pass per content version in flight; later requesters
+        // wait by node_id (a disconnect simply never gets its stream).
+        const nid = p.node_id orelse return;
+        const gop = self.manifest_inflight.getOrPut(m.path) catch return;
+        if (gop.found_existing) {
+            const owned = self.alloc.dupe(u8, nid) catch return;
+            gop.value_ptr.append(self.alloc, owned) catch self.alloc.free(owned);
+            return;
+        }
+        gop.key_ptr.* = self.alloc.dupe(u8, m.path) catch return;
+        gop.value_ptr.* = .empty;
+        const owned_nid = self.alloc.dupe(u8, nid) catch return;
+        gop.value_ptr.append(self.alloc, owned_nid) catch self.alloc.free(owned_nid);
+
+        const abs = self.inst.absPath(m.path) catch {
+            self.freeInflight(m.path);
+            return;
+        };
+        const job_path = self.alloc.dupe(u8, m.path) catch {
+            self.alloc.free(abs);
+            self.freeInflight(m.path);
+            return;
+        };
+        log(.info, "chunk_req {s} v=({x},{d}): computing manifest (worker)", .{ m.path, m.ver.origin, m.ver.seq });
+        if (!self.comp.submit(.{ .manifest = .{ .path = job_path, .abs = abs, .ver = m.ver } })) {
+            self.freeInflight(m.path);
+        }
+    }
+
+    fn freeInflight(self: *Daemon, path: []const u8) void {
+        if (self.manifest_inflight.fetchRemove(path)) |kv0| {
+            var kv = kv0;
+            for (kv.value.items) |w| self.alloc.free(w);
+            kv.value.deinit(self.alloc);
+            self.alloc.free(kv.key);
+        }
+    }
+
+    /// Worker -> core: a manifest is cut.  Validate against the CURRENT
+    /// record, cache, then stream to every waiting ready peer.
+    fn onManifestReady(self: *Daemon, res: *ManifestResult) void {
+        const path = res.job.path;
+        const abs = res.job.abs;
+        defer self.alloc.free(path);
+        defer self.alloc.free(abs);
+        defer if (res.chunks.len > 0) self.alloc.free(res.chunks);
+
+        const kv = self.manifest_inflight.fetchRemove(path) orelse return;
+        defer {
+            for (kv.value.items) |w| self.alloc.free(w);
+            var v = kv.value;
+            v.deinit(self.alloc);
+            self.alloc.free(kv.key);
+        }
+        const waiters = kv.value.items;
+
+        if (res.err) |err| {
+            log(.warn, "manifest {s}: chunk pass failed: {s}", .{ path, @errorName(err) });
+            return; // waiters' fetches stall; recovery re-drives
+        }
+        if (!self.csGate()) return;
+        const rec = self.cs.lookup(path) orelse return;
+        const fresh = res.fileid != 0 and rec.state == .live and !rec.is_dir and
+            rec.ver.eql(res.job.ver) and
+            rec.size == res.size and std.mem.eql(u8, &rec.sha256, &res.sha256);
+        if (!fresh) {
+            log(.info, "manifest {s}: record moved during chunking; waiters get stale-nack", .{path});
+            for (self.peers.items) |q| {
+                if (q.state != .ready or q.node_id == null) continue;
+                for (waiters) |w| {
+                    if (std.mem.eql(u8, q.node_id.?, w)) {
+                        self.sendNack(q, path, res.job.ver, nack_stale);
+                        if (rec.state == .live and !rec.is_dir)
+                            self.announceRecord(q, path, rec);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Cache by vnode identity for fan-out and reconnects.
+        var raw: std.ArrayList(u8) = .empty;
+        defer raw.deinit(self.alloc);
+        for (res.chunks) |ch| {
+            var hdr: [4]u8 = undefined;
+            std.mem.writeInt(u32, &hdr, ch.len, .big);
+            raw.appendSlice(self.alloc, &hdr) catch return;
+            raw.appendSlice(self.alloc, &ch.hash) catch return;
+        }
+        const key = ManifestKey{ .fileid = res.fileid, .gen = res.gen };
+        self.cacheManifest(key, .{ .size = res.size, .sha256 = res.sha256, .raw = raw.items }) catch {
+            // Cache is advisory: serve the fresh cut even without it.
+            for (self.peers.items) |q| {
+                if (q.state != .ready or q.node_id == null) continue;
+                for (waiters) |w|
+                    if (std.mem.eql(u8, q.node_id.?, w))
+                        self.streamManifestRaw(q, path, rec, res.chunks);
+            }
+            return;
+        };
+        for (self.peers.items) |q| {
+            if (q.state != .ready or q.node_id == null) continue;
+            for (waiters) |w|
+                if (std.mem.eql(u8, q.node_id.?, w))
+                    self.streamManifest(q, path, rec, self.manifest_cache.get(key).?.raw);
+        }
+    }
+
+    fn cacheManifest(self: *Daemon, key: ManifestKey, val: CachedManifest) !void {
+        const owned = try self.alloc.dupe(u8, val.raw);
+        errdefer self.alloc.free(owned);
+        if (self.manifest_cache.fetchRemove(key)) |old| self.alloc.free(old.value.raw);
+        try self.manifest_cache.put(key, .{ .size = val.size, .sha256 = val.sha256, .raw = owned });
+        self.manifest_cache_order.append(self.alloc, key) catch {};
+        while (self.manifest_cache_order.items.len > manifest_cache_max) {
+            const victim = self.manifest_cache_order.orderedRemove(0);
+            if (self.manifest_cache.fetchRemove(victim)) |old| self.alloc.free(old.value.raw);
+        }
+    }
+
+    fn evictManifest(self: *Daemon, key: ManifestKey) void {
+        if (self.manifest_cache.fetchRemove(key)) |old| self.alloc.free(old.value.raw);
+    }
+
+    /// Stream a cached (packed) manifest at a waiting peer.
+    fn streamManifest(self: *Daemon, p: *Peer, path: []const u8, rec: *const contentset.Record, raw: []const u8) void {
+        if (raw.len == 0) return;
+        var cursor: u64 = 0;
+        var off: usize = 0;
+        // Frame payload cap rounded down to a whole entry count.
+        const frame_cap = manifest_frame_bytes / protocol.manifest_entry_len * protocol.manifest_entry_len;
+        while (off < raw.len) {
+            const n = @min(frame_cap, raw.len - off);
+            const slice = raw[off .. off + n];
+            self.pushTo(p, .{ .manifest = .{
+                .ver = rec.ver,
+                .path = path,
+                .total_size = rec.size,
+                .start_off = cursor,
+                .entries_raw = slice,
+            } });
+            var eit = protocol.manifestEntries(slice);
+            while (eit.next()) |e| cursor += e.len;
+            off += n;
+        }
+        self.rdc_manifests_served += 1;
+    }
+
+    /// Streaming variant straight from a fresh worker cut (cache miss on
+    /// capacity): pack and send without retaining.
+    fn streamManifestRaw(self: *Daemon, p: *Peer, path: []const u8, rec: *const contentset.Record, chunks: []rdc.ChunkEnt) void {
+        if (chunks.len == 0) return;
+        const entries_per_frame = manifest_frame_bytes / protocol.manifest_entry_len;
+        var idx: usize = 0;
+        var cursor: u64 = 0;
+        while (idx < chunks.len) {
+            const n = @min(entries_per_frame, chunks.len - idx);
+            var raw: std.ArrayList(u8) = .empty;
+            defer raw.deinit(self.alloc);
+            for (chunks[idx .. idx + n]) |ch| {
+                var hdr: [4]u8 = undefined;
+                std.mem.writeInt(u32, &hdr, ch.len, .big);
+                raw.appendSlice(self.alloc, &hdr) catch return;
+                raw.appendSlice(self.alloc, &ch.hash) catch return;
+            }
+            self.pushTo(p, .{ .manifest = .{
+                .ver = rec.ver,
+                .path = path,
+                .total_size = rec.size,
+                .start_off = cursor,
+                .entries_raw = raw.items,
+            } });
+            for (chunks[idx .. idx + n]) |ch| cursor += ch.len;
+            idx += n;
+        }
+        self.rdc_manifests_served += 1;
+    }
+
+    /// Receiver side: one frame of the manifest stream for an in-flight
+    /// RDC fetch.
+    fn onManifest(self: *Daemon, p: *Peer, m: protocol.Manifest) void {
+        if (p.state != .ready) return;
+        const inc = self.incoming.getPtr(m.path) orelse return;
+        if (!inc.ver.eql(m.ver)) return; // superseded
+        const rs = &(inc.rdc orelse return); // plain fetch: unexpected
+        if (m.total_size != inc.size) {
+            log(.warn, "manifest {s}: total_size {d} != announced {d}; aborting", .{ m.path, m.total_size, inc.size });
+            self.abortIncoming(m.path);
+            return;
+        }
+        if (m.start_off != rs.manifest_cursor) {
+            self.dropPeer(p, peer_mod.nowMs(), "manifest stream desync");
+            return;
+        }
+        var eit = protocol.manifestEntries(m.entries_raw);
+        while (eit.next()) |e| {
+            rs.segs.append(self.alloc, .{
+                .off = rs.manifest_cursor,
+                .len = e.len,
+                .hash = e.hash,
+            }) catch return;
+            rs.manifest_cursor += e.len;
+        }
+        inc.deadline_ms = peer_mod.nowMs() + fetch_timeout_ms;
+        if (rs.manifest_cursor == inc.size) rs.manifest_done = true;
+        self.driveRdc(p, m.path);
+    }
+
+    /// Classify newly arrived segs (local-seed copy vs literal), launch
+    /// copies onto the worker, and slice literal ranges into the fetch
+    /// window.  Called on manifest frames, copy results, and source
+    /// changes.
+    fn driveRdc(self: *Daemon, p: *Peer, path: []const u8) void {
+        const inc = self.incoming.getPtr(path) orelse return;
+        const rs = &(inc.rdc orelse return);
+
+        // Classify: unresolved segs become copy_wait (seed found, copy
+        // job to the worker) or literal ranges (merged into lit_plan).
+        var job_ents: [max_copy_ents]CopyEnt = undefined;
+        var job_n: usize = 0;
+        var i: usize = 0;
+        while (i < rs.segs.items.len) : (i += 1) {
+            const seg = &rs.segs.items[i];
+            if (seg.state != .unresolved) continue;
+
+            // Answer from local seeds?
+            var ce = CopyEnt{ .seg_idx = @intCast(i), .dst_off = seg.off, .len = seg.len, .hash = seg.hash };
+            if (self.rdc_index) |*ix| {
+                var cands: [max_copy_srcs]rdc.Cand = undefined;
+                const nc = ix.lookup(&seg.hash, &cands) catch 0;
+                for (cands[0..nc]) |cand| {
+                    if (cand.len != seg.len) continue;
+                    if (ce.n_srcs >= max_copy_srcs) break;
+                    const owned = self.alloc.dupe(u8, cand.path) catch break;
+                    ce.srcs[ce.n_srcs] = .{ .path = owned, .off = cand.off };
+                    ce.n_srcs += 1;
+                }
+            }
+            if (ce.n_srcs > 0) {
+                job_ents[job_n] = ce;
+                job_n += 1;
+                seg.state = .copy_wait;
+                if (job_n == max_copy_ents) {
+                    self.submitCopyJob(path, inc.ver, rs.plan_id, job_ents[0..job_n]);
+                    job_n = 0;
+                }
+                continue;
+            }
+            // No seed: literal range (coalesces into the open tail run).
+            // Completion is tracked by lit_plan/lit_out, so the seg is
+            // handed off here (re-watch: a failed copy re-adds a range).
+            self.rdcLitPlanAdd(rs, seg.off, seg.len);
+            seg.state = .done;
+        }
+        if (job_n > 0) self.submitCopyJob(path, inc.ver, rs.plan_id, job_ents[0..job_n]);
+
+        // Slice literal ranges into the window.
+        while (rs.lit_plan.items.len > 0 and rs.lit_out_bytes < self.fetch_window) {
+            const range = &rs.lit_plan.items[0];
+            const piece: u32 = @intCast(@min(@as(u64, installer.chunk_size), range.end - range.next));
+            if (p.state != .ready) return; // next event re-drives
+            self.pushTo(p, .{ .fetch_req = .{ .ver = inc.ver, .offset = range.next, .len = piece, .path = path } });
+            rs.lit_out.append(self.alloc, .{ .off = range.next, .len = piece }) catch return;
+            rs.lit_out_bytes += piece;
+            range.next += piece;
+            if (range.next == range.end) {
+                _ = rs.lit_plan.orderedRemove(0);
+            }
+        }
+
+        self.maybeCompleteRdc(p, path);
+    }
+
+    fn rdcLitPlanAdd(self: *Daemon, rs: *RdcFetch, off: u64, len: u32) void {
+        if (rs.lit_plan.items.len > 0) {
+            const last = &rs.lit_plan.items[rs.lit_plan.items.len - 1];
+            if (last.end == off) {
+                last.end += len;
+                return;
+            }
+        }
+        rs.lit_plan.append(self.alloc, .{ .off = off, .end = off + len, .next = off }) catch {};
+    }
+
+    fn submitCopyJob(self: *Daemon, path: []const u8, ver: Version, plan_id: u64, ents: []CopyEnt) void {
+        var job = CopyJob{
+            .path = self.alloc.dupe(u8, path) catch {
+                for (ents) |e| for (e.srcs[0..e.n_srcs]) |s| self.alloc.free(s.path);
+                return;
+            },
+            .ver = ver,
+            .plan_id = plan_id,
+            .n_ents = @intCast(ents.len),
+            .ents = undefined,
+        };
+        @memcpy(job.ents[0..ents.len], ents);
+        if (!self.comp.submit(.{ .copy = job })) {
+            // submit() freed the job (OOM): these segs resolve as
+            // literals instead — delta opportunity lost, never bytes.
+            if (self.incoming.getPtr(path)) |inc| {
+                if (inc.rdc) |*rs| {
+                    for (ents) |e| {
+                        const seg = &rs.segs.items[e.seg_idx];
+                        self.rdcLitPlanAdd(rs, seg.off, seg.len);
+                        seg.state = .done;
+                    }
+                }
+            }
+        }
+    }
+
+    /// All segs resolved + all literals landed?
+    fn maybeCompleteRdc(self: *Daemon, p: *Peer, path: []const u8) void {
+        const inc = self.incoming.getPtr(path) orelse return;
+        const rs = &(inc.rdc orelse return);
+        if (!rs.manifest_done) return;
+        if (rs.lit_plan.items.len != 0 or rs.lit_out.items.len != 0) return;
+        for (rs.segs.items) |seg| {
+            if (seg.state == .unresolved or seg.state == .copy_wait) return;
+        }
+        // Every byte has landed (literal regions disjoint from verified
+        // copies by construction).
+        self.landFetch(p, path);
+    }
+
+    /// Shared fetch-completion tail (the old onFetchData body after
+    /// staging): beginComplete + LWW race guard + echo marker + submit.
+    fn landFetch(self: *Daemon, p: *Peer, path: []const u8) void {
+        const meta = self.incoming.get(path) orelse {
+            self.inst.abortFetch(path);
+            return;
+        };
+        var job = self.inst.beginComplete(path) catch |err| {
+            log(.warn, "install {s} failed: {s}", .{ path, @errorName(err) });
+            if (self.incoming.fetchRemove(path)) |kv| self.freeIncoming(kv);
+            // protocol.md: a hash mismatch REQUEUES (bounded — the file
+            // may be actively changing on the sender; each retry re-reads).
+            if (err == error.HashMismatch and meta.retries < 3) {
+                log(.info, "requeue fetch {s} (retry {d})", .{ path, meta.retries + 1 });
+                self.startFetch(p, path, meta.ver, meta.size, meta.sha256, meta.mode, meta.mtime_sec, meta.mtime_nsec);
+                if (self.incoming.getPtr(path)) |e| e.retries = meta.retries + 1;
+            }
+            return;
+        };
+        // Never land a losing install (T5 cascade, rig-proven 2026-08-26):
+        // a local upsert that beat this fetch while it was transferring
+        // would have the worker quarantine the WINNER's content and the
+        // superseded-install revert then lose the file on disk entirely.
+        // Discard the staging file instead: the tree is never touched.
+        if (self.cs.lookup(path)) |rec| {
+            switch (contentset.relate(meta.ver, rec.ver)) {
+                .same, .older, .conflict_stored_wins => {
+                    log(.info, "install {s} v=({x},{d}) lost the race before landing; discarding", .{ path, meta.ver.origin, meta.ver.seq });
+                    self.inst.discardComplete(&job);
+                    self.alloc.free(job.path);
+                    self.dropIncoming(path, meta.ver);
+                    return;
+                },
+                .newer, .conflict_incoming_wins => {},
+            }
+        }
+        // Identity echo marker BEFORE the worker's rename: the resulting
+        // kernel events (MOVE_TO + ATTRIB) must find it (rule 6), and the
+        // fileid/gen swallow never re-hashes a big install on this loop.
+        self.jr.noteEchoFile(path, job.sha256, job.size, job.fileid, job.gen) catch {};
+        // Resolve the install's own nameless self events from the first
+        // moment they can arrive (they may beat the completion result).
+        self.cs.learnId(self.tree_fsid, job.fileid, job.gen, path) catch {};
+        if (p.node_id) |nid| job.ack_peer = self.alloc.dupe(u8, nid) catch null;
+        if (self.incoming.getPtr(path)) |e| e.completing = true;
+        _ = self.comp.submit(.{ .complete = job });
+        log(.info, "install queued {s} v=({x},{d}) size={d}", .{ path, meta.ver.origin, meta.ver.seq, meta.size });
+    }
+
+    /// Abort an in-flight fetch and drop its incoming entry (RDC version-
+    /// agnostic teardown).
+    fn abortIncoming(self: *Daemon, path: []const u8) void {
+        self.inst.abortFetch(path);
+        if (self.incoming.fetchRemove(path)) |kv| self.freeIncoming(kv);
+    }
+
+    /// Worker -> core: chunk-copy batch finished.  Verified chunks book
+    /// their bytes; failures fall back to literal requests.  Worker
+    /// results carry no peer, so literal re-drives use any ready peer:
+    /// the manifest is content-derived — every converged v4 peer streams
+    /// the identical plan for the same version (onFetchReq revalidates
+    /// the record/version regardless).
+    fn onCopyResult(self: *Daemon, res: *CopyResult) void {
+        defer freeCopyJob(self.alloc, &res.job);
+        const inc = self.incoming.getPtr(res.job.path) orelse return;
+        if (!inc.ver.eql(res.job.ver)) return;
+        const rs = &(inc.rdc orelse return);
+        if (res.job.plan_id != rs.plan_id) return; // pre-restart batch: stale
+        for (res.job.ents[0..res.job.n_ents], 0..) |e, ei| {
+            const seg = &rs.segs.items[e.seg_idx];
+            const ok = (res.ok_mask >> @intCast(ei)) & 1 == 1;
+            if (ok) {
+                seg.state = .done;
+                self.inst.noteRdcCopied(res.job.path, e.len);
+                rs.copied_bytes += e.len;
+                self.rdc_copy_bytes += e.len;
+            } else {
+                // Stale seed or vanished source: literal fallback.
+                self.rdcLitPlanAdd(rs, seg.off, seg.len);
+                seg.state = .done;
+            }
+        }
+        inc.deadline_ms = peer_mod.nowMs() + fetch_timeout_ms;
+        self.driveRdcFor(res.job.path);
+    }
+
+    /// Re-enter driveRdc when no delivering peer is in hand (worker
+    /// results): any ready peer can serve the outstanding literals.
+    fn driveRdcFor(self: *Daemon, path: []const u8) void {
+        for (self.peers.items) |q| {
+            if (q.state == .ready) {
+                self.driveRdc(q, path);
+                return;
+            }
+        }
+    }
+
+    const nack_no_rdc: u16 = 3;
+
     /// Completion worker -> core: an install finished (or failed).
     fn onInstalled(self: *Daemon, res: *installer.CompleteResult) void {
         const path = res.job.path;
         defer self.alloc.free(path);
         defer if (res.job.ack_peer) |ap| self.alloc.free(ap);
         defer if (res.job.quarantined) |q| self.alloc.free(q);
+        // Indexed on success (arm clears the slice); dropped otherwise.
+        defer if (res.job.rdc_chunks.len > 0) self.alloc.free(res.job.rdc_chunks);
 
         // fs gone mid-install: drop the result; the wire side recovers on
         // the post-restart resync.
@@ -1755,6 +2671,13 @@ pub const Daemon = struct {
         }
 
         self.upsertFromWire(path, res.job.ver, false, res.job.mode, res.job.size, res.job.mtime_sec, res.job.mtime_nsec, res.job.sha256);
+        // D37: an RDC install's staged bytes were chunk-cut during the
+        // worker hash — seed the cross-file index from them.
+        if (res.job.rdc_chunks.len > 0) {
+            self.rdcIndexAdd(path, res.job.rdc_chunks);
+            self.alloc.free(res.job.rdc_chunks);
+            res.job.rdc_chunks = &.{};
+        }
         // ACK the serving node if still connected (advisory; a missing ACK
         // is a no-op on the sender).
         if (res.job.ack_peer) |nid| {
@@ -1790,13 +2713,20 @@ pub const Daemon = struct {
         };
     }
 
+    /// Free a removed incoming entry: the key + any RDC chunk plan.
+    fn freeIncoming(self: *Daemon, kv0: std.StringHashMap(Incoming).KV) void {
+        var v = kv0.value;
+        if (v.rdc) |*r| r.deinit(self.alloc);
+        self.alloc.free(kv0.key);
+    }
+
     /// Drop the incoming entry IF it still belongs to this version (a newer
     /// fetch may have replaced it while the worker installed the old one).
     fn dropIncoming(self: *Daemon, path: []const u8, ver: Version) void {
         if (self.incoming.getPtr(path)) |e| {
             if (!e.ver.eql(ver)) return;
         }
-        if (self.incoming.fetchRemove(path)) |kv| self.alloc.free(kv.key);
+        if (self.incoming.fetchRemove(path)) |kv| self.freeIncoming(kv);
     }
 
     fn drainCompletions(self: *Daemon) void {
@@ -1806,6 +2736,8 @@ pub const Daemon = struct {
         for (results.items) |*res| switch (res.*) {
             .complete => |*cr| self.onInstalled(cr),
             .hash => |*hr| self.onHashed(hr),
+            .manifest => |*mr| self.onManifestReady(mr),
+            .copy => |*cr| self.onCopyResult(cr),
         };
     }
 
@@ -1949,7 +2881,7 @@ pub const Daemon = struct {
             if (self.incoming.get(d.p)) |inf2| {
                 if (!inf2.completing) {
                     self.inst.abortFetch(d.p);
-                    if (self.incoming.fetchRemove(d.p)) |kv| self.alloc.free(kv.key);
+                    if (self.incoming.fetchRemove(d.p)) |kv| self.freeIncoming(kv);
                 }
             }
             self.startFetch(peer, newp, ver, d.rec.size, d.rec.sha256, d.rec.mode, d.rec.mtime_sec, d.rec.mtime_nsec);
@@ -2023,6 +2955,11 @@ pub const Daemon = struct {
         // Descendant records move with the dir (in-flight child installs
         // retarget to the new path; missing content re-fetches there).
         if (m.is_dir) self.renameSubtreeRecords(p, mv.path, m.path, m.ver);
+        // D37: content moved bytes-free; re-key the seed index with it.
+        if (m.is_dir)
+            self.rdcRenamePrefix(mv.path, m.path)
+        else if (dst.size >= self.rdc_min)
+            self.rdcRenamePath(mv.path, m.path);
         log(.info, "applied rename {s} -> {s} v=({x},{d})", .{ mv.path, m.path, m.ver.origin, m.ver.seq });
     }
 
@@ -2415,7 +3352,7 @@ pub const Daemon = struct {
         for (expired_f.items) |path| {
             log(.warn, "fetch {s} stalled (no progress {d}ms); aborting", .{ path, fetch_timeout_ms });
             self.inst.abortFetch(path);
-            if (self.incoming.fetchRemove(path)) |kv| self.alloc.free(kv.key);
+            if (self.incoming.fetchRemove(path)) |kv| self.freeIncoming(kv);
             restalled = true;
         }
         // Re-drive after stalls must be a FULL pull: entries already past
@@ -2433,6 +3370,9 @@ pub const Daemon = struct {
             const committed_before = self.cs.journalCommitted();
             self.cs.checkpoint(self.jr.high_seq) catch {};
             self.cs.flush() catch {};
+            // D37: the rdc index runs MDB_NOSYNC (rebuildable); ride the
+            // checkpoint cadence for durability.
+            if (self.rdc_index) |*ix| ix.sync();
             const committed_now = self.cs.journalCommitted();
             // Diff-serves cap at the committed head (read txns can't see
             // the pending txn), so entries appended DURING a serve window
@@ -2503,7 +3443,23 @@ pub const Daemon = struct {
             if (out.journaled > 0)
                 log(.info, "journal GC: {d} entries trimmed (floor={d})", .{ out.journaled, jfloor });
         }
+        // D37 chunk-index sweep: drop seed chunks of tombstoned/vanished
+        // paths (bounded growth; same-path replace self-heals via
+        // delete-before-insert, so only deletes accumulate).
+        // (Runs even when the index is MapFull-latched: deletes free
+        // space; insert-latching is a separate concern.)
+        if (self.rdc_index) |*ix| {
+            const n = ix.sweep(self.alloc, self, rdcIsLive) catch 0;
+            if (n > 0) log(.info, "rdc index sweep: {d} dead paths evicted", .{n});
+        }
         return out;
+    }
+
+    /// Sweep predicate: chunks stay only for live big files.
+    fn rdcIsLive(ctx: *const anyopaque, path: []const u8) bool {
+        const self: *Daemon = @ptrCast(@alignCast(@constCast(ctx)));
+        const rec = self.cs.lookup(path) orelse return false;
+        return rec.state == .live and !rec.is_dir and rec.size >= self.rdc_min;
     }
 
     /// Operator GC trigger (`brfsctl gc`) — the hourly tombstone/journal
@@ -2651,6 +3607,17 @@ pub const Daemon = struct {
             log(.info, "SIGHUP: fetch_window {d} -> {d} bytes", .{ self.fetch_window, fresh_window });
             self.fetch_window = fresh_window;
         }
+        // D37 knobs: apply to NEW fetches/manifests; in-flight transfers
+        // run to completion under the mode they started with.
+        if (fresh.rdc != self.rdc_enabled) {
+            log(.info, "SIGHUP: rdc {} -> {}", .{ self.rdc_enabled, fresh.rdc });
+            self.rdc_enabled = fresh.rdc;
+        }
+        const fresh_rdc_min = if (fresh.rdc_min > 0) fresh.rdc_min else rdc_min_default;
+        if (fresh_rdc_min != self.rdc_min) {
+            log(.info, "SIGHUP: rdc_min {d} -> {d} bytes", .{ self.rdc_min, fresh_rdc_min });
+            self.rdc_min = fresh_rdc_min;
+        }
 
         // PSK re-read (even if psk_file path is unchanged — the CONTENT
         // may have been rotated).
@@ -2734,6 +3701,18 @@ pub const Daemon = struct {
         self.ctlPrint(out, "incoming: {d} fetches ({d} completing)\n", .{ self.incoming.count(), completing });
         self.ctlPrint(out, "rate_limit: {d} B/s egress per peer conn (0 = unlimited)\n", .{self.rate_limit});
         self.ctlPrint(out, "fetch_window: {d} B per fetch\n", .{self.fetch_window});
+        self.ctlPrint(out, "rdc: {s} (min {d} B)\n", .{ if (self.rdc_enabled) "on" else "off", self.rdc_min });
+        if (self.rdc_index) |*ix| {
+            self.ctlPrint(out, "rdc index: {d} chunks{s} (copied {d} B, literal {d} B, manifests {d})\n", .{
+                ix.chunkCount(),
+                if (self.rdc_index_ro) " READ-ONLY (map full — see log)" else "",
+                self.rdc_copy_bytes,
+                self.rdc_lit_bytes,
+                self.rdc_manifests_served,
+            });
+        } else {
+            self.ctlPrint(out, "rdc index: unavailable (whole-file literal transfer in effect)\n", .{});
+        }
         self.ctlPrint(out, "mass-delete guard: {s} ({d} deletes in window)\n", .{
             if (self.guard.latched) "LATCHED — local tombstones suppressed" else "clear",
             self.guard.count,
@@ -2826,6 +3805,20 @@ pub const Daemon = struct {
             if (q.node_id) |nid|
                 self.ctlPrint(out, "brfs_rate_tokens{{node=\"{s}\",peer=\"{s}\"}} {d}\n", .{ self.cfg.node_id, nid, q.rl_tokens });
         }
+
+        // D37: replication efficiency — bytes landed via verified local
+        // chunk copies vs literal network pulls; index state.
+        self.ctlPrint(out, "# TYPE brfs_rdc_copy_bytes counter\n", .{});
+        self.ctlPrint(out, "brfs_rdc_copy_bytes{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.rdc_copy_bytes });
+        self.ctlPrint(out, "# TYPE brfs_rdc_literal_bytes counter\n", .{});
+        self.ctlPrint(out, "brfs_rdc_literal_bytes{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.rdc_lit_bytes });
+        self.ctlPrint(out, "# TYPE brfs_rdc_manifests_served counter\n", .{});
+        self.ctlPrint(out, "brfs_rdc_manifests_served{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.rdc_manifests_served });
+        self.ctlPrint(out, "# TYPE brfs_rdc_index_chunks gauge\n", .{});
+        if (self.rdc_index) |*ix|
+            self.ctlPrint(out, "brfs_rdc_index_chunks{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, ix.chunkCount() });
+        self.ctlPrint(out, "# TYPE brfs_rdc_index_readonly gauge\n", .{});
+        self.ctlPrint(out, "brfs_rdc_index_readonly{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, @intFromBool(self.rdc_index_ro) });
     }
 
     fn ctlMassdelete(self: *Daemon, out: *std.ArrayList(u8), do_resume: bool) void {

@@ -28,6 +28,16 @@
 //!                watermark it just durably settled for the streamer's
 //!                journal, at the same points it persists it: the lazy
 //!                4096-entry boundary and the DONE settle)
+//!   CHUNK_REQ    origin u64 | seq u64 | path  (D37: request the chunk
+//!                manifest for a big announced version instead of byte
+//!                ranges)
+//!   MANIFEST     origin u64 | seq u64 | path | total_size u64 |
+//!                start_off u64 | count u32 | count x (len u32 | hash [16])
+//!                (D37: ordered chunk entries; offsets implicit — the
+//!                receiver's running cursor, which start_off must equal;
+//!                stream complete when the cursor reaches total_size.
+//!                Frames split at ~1 MiB.  len 0 or > max_chunk is
+//!                malformed.)
 //!
 //! flags bit0 = ISDIR.  All ops are idempotent; every incoming path is
 //! validated (contentset.validRelPath) before the caller may touch the
@@ -37,13 +47,16 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const contentset = @import("contentset.zig");
+const rdc = @import("rdc.zig");
 
 pub const max_frame: u32 = 16 * 1024 * 1024;
 /// v2 (Phase 3b): RESYNC_REQ.journal_wm, RESYNC_ENTRY.jseq,
 /// RESYNC_DONE.journal_head.
 /// v3 (D35): the (permanently empty since Phase 3b) version vector leaves
 /// RESYNC_REQ; WM_ECHO added.  Refused by mismatched peers at HELLO.
-pub const protocol_version: u16 = 3;
+/// v4 (D37): CHUNK_REQ + MANIFEST (RDC chunk-manifest transfer mode for
+/// files at/above rdc_min).
+pub const protocol_version: u16 = 4;
 pub const nonce_len = 16;
 
 pub const Op = enum(u16) {
@@ -60,6 +73,8 @@ pub const Op = enum(u16) {
     nack = 11,
     resync_done = 12,
     wm_echo = 13,
+    chunk_req = 14,
+    manifest = 15,
     _,
 };
 
@@ -166,6 +181,46 @@ pub const Move = struct {
     path: []const u8,
 };
 
+/// One manifest entry (decoded view; borrows the frame buffer).
+pub const ManifestEntry = struct {
+    len: u32,
+    hash: [rdc.hash_len]u8,
+};
+
+/// A MANIFEST stream continues until the entries' implied cursor reaches
+/// total_size.  The codec is allocation-free: entries stay in the frame
+/// buffer and are walked with manifestEntries().
+pub const Manifest = struct {
+    ver: Version,
+    path: []const u8,
+    /// Total size of the announced version (repeated in every frame).
+    total_size: u64,
+    /// Byte offset of the first entry in this frame; must equal the
+    /// receiver's running cursor (gapless ordered stream).
+    start_off: u64,
+    entries_raw: []const u8, // count x (len u32 | hash16), bounds-checked
+};
+
+pub const manifest_entry_len: usize = 4 + rdc.hash_len;
+
+/// Walk a decoded MANIFEST frame's entries.  Buffers borrow the frame.
+pub fn manifestEntries(raw: []const u8) ManifestEntryIter {
+    return .{ .raw = raw };
+}
+
+pub const ManifestEntryIter = struct {
+    raw: []const u8,
+
+    pub fn next(self: *ManifestEntryIter) ?ManifestEntry {
+        if (self.raw.len < manifest_entry_len) return null;
+        const len = std.mem.readInt(u32, self.raw[0..4], .big);
+        var hash: [rdc.hash_len]u8 = undefined;
+        @memcpy(&hash, self.raw[4 .. 4 + rdc.hash_len]);
+        self.raw = self.raw[manifest_entry_len..];
+        return .{ .len = len, .hash = hash };
+    }
+};
+
 pub const Nack = struct {
     ver: Version,
     code: u16,
@@ -189,6 +244,11 @@ pub const Message = union(enum) {
     resync_done: ResyncDone,
     /// Ack-horizon claim from a stream receiver (D35; see WmEcho).
     wm_echo: WmEcho,
+    /// D37: request the chunk manifest for the announced version (big
+    /// files replicate as local-copy chunks + literal ranges).
+    chunk_req: PathVer,
+    /// D37: one frame of the ordered chunk-manifest stream.
+    manifest: Manifest,
 };
 
 pub const DecodeError = error{ Truncated, FrameTooLarge, BadOp, BadPath, TrailingGarbage };
@@ -297,6 +357,21 @@ pub fn encode(alloc: Allocator, msg: Message) ![]u8 {
         .wm_echo => |m| {
             try appendInt(w, alloc, u16, @intFromEnum(Op.wm_echo));
             try appendInt(w, alloc, u64, m.journal_wm);
+        },
+        .chunk_req => |m| {
+            try appendInt(w, alloc, u16, @intFromEnum(Op.chunk_req));
+            try appendVer(w, alloc, m.ver);
+            try appendStr(w, alloc, m.path);
+        },
+        .manifest => |m| {
+            if (m.entries_raw.len % manifest_entry_len != 0) return error.FrameTooLarge;
+            try appendInt(w, alloc, u16, @intFromEnum(Op.manifest));
+            try appendVer(w, alloc, m.ver);
+            try appendStr(w, alloc, m.path);
+            try appendInt(w, alloc, u64, m.total_size);
+            try appendInt(w, alloc, u64, m.start_off);
+            try appendInt(w, alloc, u32, @intCast(m.entries_raw.len / manifest_entry_len));
+            try w.appendSlice(alloc, m.entries_raw);
         },
     }
 
@@ -413,6 +488,30 @@ pub fn decode(payload: []const u8) DecodeError!Message {
         },
         .resync_done => .{ .resync_done = .{ .count = try r.u64v(), .journal_head = try r.u64v() } },
         .wm_echo => .{ .wm_echo = .{ .journal_wm = try r.u64v() } },
+        .chunk_req => blk: {
+            const v = try r.ver();
+            break :blk .{ .chunk_req = .{ .ver = v, .path = try r.path() } };
+        },
+        .manifest => blk: {
+            const v = try r.ver();
+            const path = try r.path();
+            const total_size = try r.u64v();
+            const start_off = try r.u64v();
+            const count = try r.u32v();
+            // Exactly count entries must fill the rest of the frame.
+            const entries_raw = try r.bytes(@as(usize, count) * manifest_entry_len);
+            var eit = manifestEntries(entries_raw);
+            while (eit.next()) |e| {
+                if (e.len == 0 or e.len > rdc.max_chunk) return error.BadOp;
+            }
+            break :blk .{ .manifest = .{
+                .ver = v,
+                .path = path,
+                .total_size = total_size,
+                .start_off = start_off,
+                .entries_raw = entries_raw,
+            } };
+        },
         _ => return error.BadOp,
     };
     if (r.pos != payload.len) return error.TrailingGarbage;
@@ -620,6 +719,76 @@ test "roundtrip every opcode" {
         defer t.allocator.free(rt.frame);
         try t.expectEqual(@as(u16, 5), rt.msg.nack.code);
     }
+}
+
+test "roundtrip CHUNK_REQ and MANIFEST" {
+    {
+        const rt = try roundtrip(.{ .chunk_req = .{ .ver = .{ .origin = 4, .seq = 12 }, .path = "big.iso" } });
+        defer t.allocator.free(rt.frame);
+        try t.expectEqual(@as(u64, 12), rt.msg.chunk_req.ver.seq);
+        try t.expectEqualStrings("big.iso", rt.msg.chunk_req.path);
+    }
+    {
+        var raw: [3 * manifest_entry_len]u8 = undefined;
+        std.mem.writeInt(u32, raw[0..4], 50000, .big);
+        @memset(raw[4 .. 4 + rdc.hash_len], 0xaa);
+        std.mem.writeInt(u32, raw[manifest_entry_len..][0..4], rdc.max_chunk, .big);
+        @memset(raw[manifest_entry_len + 4 .. 2 * manifest_entry_len], 0xbb);
+        std.mem.writeInt(u32, raw[2 * manifest_entry_len ..][0..4], 1, .big);
+        @memset(raw[2 * manifest_entry_len + 4 ..], 0xcc);
+        const rt = try roundtrip(.{ .manifest = .{
+            .ver = .{ .origin = 4, .seq = 12 },
+            .path = "big.iso",
+            .total_size = 114561,
+            .start_off = 50000,
+            .entries_raw = &raw,
+        } });
+        defer t.allocator.free(rt.frame);
+        try t.expectEqual(@as(u64, 114561), rt.msg.manifest.total_size);
+        try t.expectEqual(@as(u64, 50000), rt.msg.manifest.start_off);
+        var eit = manifestEntries(rt.msg.manifest.entries_raw);
+        const e0 = eit.next().?;
+        try t.expectEqual(@as(u32, 50000), e0.len);
+        try t.expectEqual(@as(u8, 0xaa), e0.hash[0]);
+        const e1 = eit.next().?;
+        try t.expectEqual(rdc.max_chunk, e1.len);
+        try t.expectEqual(@as(u8, 0xbb), e1.hash[rdc.hash_len - 1]);
+        const e2 = eit.next().?;
+        try t.expectEqual(@as(u32, 1), e2.len);
+        try t.expectEqual(@as(?ManifestEntry, null), eit.next());
+    }
+}
+
+test "manifest decode rejects zero/oversize lens and ragged tails" {
+    const mk = struct {
+        fn run(entry_len_field: u32, raw: []const u8) !Message {
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(t.allocator);
+            try appendInt(&body, t.allocator, u16, @intFromEnum(Op.manifest));
+            try appendVer(&body, t.allocator, .{ .origin = 1, .seq = 1 });
+            try appendStr(&body, t.allocator, "f");
+            try appendInt(&body, t.allocator, u64, 100000);
+            try appendInt(&body, t.allocator, u64, 0);
+            try appendInt(&body, t.allocator, u32, entry_len_field);
+            try body.appendSlice(t.allocator, raw);
+            return decode(body.items);
+        }
+    };
+    var good: [manifest_entry_len]u8 = undefined;
+    std.mem.writeInt(u32, good[0..4], 1024, .big);
+    @memset(good[4..], 1);
+    // count vs bytes mismatch
+    try t.expectError(error.Truncated, mk.run(2, &good));
+    // len 0 entry
+    var zeroed: [manifest_entry_len]u8 = good;
+    std.mem.writeInt(u32, zeroed[0..4], 0, .big);
+    try t.expectError(error.BadOp, mk.run(1, &zeroed));
+    // oversize entry
+    var big: [manifest_entry_len]u8 = good;
+    std.mem.writeInt(u32, big[0..4], rdc.max_chunk + 1, .big);
+    try t.expectError(error.BadOp, mk.run(1, &big));
+    // sane one passes
+    _ = try mk.run(1, &good);
 }
 
 test "frameReady needs full frame, rejects oversize" {

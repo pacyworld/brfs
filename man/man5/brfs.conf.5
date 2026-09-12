@@ -1,4 +1,4 @@
-.Dd August 28, 2026
+.Dd September 12, 2026
 .Dt BRFS.CONF 5
 .Os
 .Sh NAME
@@ -58,6 +58,23 @@ the receiver has staged, per fetch.
 Chunks land in request order over the ordered connection, so the window
 is pure depth — no reorder bookkeeping.
 Larger values hide more RTT on bulk pulls; 0 selects the default.
+.It Va rdc Pq boolean, default: true
+Chunk-manifest (RDC-style delta) transfer for files at or above
+.Va rdc_min
+bytes.
+The receiver resolves the sender's content-defined chunk manifest
+against a persistent content-addressed index of everything its tree
+already holds
+.Pq Pa state_dir/rdcdb ,
+copies matching chunks locally with verify-on-read, and pulls only the
+missing ranges as literals through the pipelined fetch window.
+Cross-file seed sharing falls out of the addressing: copies, renames
+with edits, and partially-related files all dedup.
+The index is rebuildable cache — deleting it wholesale degrades transfer
+to whole-file pulls, never correctness.
+.It Va rdc_min Pq integer, default: 65536
+File-size threshold for manifest mode; smaller files transfer whole
+(below one chunk the manifest cannot pay for its round trip).
 .It Va tls_cert , tls_key , tls_ca Pq paths
 TLS/mTLS for all peer connections (TLS 1.3 minimum, KTLS offload when the
 kernel supports it).
@@ -103,8 +120,10 @@ Reloadable at runtime:
 content, additions to
 .Va peers ,
 .Va rate_limit ,
+.Va fetch_window ,
+.Va rdc ,
 and
-.Va fetch_window .
+.Va rdc_min .
 All other keys require a restart; a change to one is logged as a warning
 and ignored.
 A reload that fails to parse keeps the running configuration.

@@ -21,6 +21,11 @@ pub const Config = struct {
     /// D36: fetch pipelining depth in bytes (requested ahead of staging),
     /// per fetch.  0 = the built-in default (8 MiB).
     fetch_window: u64 = 0,
+    /// D37: chunk-manifest deltas (cross-file seeds).  rdc_min is the
+    /// file-size threshold for manifest mode; 0 = built-in default
+    /// (64 KiB).  Both SIGHUP-reloadable.
+    rdc: bool = true,
+    rdc_min: u64 = 0,
     /// Initial-seed role (gap #8): a primary with an empty content set
     /// treats its local tree as authoritative; a non-primary with an empty
     /// set pulls via RESYNC before announcing anything local.
@@ -117,6 +122,19 @@ pub fn load(path: [*:0]const u8) ?Config {
 
     if (root.lookup("fetch_window")) |obj| {
         cfg.fetch_window = switch (obj.objectType()) {
+            .int_ => @intCast(@max(obj.toInt(), 0)),
+            .string => blk: {
+                const s = obj.toString() orelse break :blk 0;
+                break :blk std.fmt.parseInt(u64, s, 10) catch 0;
+            },
+            else => 0,
+        };
+    }
+
+    if (root.lookup("rdc")) |obj| cfg.rdc = obj.toBool();
+
+    if (root.lookup("rdc_min")) |obj| {
+        cfg.rdc_min = switch (obj.objectType()) {
             .int_ => @intCast(@max(obj.toInt(), 0)),
             .string => blk: {
                 const s = obj.toString() orelse break :blk 0;

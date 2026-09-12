@@ -7,7 +7,14 @@ const lmdb_files: []const []const u8 = &.{ "mdb.c", "midl.c" };
 /// guests can't resolve (their pkg/DNS is broken by design).
 fn addLmdb(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(b.path("lib/lmdb"));
-    mod.addCSourceFiles(.{ .root = b.path("lib/lmdb"), .files = lmdb_files });
+    mod.addCSourceFiles(.{
+        .root = b.path("lib/lmdb"),
+        .files = lmdb_files,
+        // MDB_DUPSORT packs sub-page indirection without alignment on
+        // purpose; clang UBSan's alignment check (Debug default) false-
+        // fires inside mdb_xcursor_init1.  Keep every other sanitizer.
+        .flags = &.{"-fno-sanitize=alignment"},
+    });
 }
 
 /// Link base-system OpenSSL for TLS/KTLS support.

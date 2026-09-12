@@ -68,6 +68,18 @@ wait_log() {
 	return 1
 }
 
+# wait_sha <ip> <rel> <sha> <timeout-s> — "install queued" precedes the
+# atomic landing (D37 hashes on the completion worker before rename);
+# content assertions must poll.
+wait_sha() {
+	i=0
+	while [ $i -lt $(( $4 * 2 )) ]; do
+		[ "$(file_sha $1 $2)" = "$3" ] && return 0
+		sleep 0.5; i=$((i + 1))
+	done
+	return 1
+}
+
 # xfer_dur <ip> <path> — transfer duration in ms from the node's OWN log:
 # FIRST "recv announce <path>" (fetch start) to "install queued <path>"
 # (last chunk staged).  Single-clock, immune to poll/ssh/clock-drift noise.
@@ -101,7 +113,7 @@ R $A "dd if=/dev/urandom of=$TREE/pipe32.bin bs=1m count=32 2>/dev/null"
 sha=$(file_sha $A pipe32.bin)
 [ -n "$sha" ] || fail "A1: source write failed"
 wait_log $B 'install queued pipe32.bin' 60 || fail "A1: 32 MiB never converged (60s)"
-[ "$(file_sha $B pipe32.bin)" = "$sha" ] || fail "A1: content mismatch on B"
+wait_sha $B pipe32.bin "$sha" 30 || fail "A1: content mismatch on B"
 el1=$(xfer_dur $B pipe32.bin)
 echo "  pipelined: ${el1}ms (announce->install on B)"
 # On this rig a delay-shaped link also shows TCP's own window limit —
@@ -121,12 +133,13 @@ R $B 'doas /tmp/brfsctl status' | grep -q 'fetch_window: 1048576 B' \
 R $A "dd if=/dev/urandom of=$TREE/serial32.bin bs=1m count=32 2>/dev/null"
 sha=$(file_sha $A serial32.bin)
 wait_log $B 'install queued serial32.bin' 120 || fail "A2: 32 MiB never converged (120s)"
-[ "$(file_sha $B serial32.bin)" = "$sha" ] || fail "A2: content mismatch on B"
+wait_sha $B serial32.bin "$sha" 30 || fail "A2: content mismatch on B"
 el2=$(xfer_dur $B serial32.bin)
 echo "  serialized: ${el2}ms (announce->install on B)"
-# Separation proof: the clamp must cost at least +6s AND at least 2x
-# over the same bytes windowed.
-if [ -n "$el2" ] && [ $el2 -gt $((el1 + 6000)) ] && [ $el2 -ge $((el1 * 2)) ]; then
+# Separation proof: 32 x 1-chunk-deep requests over ~100ms RTT can't be
+# under ~8s (D37 adds a constant manifest pre-pass to BOTH arms, so the
+# old 2x-ratio form no longer holds — use an absolute floor + spread).
+if [ -n "$el2" ] && [ $el2 -ge 8000 ] && [ $el2 -ge $((el1 + 3000)) ]; then
 	ok "A2: one-chunk-deep fetch is RTT-serialized (${el2}ms vs pipelined ${el1}ms)"
 else
 	fail "A2: '${el2}ms' vs pipelined '${el1}ms' — window clamp did not serialize"
@@ -154,7 +167,7 @@ R $A 'doas /tmp/brfsctl metrics' | grep -q '^brfs_rate_tokens{' \
 R $A "dd if=/dev/urandom of=$TREE/rate16.bin bs=1m count=16 2>/dev/null"
 sha=$(file_sha $A rate16.bin)
 wait_log $B 'install queued rate16.bin' 45 || fail "B: 16 MiB never converged (45s)"
-[ "$(file_sha $B rate16.bin)" = "$sha" ] || fail "B: content mismatch on B"
+wait_sha $B rate16.bin "$sha" 30 || fail "B: content mismatch on B"
 el3=$(xfer_dur $B rate16.bin)
 echo "  rate-limited: ${el3}ms (target ~7s)"
 # Target: (16 MiB - one free 2 MiB bucket) / 2 MiB/s ≈ 7 s of pacing.

@@ -52,6 +52,17 @@ WM_ECHO      journal_wm u64  (D35: the stream receiver echoes its newly
                            settled watermark back to the streamer — sent
                            exactly where the receiver persists it: the lazy
                            4096-entry boundary and the DONE settle)
+CHUNK_REQ    ver | path   (D37: request the chunk manifest instead of
+                           byte-range pulls; files < rdc_min are refused
+                           with NACK code 3)
+MANIFEST     ver | path | total_size u64 | start_off u64 | count u32 |
+             count x (len u32 | hash [16])
+                           (D37: ordered chunk entries; byte offsets are
+                           implicit via the receiver's running cursor,
+                           which start_off must equal; the stream is
+                           complete when the cursor reaches total_size;
+                           frames split at ~512 KiB; len 0 or > 64 KiB is
+                           malformed)
 ```
 
 RESYNC_ENTRY carries `state` (1=live, 2=deleted) so tombstones propagate
@@ -152,6 +163,47 @@ from a diff stream. Only journal GC of the entry AND a member never
 rising past it yields the same stray-resurrection class the TTL window
 already documents.
 
+## Chunk-manifest (RDC-style delta) transfers (D37, protocol v4)
+
+Files at or above the receiver's `rdc_min` (default 64 KiB) replicate as
+**content-defined chunks** instead of a serial byte pull:
+
+1. The receiver answers the ANNOUNCE with CHUNK_REQ. The sender cuts the
+   file into chunks with a gear rolling hash (FastCDC shape: 16 KiB
+   minimum, ~32 KiB mean, 64 KiB hard max; deterministic comptime table —
+   every node chunks identically), chunk ids BLAKE3 truncated to 16 bytes
+   (chunk ids are a seed hint only; the whole-file SHA-256 verify is the
+   integrity arbiter).
+   The same pass recomputes the whole-file SHA-256: a mismatch against
+   the stored record means the file moved under the read and the
+   requester gets NACK-stale + a fresh ANNOUNCE. Manifests are cached per
+   (fileid, gen) after a sha/size content-guard, so an N-peer fan-out
+   chunks once.
+2. The MANIFEST stream delivers ordered entries (`len, hash16`), offsets
+   implicit, frames at ~512 KiB, `start_off` chaining the receiver's
+   cursor (a desync drops the conn; stalls re-drive via the usual
+   machinery).
+3. The receiver resolves each chunk against its persistent
+   content-addressed chunk index (`state_dir/rdcdb`, an LMDB env separate
+   from the content set — a rebuildable cache). A hit becomes a **verified
+   local copy** (pread + hash check on the completion worker; a stale
+   entry degenerates to a literal). Its OWN prior copy of the same path
+   is naturally just another indexed file — same-path deltas and
+   cross-file seeds come from the same mechanism, and renames re-key the
+   index (no re-chunk) while hourly GC evicts chunks of deleted paths.
+4. Missing chunks are pulled as literal ranges with the unchanged
+   FETCH_REQ/FETCH_DATA machinery (pipelined window, NACK-missing source
+   fallback). Copy writes and literal writes touch disjoint staging
+   offsets, so anything may land in any relative order; the whole-file
+   SHA-256 check runs on the completion worker before install.
+
+Every failure mode degrades toward the pre-D37 whole-file pull: no index
+(all-literal manifest), CHUNK_REQ refused (`nack_no_rdc` → plain fetch),
+copy-verify failures (per-chunk literal), any assembly damage (final
+hash mismatch → bounded requeue). The chunk index being empty or wiped
+is a performance event, never a correctness one. NACK code 3
+(`nack_no_rdc`) was added for the refusal case.
+
 Decoding is strict: every byte of the payload must be consumed
 (TrailingGarbage), every length field must fit the frame (Truncated), and
 paths must pass the validation below before ANY filesystem use.
@@ -188,6 +240,8 @@ incremented on every local mutation. Clock time plays no role in ordering
 | 11 | NACK        | path, ver, error code | explicit failure; never silently drop |
 | 12 | RESYNC_DONE | count, journal_head | stream terminator; receiver settles watermark, runs post-join scan |
 | 13 | WM_ECHO     | journal_wm | settled-watermark echo to the streamer (D35 ack horizon) |
+| 14 | CHUNK_REQ   | ver, path | request a chunk manifest (big files, D37) |
+| 15 | MANIFEST    | ver, path, total_size, start_off, entries… | one frame of the ordered manifest stream |
 
 ## Directories
 
