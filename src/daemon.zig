@@ -157,6 +157,11 @@ const Incoming = struct {
     /// fallbacks.  Bounded by max_peers (full mesh, no relaying).
     tried: [config.max_peers]u64 = [_]u64{0} ** config.max_peers,
     tried_n: u8 = 0,
+    /// D36 fetch pipelining: highest byte offset (exclusive) requested
+    /// from the CURRENT source.  The window is req_hi - staged bytes;
+    /// a source fallback reseeds it at the staged tail before
+    /// re-windowing from there.
+    req_hi: u64 = 0,
 
     fn markTried(self: *Incoming, node_id: []const u8) void {
         if (self.wasTried(node_id)) return;
@@ -175,6 +180,16 @@ const Incoming = struct {
 };
 
 const fetch_timeout_ms: i64 = 30_000;
+
+/// Fetch pipelining (D36): bytes requested ahead of staging per fetch.
+/// Chunks land in request order over the ordered conn, so the window is
+/// pure depth — no reorder buffer, no protocol change (overshoot clamps
+/// at the sender's EOF semantics).  8 chunks ≈ 87 MB/s/file at 96 ms RTT
+/// vs ~1 MiB per RTT serialized.
+const fetch_window_bytes_default: u64 = 8 * 1024 * 1024;
+
+/// Rate-limit refill wake cadence while any peer is credit-parked.
+const rl_wake_ms: i64 = 100;
 
 /// Journal-diff streaming chunk size (one LMDB read txn per chunk) and
 /// the requester's lazy watermark-persist interval.  A crash replays at
@@ -406,6 +421,12 @@ pub const Daemon = struct {
     pending_hash: std.StringHashMap(bool),
     running: bool = true,
     tls_ctx: ?tls_mod.TlsContext = null,
+    /// D36: live egress limit per peer conn (bytes/sec; 0 = unlimited) and
+    /// the fetch pipelining depth (bytes requested ahead of staging).
+    /// Both start from config and are SIGHUP-reloadable; the consts are
+    /// never re-read after init (reloadConfig replaces these).
+    rate_limit: u64 = 0,
+    fetch_window: u64 = fetch_window_bytes_default,
 
     pub fn init(alloc: Allocator, cfg: *const config.Config, psk: []const u8, dev_fd: posix.fd_t, wake_rd: posix.fd_t, wake_wr: posix.fd_t) !Daemon {
         var cs = try ContentSet.open(alloc, cfg.state_dir, cfg.node_id);
@@ -452,6 +473,8 @@ pub const Daemon = struct {
             .incoming = std.StringHashMap(Incoming).init(alloc),
             .pending_hash = std.StringHashMap(bool).init(alloc),
             .tls_ctx = tls_ctx,
+            .rate_limit = cfg.rate_limit,
+            .fetch_window = if (cfg.fetch_window > 0) cfg.fetch_window else fetch_window_bytes_default,
             // inst back-pointer is wired in run() (the Daemon is moved by
             // value out of init — &self.inst here would dangle).
             .comp = .{ .alloc = alloc, .inst = undefined, .kick_rd = kpfds[0], .kick_wr = kpfds[1], .wake_wr = wake_wr },
@@ -687,6 +710,10 @@ pub const Daemon = struct {
             var it = p.moves.iterator();
             while (it.next()) |e|
                 best = @min(best, @max(e.value_ptr.deadline_ms - now, 0));
+            // Credit-parked conn with queued bytes: wake for the refill
+            // pass, not for a kqueue event (EVFILT_WRITE only fires on
+            // space transitions, so a parked peer gets none).
+            if (p.parked(self.rate_limit)) best = @min(best, rl_wake_ms);
         }
         if (self.need_rescan)
             best = @min(best, @max(self.last_rescan_ms + rescan_cooldown_ms - now, 0));
@@ -1201,7 +1228,7 @@ pub const Daemon = struct {
             self.driveTlsHandshake(p);
             return;
         }
-        p.writeReady() catch {
+        p.writeReady(self.rate_limit) catch {
             self.dropPeer(p, peer_mod.nowMs(), "write failed");
         };
     }
@@ -1247,11 +1274,15 @@ pub const Daemon = struct {
 
     fn flushPeer(self: *Daemon, p: *Peer) void {
         if (p.state == .connecting or p.state == .tls_handshake or p.state == .closed) return;
-        p.writeReady() catch {
+        // Seed the credit bucket on the first write of a rate-limited conn
+        // (refillTokens also runs on the timer; without this the HELLO
+        // would sit parked until it).
+        if (self.rate_limit > 0) _ = p.refillTokens(self.rate_limit, peer_mod.nowMs());
+        p.writeReady(self.rate_limit) catch {
             self.dropPeer(p, peer_mod.nowMs(), "write failed");
             return;
         };
-        if (p.wantsWrite())
+        if (p.wantsWrite() and !p.parked(self.rate_limit))
             self.stageChange(@intCast(p.fd), c_event.EVFILT_WRITE, c_event.EV_ADD | c_event.EV_CLEAR, p);
     }
 
@@ -1332,8 +1363,13 @@ pub const Daemon = struct {
                         log(.info, "fetch {s} v=({x},{d}): source fallback {s} -> {s} at offset {d}", .{
                             m.path, m.ver.origin, m.ver.seq, peerName(p), peerName(alt), off,
                         });
-                        if (self.incoming.getPtr(m.path)) |mp| mp.deadline_ms = now + fetch_timeout_ms;
-                        self.requestChunk(alt, m.path, m.ver, off);
+                        if (self.incoming.getPtr(m.path)) |mp| {
+                            mp.deadline_ms = now + fetch_timeout_ms;
+                            // D36: staged bytes stay, so the new source's
+                            // window reseeds at the staged tail.
+                            mp.req_hi = off;
+                        }
+                        self.fillFetchWindow(alt, m.path);
                         return;
                     }
                 }
@@ -1479,12 +1515,26 @@ pub const Daemon = struct {
             log(.warn, "beginFetch {s}: {s}", .{ path, @errorName(err) });
             return;
         };
-        self.requestChunk(p, path, ver, 0);
+        if (self.incoming.getPtr(path)) |mp| mp.req_hi = 0;
+        self.fillFetchWindow(p, path);
     }
 
-    /// Receiver-driven pull: exactly one chunk in flight per fetch.
-    fn requestChunk(self: *Daemon, p: *Peer, path: []const u8, ver: Version, offset: u64) void {
-        self.pushTo(p, .{ .fetch_req = .{ .ver = ver, .offset = offset, .len = installer.chunk_size, .path = path } });
+    /// Receiver-driven pull with a pipelined window (D36): keep up to
+    /// fetch_window bytes requested-but-undelivered per fetch.  Chunks
+    /// arrive in request order over the ordered conn — the installer's
+    /// strict-offset staging (`GapInFetch`) already enforces that — so
+    /// the window is pure depth.  Drives the whole window again after
+    /// every arrival; a stall/timeout/fallback path reseeds req_hi at
+    /// the staged tail and re-windows from there.
+    fn fillFetchWindow(self: *Daemon, p: *Peer, path: []const u8) void {
+        const meta = self.incoming.getPtr(path) orelse return;
+        const ver = meta.ver;
+        const staged = self.inst.fetchOffset(path);
+        while (meta.req_hi < meta.size and meta.req_hi -| staged < self.fetch_window) {
+            if (p.state != .ready) return; // the stall sweep / next arrival re-drives
+            self.pushTo(p, .{ .fetch_req = .{ .ver = ver, .offset = meta.req_hi, .len = installer.chunk_size, .path = path } });
+            meta.req_hi +|= installer.chunk_size;
+        }
     }
 
     /// Gap #10: pick a fallback source for a fetch whose current source
@@ -1574,6 +1624,11 @@ pub const Daemon = struct {
 
     fn onFetchData(self: *Daemon, p: *Peer, m: protocol.FetchData) void {
         if (p.state != .ready) return;
+        // D36 window tail: requests issued past a late-arriving announce
+        // size (the unpaired-MOVE_TO path starts size-unknown) outlive
+        // the completing chunk — their trailing empty DATA lands after
+        // the fetch has been removed.  Not an error.
+        if (!self.inst.fetchInProgress(m.path) and self.incoming.get(m.path) == null) return;
         self.inst.writeChunk(m.path, m.ver, m.offset, m.data) catch |err| {
             log(.warn, "writeChunk {s}: {s}", .{ m.path, @errorName(err) });
             self.inst.abortFetch(m.path);
@@ -1593,7 +1648,7 @@ pub const Daemon = struct {
                 if (self.incoming.fetchRemove(m.path)) |kv| self.alloc.free(kv.key);
                 return;
             }
-            self.requestChunk(p, m.path, m.ver, self.inst.fetchOffset(m.path));
+            self.fillFetchWindow(p, m.path);
             return;
         }
 
@@ -2256,6 +2311,25 @@ pub const Daemon = struct {
     fn timerPass(self: *Daemon) void {
         const now = peer_mod.nowMs();
 
+        // Rate-limit refills (D36): top up every conn's egress bucket.
+        // A peer parked with an empty bucket re-drives from here — kqueue
+        // never wakes it (EV_CLEAR only fires on space transitions).
+        // flushPeer can drop a peer mid-loop (swapRemove): rewind when
+        // the slot's occupant changed, mirroring broadcast().
+        if (self.rate_limit > 0) {
+            var i: usize = 0;
+            while (i < self.peers.items.len) : (i += 1) {
+                const p = self.peers.items[i];
+                const woke = p.refillTokens(self.rate_limit, now);
+                if (woke and p.wantsWrite()) {
+                    const before = p;
+                    self.flushPeer(p);
+                    if (before.state == .closed and i < self.peers.items.len and self.peers.items[i] != before)
+                        i -%= 1;
+                }
+            }
+        }
+
         // Journal debounce expiries -> announce.
         if (self.resynced) {
             var works: std.ArrayList(journal.Work) = .empty;
@@ -2559,8 +2633,24 @@ pub const Daemon = struct {
             !std.mem.eql(u8, fresh.tls_ca, cfg.tls_ca) or
             fresh.tls_ktls != cfg.tls_ktls)
             log(.warn, "SIGHUP: tls_* changes require restart; ignored", .{});
-        if (fresh.rate_limit != cfg.rate_limit)
-            log(.info, "SIGHUP: rate_limit now {d} bytes/sec (enforcement is Phase 3)", .{fresh.rate_limit});
+        // D36: compared against the RUNTIME value (the startup cfg is
+        // never swapped, so repeated SIGHUPs must not be measured against
+        // it).  Rates down clamp live buckets at once; rates up free
+        // parked conns from the next refill tick.
+        if (fresh.rate_limit != self.rate_limit) {
+            log(.info, "SIGHUP: rate_limit {d} -> {d} bytes/sec", .{ self.rate_limit, fresh.rate_limit });
+            self.rate_limit = fresh.rate_limit;
+            if (self.rate_limit > 0) {
+                for (self.peers.items) |p| {
+                    p.rl_tokens = @min(p.rl_tokens, self.rate_limit);
+                }
+            }
+        }
+        const fresh_window = if (fresh.fetch_window > 0) fresh.fetch_window else fetch_window_bytes_default;
+        if (fresh_window != self.fetch_window) {
+            log(.info, "SIGHUP: fetch_window {d} -> {d} bytes", .{ self.fetch_window, fresh_window });
+            self.fetch_window = fresh_window;
+        }
 
         // PSK re-read (even if psk_file path is unchanged — the CONTENT
         // may have been rotated).
@@ -2642,6 +2732,8 @@ pub const Daemon = struct {
         self.ctlPrint(out, "ring_seq: {d}\n", .{self.cs.ring_seq});
         self.ctlPrint(out, "state_at_open: {s}\n", .{if (self.cs.needs_scan) "empty/corrupt (rebuilt via scan floor)" else "loaded"});
         self.ctlPrint(out, "incoming: {d} fetches ({d} completing)\n", .{ self.incoming.count(), completing });
+        self.ctlPrint(out, "rate_limit: {d} B/s egress per peer conn (0 = unlimited)\n", .{self.rate_limit});
+        self.ctlPrint(out, "fetch_window: {d} B per fetch\n", .{self.fetch_window});
         self.ctlPrint(out, "mass-delete guard: {s} ({d} deletes in window)\n", .{
             if (self.guard.latched) "LATCHED — local tombstones suppressed" else "clear",
             self.guard.count,
@@ -2722,6 +2814,17 @@ pub const Daemon = struct {
         for (&self.member_claims) |*s| {
             if (!s.used) continue;
             self.ctlPrint(out, "brfs_member_ack_wm{{node=\"{s}\",member=\"{x}\"}} {d}\n", .{ self.cfg.node_id, s.node_hash, s.wm });
+        }
+
+        // D36: egress shaping — the configured per-conn limit and each
+        // conn's current credit balance (a conn pinned at 0 with wbuf
+        // depth is rate-limited, not stalled).
+        self.ctlPrint(out, "# TYPE brfs_rate_limit_bytes_per_second gauge\n", .{});
+        self.ctlPrint(out, "brfs_rate_limit_bytes_per_second{{node=\"{s}\"}} {d}\n", .{ self.cfg.node_id, self.rate_limit });
+        self.ctlPrint(out, "# TYPE brfs_rate_tokens gauge\n", .{});
+        for (self.peers.items) |q| {
+            if (q.node_id) |nid|
+                self.ctlPrint(out, "brfs_rate_tokens{{node=\"{s}\",peer=\"{s}\"}} {d}\n", .{ self.cfg.node_id, nid, q.rl_tokens });
         }
     }
 

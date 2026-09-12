@@ -84,6 +84,11 @@ pub const Peer = struct {
     /// Stable bounce buffer for TLS writes (see writeReady).  Empty until
     /// first use; allocated once, never reallocated.
     tls_scratch: []u8 = &.{},
+    /// Rate-limit bucket (egress credits on this conn; the daemon owns the
+    /// limit and refills on the timer pass; writeReady spends).  Capacity
+    /// is one second of rate, so steady shaping still allows bursts.
+    rl_tokens: u64 = 0,
+    rl_last_refill_ms: i64 = 0,
 
     pub fn init(alloc: Allocator) Peer {
         return .{ .alloc = alloc, .moves = std.AutoHashMap(u32, RemoteMove).init(alloc) };
@@ -256,8 +261,40 @@ pub const Peer = struct {
         return self.state != .closed and self.wbuf.items.len > 0;
     }
 
+    /// Refill the rate bucket against elapsed time.  First call after
+    /// connect starts a FULL bucket (a fresh conn burst is deliberate).
+    /// Returns true when the bucket transitioned empty -> spendable, so
+    /// the caller can re-drive a parked wbuf.
+    pub fn refillTokens(self: *Peer, limit: u64, now: i64) bool {
+        if (limit == 0) return false; // unlimited: no bucket state
+        if (self.rl_last_refill_ms == 0) {
+            self.rl_tokens = limit;
+            self.rl_last_refill_ms = now;
+            return self.wbuf.items.len > 0;
+        }
+        const dt = now - self.rl_last_refill_ms;
+        if (dt <= 0) return false;
+        const add = limit * @as(u64, @intCast(dt)) / 1000;
+        if (add == 0) return false; // sub-resolution: stamp only when it yields
+        const old = self.rl_tokens;
+        self.rl_last_refill_ms = now;
+        self.rl_tokens = @min(self.rl_tokens +| add, limit);
+        return old == 0 and self.rl_tokens > 0;
+    }
+
+    /// True when the conn has outbound bytes queued but no spendable
+    /// credits (the daemon tightens its wake cadence while any peer
+    /// reports this).
+    pub fn parked(self: *const Peer, limit: u64) bool {
+        return limit > 0 and self.state != .closed and
+            self.wbuf.items.len > 0 and self.rl_tokens == 0;
+    }
+
     /// Drain the outbound buffer (called on EVFILT_WRITE).
     /// When TLS is active, uses SSL_write (KTLS makes this a kernel op).
+    /// rl_limit caps egress in bytes/sec (0 = unlimited): writes clip at
+    /// the remaining credits and the conn parks (wbuf kept) until the
+    /// daemon's refill pass re-drives it.
     ///
     /// TLS writes go through a per-peer scratch buffer that is allocated
     /// once and never moves: after a WANT_WRITE mid-burst, OpenSSL's KTLS
@@ -268,18 +305,30 @@ pub const Peer = struct {
     /// never backpressured so the retained pointer never went stale).
     /// Retrying with an IDENTICAL pointer+len is the strict pre-3.2
     /// SSL_write contract and satisfies KTLS unconditionally.
-    pub fn writeReady(self: *Peer) !void {
+    pub fn writeReady(self: *Peer, rl_limit: u64) !void {
         while (self.wbuf.items.len > 0) {
+            // Egress credits: clip this pass at the bucket.  Zero tokens
+            // parks the conn — kqueue EV_CLEAR only fires WRITE on a
+            // space-available transition, so parking costs nothing and
+            // the daemon's refill timer is the wake source.
+            var budget: usize = self.wbuf.items.len;
+            if (rl_limit > 0) {
+                if (self.rl_tokens == 0) return;
+                budget = @intCast(@min(self.rl_tokens, budget));
+            }
             if (self.tls_conn) |*tc| {
                 if (self.tls_scratch.len == 0)
                     self.tls_scratch = try self.alloc.alloc(u8, tls_scratch_size);
-                const n_req = @min(self.wbuf.items.len, self.tls_scratch.len);
+                // D27: the scratch buffer never moves; only the length
+                // shrinks under a credit clip.
+                const n_req = @min(budget, self.tls_scratch.len);
                 @memcpy(self.tls_scratch[0..n_req], self.wbuf.items[0..n_req]);
                 const result = tc.write(self.tls_scratch[0..n_req]) catch
                     return error.PeerGone;
                 switch (result) {
                     .ok => |n| {
                         if (n == 0) return error.PeerGone;
+                        if (rl_limit > 0) self.rl_tokens -= @intCast(n); // n <= budget <= tokens
                         self.wbuf.replaceRange(self.alloc, 0, n, &.{}) catch |err| switch (err) {
                             error.OutOfMemory => return err,
                         };
@@ -287,11 +336,12 @@ pub const Peer = struct {
                     .want_read, .want_write => return,
                 }
             } else {
-                const n = posix.write(self.fd, self.wbuf.items) catch |err| switch (err) {
+                const n = posix.write(self.fd, self.wbuf.items[0..budget]) catch |err| switch (err) {
                     error.WouldBlock => return,
                     else => return err,
                 };
                 if (n == 0) return error.PeerGone;
+                if (rl_limit > 0) self.rl_tokens -= @intCast(n);
                 self.wbuf.replaceRange(self.alloc, 0, n, &.{}) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                 };
@@ -390,8 +440,9 @@ fn socketPair() ![2]posix.fd_t {
 
 fn pump(a: *Peer, b: *Peer) !void {
     // Non-blocking fds, small buffers: one ordered pass each way.
-    try a.writeReady();
-    try b.writeReady();
+    // Unlimited egress (rl_limit 0): rate limiting is tested separately.
+    try a.writeReady(0);
+    try b.writeReady(0);
     try a.readReady();
     try b.readReady();
 }
@@ -466,6 +517,68 @@ test "hello validation: psk, self, version" {
     var old = base;
     old.proto = 99;
     try t.expectError(error.BadProtocol, q.checkHello(old, "us", "right"));
+}
+
+test "rate bucket clips writes and parks until refill" {
+    const fds = try socketPair();
+    var p = Peer.init(t.allocator);
+    defer p.deinit();
+    p.adopt(fds[0]);
+
+    const now: i64 = 1_000_000;
+    const limit: u64 = 1000; // bytes/sec
+    // First refill starts a full bucket.
+    try t.expectEqual(@as(u64, 0), p.rl_tokens);
+    _ = p.refillTokens(limit, now);
+    try t.expectEqual(limit, p.rl_tokens);
+
+    const blob = try t.allocator.alloc(u8, 4000);
+    defer t.allocator.free(blob);
+    @memset(blob, 0xAB);
+    try p.sendRaw(blob);
+
+    // The full bucket (1000) is spent up front; the conn parks.
+    try p.writeReady(limit);
+    try t.expectEqual(@as(u64, 0), p.rl_tokens);
+    try t.expect(p.wbuf.items.len >= 3000); // at most 1000 written
+    try t.expect(p.parked(limit));
+    try t.expect(!p.parked(0)); // unlimited never reports parked
+
+    // Parked: a second pass writes nothing.
+    const left = p.wbuf.items.len;
+    try p.writeReady(limit);
+    try t.expectEqual(left, p.wbuf.items.len);
+
+    // 500 ms later: +500 credits, exactly that much moves.
+    _ = p.refillTokens(limit, now + 500);
+    try t.expectEqual(@as(u64, 500), p.rl_tokens);
+    try p.writeReady(limit);
+    try t.expectEqual(left - 500, p.wbuf.items.len);
+
+    // Bucket cap = one second of rate: a long idle stretch never
+    // stockpiles more.
+    _ = p.refillTokens(limit, now + 500_000);
+    try t.expectEqual(limit, p.rl_tokens);
+
+    // Unlimited: the remainder drains in one pass.
+    try p.writeReady(0);
+    try t.expectEqual(@as(usize, 0), p.wbuf.items.len);
+}
+
+test "refill sub-resolution stamps only when it yields" {
+    var p = Peer.init(t.allocator);
+    defer p.deinit();
+    p.rl_tokens = 0;
+    p.rl_last_refill_ms = 1000;
+    // 10 bytes/s: a 50ms delta yields 0 — the stamp must NOT move or the
+    // remainder flakes away.
+    try t.expect(!p.refillTokens(10, 1050));
+    try t.expectEqual(@as(i64, 1000), p.rl_last_refill_ms);
+    // At 200ms the accrued 2 bytes land and the stamp moves; the 0 -> 2
+    // transition is reported (parked-consumers need it).
+    try t.expect(p.refillTokens(10, 1200));
+    try t.expectEqual(@as(u64, 2), p.rl_tokens);
+    try t.expectEqual(@as(i64, 1200), p.rl_last_refill_ms);
 }
 
 test "wbuf cap saturates" {

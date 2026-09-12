@@ -17,7 +17,10 @@ pub const Config = struct {
     psk_file: []const u8 = "",
     peers: [max_peers][]const u8 = undefined,
     num_peers: usize = 0,
-    rate_limit: u64 = 0, // bytes/sec, 0 = unlimited
+    rate_limit: u64 = 0, // bytes/sec egress per peer conn, 0 = unlimited
+    /// D36: fetch pipelining depth in bytes (requested ahead of staging),
+    /// per fetch.  0 = the built-in default (8 MiB).
+    fetch_window: u64 = 0,
     /// Initial-seed role (gap #8): a primary with an empty content set
     /// treats its local tree as authoritative; a non-primary with an empty
     /// set pulls via RESYNC before announcing anything local.
@@ -103,6 +106,17 @@ pub fn load(path: [*:0]const u8) ?Config {
 
     if (root.lookup("rate_limit")) |obj| {
         cfg.rate_limit = switch (obj.objectType()) {
+            .int_ => @intCast(@max(obj.toInt(), 0)),
+            .string => blk: {
+                const s = obj.toString() orelse break :blk 0;
+                break :blk std.fmt.parseInt(u64, s, 10) catch 0;
+            },
+            else => 0,
+        };
+    }
+
+    if (root.lookup("fetch_window")) |obj| {
+        cfg.fetch_window = switch (obj.objectType()) {
             .int_ => @intCast(@max(obj.toInt(), 0)),
             .string => blk: {
                 const s = obj.toString() orelse break :blk 0;

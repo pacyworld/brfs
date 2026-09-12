@@ -48,8 +48,14 @@ psk_file = "/usr/local/etc/brfs.psk"
 # an empty content set and pulls via RESYNC before announcing anything.
 primary = false
 
-# Outbound transfer cap in bytes/sec; 0 = unlimited.
+# Outbound transfer cap in bytes/sec per peer conn (credit bucket,
+# 1s of rate capacity); 0 = unlimited. SIGHUP-reloadable.
 rate_limit = 0
+
+# Fetch pipelining depth in bytes per fetch (chunks requested ahead of
+# what the receiver has staged); 0 = built-in default of 8 MiB.
+# SIGHUP-reloadable.
+# fetch_window = 8388608
 
 # Event classes to drop at intake (gap #11, selective filtering). The
 # kernel tap is emit-all by design; filtering happens in the daemon.

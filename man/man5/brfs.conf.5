@@ -47,8 +47,17 @@ set; it treats its local tree as authoritative.
 Every other member starts with an empty content set and pulls via RESYNC
 before announcing anything local.
 .It Va rate_limit Pq integer, default: 0
-Outbound transfer cap in bytes/sec; 0 = unlimited.
-Parsed but not yet enforced (Phase 3).
+Outbound transfer cap in bytes/sec, applied per peer connection as a
+credit bucket refilled by the daemon timer (bucket capacity is one
+second of rate); 0 = unlimited.
+A conn that spends its bucket parks its write queue until the next
+refill tick — replication paces, never drops.
+.It Va fetch_window Pq integer, default: 8 MiB
+Fetch pipelining depth: bytes of file content requested ahead of what
+the receiver has staged, per fetch.
+Chunks land in request order over the ordered connection, so the window
+is pure depth — no reorder bookkeeping.
+Larger values hide more RTT on bulk pulls; 0 selects the default.
 .It Va tls_cert , tls_key , tls_ca Pq paths
 TLS/mTLS for all peer connections (TLS 1.3 minimum, KTLS offload when the
 kernel supports it).
@@ -93,8 +102,9 @@ Reloadable at runtime:
 .Va psk_file
 content, additions to
 .Va peers ,
+.Va rate_limit ,
 and
-.Va rate_limit .
+.Va fetch_window .
 All other keys require a restart; a change to one is logged as a warning
 and ignored.
 A reload that fails to parse keeps the running configuration.

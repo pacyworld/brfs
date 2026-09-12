@@ -366,12 +366,27 @@ pairs. All ops idempotent. See docs/protocol.md.
   **t-rmdir-root.sh DONE 2026-09-07**: dedicated rig test for the P0.2
   root-dir rmdir/revoke analytical answer (daemon survives, freezes,
   recovers after root recreation).
-  Remaining Phase 3 items: RDC deltas (>64KB, cross-file seeds), rate
-  limiting/credits + fetch pipelining windows (receiver-driven pull is
-  RTT-serialized: ~1 MiB per RTT per file — ~20 MB/s ceiling at 50 ms
-  cross-region RTT), node add/remove, >3 nodes, resync
-  skip-on-(size,sha), upstreamable registration API if patch fallback
-  used.
+  **Fetch pipelining + rate limiting DONE 2026-09-12** (D36): the pull is
+  no longer RTT-serialized — the requester keeps fetch_window bytes
+  (default 8 MiB) requested-ahead of staging per fetch (chunks land in
+  request order over the ordered conn; the installer's strict-offset
+  staging already enforces it, so the window is pure depth; NACK
+  fallbacks reseed the window at the staged tail).  rate_limit is now
+  ENFORCED as a per-peer-conn egress credit bucket (1 s of rate capacity,
+  refilled by the daemon timer at <=100 ms cadence while any conn is
+  parked; applies to everything on the conn — no QoS classes; 0 =
+  unlimited).  Both knobs are SIGHUP-reloadable against the runtime
+  values (not the startup config).  No protocol change.  New surface:
+  fetch_window config key, brfs_rate_limit_bytes_per_second +
+  brfs_rate_tokens{node,peer} gauges, the knobs in brfsctl status.
+  Rig: t-shaping.sh — 32 MiB over a ~100 ms-delayed pair lands in
+  4.7 s windowed vs 11.0 s with a 1 MiB (serialized) SIGHUP'd window,
+  and a 2 MiB/s egress cap paces a 16 MiB file to 7.25 s (~7 s model);
+  WAN track, repl-tests, t12-t20, t-journal-resync, t-ackhorizon,
+  t-guard re-PASS on the new binaries.
+  Remaining Phase 3 items: RDC deltas (>64KB, cross-file seeds), node
+  add/remove, >3 nodes, resync skip-on-(size,sha), upstreamable
+  registration API if patch fallback used.
 - **Code-review backlog landings 2026-08-28** (gaps #7/#10/#11/#14/#15/
   #16/#17/#18/#19 + man pages + CI + metrics):
   - #18 staging free-space precondition: beginFetch refuses a fetch whose
